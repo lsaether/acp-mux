@@ -16,7 +16,9 @@ use tokio::sync::{Mutex, oneshot};
 use crate::agent::process::AgentProcess;
 use crate::cli::ReplayTurns;
 use crate::multiplex::subscriber::Subscriber;
-use crate::session::state::{AttachError, SessionHandle, SessionMsg, spawn_session};
+use crate::session::state::{
+    AttachError, SessionHandle, SessionMsg, SessionSnapshot, spawn_session,
+};
 
 #[derive(Debug, Clone)]
 pub struct AgentCmd {
@@ -168,6 +170,45 @@ impl SessionRegistry {
         let count = sessions.len();
         sessions.clear();
         tracing::info!(sessions = count, "registry shutdown");
+    }
+
+    /// Snapshot every live session for `/debug/sessions`. Sessions whose
+    /// actors have exited (handle closed) are skipped. Each live session
+    /// gets a `Snapshot` SessionMsg and a short timeout; sessions that
+    /// don't reply in time are skipped with a warn.
+    pub async fn snapshot(&self) -> Vec<SessionSnapshot> {
+        let handles: Vec<(String, SessionHandle)> = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .iter()
+                .filter(|(_, h)| h.is_alive())
+                .map(|(id, h)| (id.clone(), h.clone()))
+                .collect()
+        };
+
+        let mut out = Vec::with_capacity(handles.len());
+        for (id, handle) in handles {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if handle
+                .tx
+                .send(SessionMsg::Snapshot { ack: ack_tx })
+                .await
+                .is_err()
+            {
+                tracing::debug!(session = %id, "session unreachable during snapshot");
+                continue;
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(200), ack_rx).await {
+                Ok(Ok(snap)) => out.push(snap),
+                Ok(Err(_)) => {
+                    tracing::debug!(session = %id, "session actor dropped snapshot ack");
+                }
+                Err(_) => {
+                    tracing::warn!(session = %id, "snapshot timed out");
+                }
+            }
+        }
+        out
     }
 
     #[cfg(test)]

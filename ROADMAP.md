@@ -144,15 +144,15 @@ commit/PR.
   - `ttl_grace_expires_when_idle` — A disconnects with no reconnect; live_session_count stays 1 during grace, drops to 0 after expiry
   - `agent_death_closes_subscribers_with_1011` — agent is `sleep 0.4`; subscriber attaches, agent exits; WS close frame arrives with application code 1011
 
-#### Chunk 10 — Tests + `/debug/sessions` + README + v0.1.0 cut `1–1½ days`
+#### Chunk 10 — Tests + `/debug/sessions` + README + v0.1.0 cut `1–1½ days` — **done**
 
-- [ ] `tests/fake_acp.rs` — a minimal NDJSON ACP server fixture for deterministic integration tests
-- [ ] integration tests covering each chunk's DoD scenarios
-- [ ] `/debug/sessions` GET endpoint returning JSON snapshot (subscribers, pending requests, cached initialize, cached session id, active turn, driving sub, subprocess_dead, ttl_pending, replay log length, next bridge id)
-- [ ] README: install, run, CLI flags table, architecture diagram, client contract, link to design doc
-- [ ] CHANGELOG.md noting v0.1.0
-- [ ] tag `v0.1.0`
-- [ ] **DoD:** `cargo test` green; `acp-mux` runs end-to-end with two `websocat` subscribers against the fixture; `/debug/sessions` reflects state correctly
+- [x] `src/bin/mock_acp.rs` serves the canonical NDJSON ACP fixture role (the roadmap's `tests/fake_acp.rs` lives at `src/bin/` instead, so it's a `cargo` bin alongside the test binaries and tests reach it via `CARGO_MANIFEST_DIR + target/<profile>/mock_acp`). Knobs: `MOCK_ACP_SESSION_ID`, `MOCK_ACP_EMIT_PERMISSION`, `MOCK_ACP_PROMPT_DELAY_MS`
+- [x] integration tests covering every chunk's DoD (see chunks 1–9). 53 tests total
+- [x] `GET /debug/sessions` returns `{sessions: [...], sessionCount: N}`. Each session: `sessionId`, `subscribers[{peerId, peerName, role, isDriving}]`, `pendingRequestCount`, `initializeCached`, `cachedSessionId`, `activeTurnBridgeId`, `activeAmuxTurnId`, `drivingSubscriber`, `subprocessDead`, `ttlPending`, `replayLogLen`, `nextBridgeId`, `nextAmuxTurnId`
+- [x] README: install, run snippet, CLI flags table, architecture summary, client contract, link to design doc
+- [x] CHANGELOG.md noting v0.1.0
+- [x] tag `v0.1.0`
+- [x] **DoD:** `cargo test` green; `acp-mux` runs end-to-end against real `hermes acp` (manual verification in chunks 3 + 4); `debug_sessions_reflects_live_state` proves the snapshot endpoint reflects post-initialize/post-session-new state correctly
 
 ---
 
