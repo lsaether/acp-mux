@@ -43,25 +43,25 @@ commit/PR.
 
 ### Phase A — core multiplex routing
 
-#### Chunk 1 — Scaffold + JSON-RPC envelope `½ day`
+#### Chunk 1 — Scaffold + JSON-RPC envelope `½ day` — **done** (`f53adcb`)
 
-- [ ] `cargo new --bin acp-mux` (run from `~/Code/acp-mux`)
-- [ ] add deps: tokio, axum, tokio-tungstenite, serde, serde_json, tracing, tracing-subscriber, clap, anyhow, thiserror, url, futures
-- [ ] module skeleton: `src/{main, cli, server, session/{mod,registry,state}, agent/{mod,process}, protocol/{mod,jsonrpc,bridge}, multiplex/{mod,subscriber}}`
-- [ ] `protocol/jsonrpc.rs`: `Incoming` enum, `OutgoingRequest`/`Notification`/`Response`, `JsonRpcError`, parser
-- [ ] update `README.md` (one-line, install placeholder, CLI placeholder)
-- [ ] CI: rustfmt + clippy + cargo test on push (GitHub Actions)
-- [ ] `.gitignore`, `LICENSE` (MIT)
-- [ ] **DoD:** `cargo build`/`cargo test` pass; JSON-RPC envelope fixtures round-trip request/response/notification shapes
+- [x] `cargo new --bin acp-mux` (run from `~/Code/acp-mux`)
+- [x] add deps: tokio, axum, tokio-tungstenite, serde, serde_json, tracing, tracing-subscriber, clap, anyhow, thiserror, url, futures
+- [x] module skeleton: `src/{main, cli, server, session/{mod,registry,state}, agent/{mod,process}, protocol/{mod,jsonrpc,bridge}, multiplex/{mod,subscriber}}`
+- [x] `protocol/jsonrpc.rs`: `Incoming` enum, `IncomingRequest`/`IncomingNotification`/`IncomingResponse`, `JsonRpcError`, parser (aliases dropped — same shape suffices for outgoing)
+- [x] update `README.md` (one-line, install placeholder, CLI placeholder)
+- [x] CI: rustfmt + clippy + cargo test on push (GitHub Actions)
+- [x] `.gitignore`, `LICENSE` (MIT)
+- [x] **DoD:** `cargo build`/`cargo test` pass; JSON-RPC envelope fixtures round-trip request/response/notification shapes (12 tests)
 
-#### Chunk 2 — Subprocess driver + WS server skeleton `½–1 day`
+#### Chunk 2 — Subprocess driver + WS server skeleton `½–1 day` — **done** (`c1f5b26`)
 
-- [ ] `agent/process.rs`: `AgentProcess` — spawn via `tokio::process::Command`, NDJSON over stdin/stdout, graceful stop (close stdin, wait, kill on timeout)
-- [ ] `cli.rs`: clap config — `--host`, `--port`, `--agent-cmd`, `--session-ttl-seconds`, `--replay-turns`, `--log-level`
-- [ ] `server.rs`: axum app with `/healthz` (GET) + `/acp` (WS upgrade)
-- [ ] WS query parsing: `session`, `peer_id`, `peer_name`, `role`; `session` validated against `^[A-Za-z0-9_-]{1,128}$`
-- [ ] invalid query → WS close code 4400; `peer_id` collision → close 4409
-- [ ] **DoD:** `acp-mux` launches; `curl /healthz` returns ok; WS connect + close round-trips cleanly; invalid `?session=` rejected with 4400
+- [x] `agent/process.rs`: `AgentProcess` — spawn via `tokio::process::Command`, NDJSON over stdin/stdout, graceful stop (close stdin, wait, kill on timeout)
+- [x] `cli.rs`: clap config — `--host`, `--port`, `--agent-cmd`, `--session-ttl-seconds`, `--replay-turns`, `--log-level`
+- [x] `server.rs`: axum app with `/healthz` (GET) + `/acp` (WS upgrade)
+- [x] WS query parsing: `session`, `peer_id`, `peer_name`, `role`; `session` validated against `^[A-Za-z0-9_-]{1,128}$`
+- [x] invalid query → WS close code 4400; `peer_id` collision → close 4409 (per-session `HashSet<peer_id>` placeholder; replace with `SessionRegistry` in chunk 3)
+- [x] **DoD:** `acp-mux` launches; `curl /healthz` returns ok; WS connect + close round-trips cleanly; invalid `?session=` rejected with 4400 (15 chunk-2 tests; 27 total)
 
 #### Chunk 3 — Session registry + single-subscriber byte relay `½ day`
 
