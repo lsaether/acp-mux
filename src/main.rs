@@ -13,6 +13,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use crate::session::registry::{AgentCmd, SessionRegistry};
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = cli::Cli::parse();
@@ -21,8 +23,19 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| EnvFilter::new(cli.log_level.as_filter()));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let state = server::AppState::new();
-    let app = server::router(state);
+    let agent_cmd = cli
+        .agent_cmd
+        .as_deref()
+        .and_then(cli::split_agent_cmd)
+        .map(|(program, args)| AgentCmd { program, args });
+    if agent_cmd.is_none() {
+        tracing::warn!(
+            "--agent-cmd not configured; subscriber attaches will be rejected with close 1011",
+        );
+    }
+
+    let registry = SessionRegistry::new(agent_cmd);
+    let app = server::router(server::AppState::new(registry));
 
     let addr = SocketAddr::new(cli.host, cli.port);
     let listener = tokio::net::TcpListener::bind(addr)
