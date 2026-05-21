@@ -15,6 +15,7 @@ const METHOD_PEER_LEFT: &str = "amux/peer_left";
 const METHOD_TURN_STARTED: &str = "amux/turn_started";
 const METHOD_TURN_COMPLETE: &str = "amux/turn_complete";
 const METHOD_SESSION_BUSY: &str = "amux/session_busy";
+const METHOD_AGENT_REQUEST_RESOLVED: &str = "amux/agent_request_resolved";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AmuxTurnId(pub u64);
@@ -78,6 +79,24 @@ struct SessionBusyParams<'a> {
     busy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     held_by: Option<&'a str>,
+}
+
+/// Sibling of an agent-initiated request that the multiplexer broadcast
+/// to every subscriber. Emitted as soon as the first subscriber reply
+/// for a given agent request id is forwarded to the agent, so peers
+/// that lost the race (or never replied at all) can clear the request
+/// from their UI. Exactly one of `result` / `error` is populated and
+/// echoes the winning reply verbatim.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRequestResolvedParams<'a> {
+    session_id: &'a str,
+    request_id: &'a serde_json::Value,
+    resolved_by: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a serde_json::Value>,
 }
 
 fn encode<P: Serialize>(method: &'static str, params: P) -> Vec<u8> {
@@ -165,6 +184,25 @@ pub fn session_busy(session_id: &str, busy: bool, held_by: Option<&str>) -> Vec<
     )
 }
 
+pub fn agent_request_resolved(
+    session_id: &str,
+    request_id: &serde_json::Value,
+    resolved_by: &str,
+    result: Option<&serde_json::Value>,
+    error: Option<&serde_json::Value>,
+) -> Vec<u8> {
+    encode(
+        METHOD_AGENT_REQUEST_RESOLVED,
+        AgentRequestResolvedParams {
+            session_id,
+            request_id,
+            resolved_by,
+            result,
+            error,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +285,40 @@ mod tests {
 
         let v = parse(&session_busy("work", false, None));
         assert!(v["params"].get("heldBy").is_none());
+    }
+
+    #[test]
+    fn agent_request_resolved_with_result() {
+        let req_id = json!(10001);
+        let result = json!({"outcome": {"outcome": "selected", "optionId": "allow_once"}});
+        let v = parse(&agent_request_resolved(
+            "work",
+            &req_id,
+            "alice",
+            Some(&result),
+            None,
+        ));
+        assert_eq!(v["method"], json!("amux/agent_request_resolved"));
+        assert_eq!(v["params"]["sessionId"], json!("work"));
+        assert_eq!(v["params"]["requestId"], req_id);
+        assert_eq!(v["params"]["resolvedBy"], json!("alice"));
+        assert_eq!(v["params"]["result"], result);
+        assert!(v["params"].get("error").is_none());
+    }
+
+    #[test]
+    fn agent_request_resolved_with_error() {
+        let req_id = json!("perm-7");
+        let err = json!({"code": -32603, "message": "rejected"});
+        let v = parse(&agent_request_resolved(
+            "work",
+            &req_id,
+            "bob",
+            None,
+            Some(&err),
+        ));
+        assert_eq!(v["params"]["requestId"], req_id);
+        assert_eq!(v["params"]["error"], err);
+        assert!(v["params"].get("result").is_none());
     }
 }

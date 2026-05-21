@@ -1247,11 +1247,12 @@ mod tests {
         let _ = ws_b.send(ClientMsg::Close(None)).await;
     }
 
-    /// Chunk 5: agent-initiated requests route to the driving subscriber.
-    /// A drives by sending session/new, B is just attached. mock_acp emits
-    /// a permission/request on session/prompt — only A should see it.
+    /// Agent-initiated requests fan out to every attached subscriber so
+    /// any peer can confirm. Previously this was driver-only routing; the
+    /// duplicate-reply concern is now handled by the first-reply-wins
+    /// gate inside `SessionInner::gate_subscriber_response`.
     #[tokio::test]
-    async fn agent_request_routes_to_driving_subscriber() {
+    async fn agent_request_broadcasts_to_every_subscriber() {
         let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_EMIT_PERMISSION", "1")]).await;
         let url_a = format!("ws://{addr}/acp?session=drive&peer_id=A");
         let url_b = format!("ws://{addr}/acp?session=drive&peer_id=B");
@@ -1276,7 +1277,7 @@ mod tests {
         )
         .await;
 
-        // A sends prompt → mock emits permission/request (agent-initiated).
+        // A sends prompt → mock emits session/request_permission (agent-initiated).
         ws_a.send(ClientMsg::Text(
             r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#.into(),
         ))
@@ -1288,18 +1289,307 @@ mod tests {
 
         let perm_in_a = a_frames
             .iter()
-            .any(|v| v.get("method") == Some(&serde_json::json!("permission/request")));
+            .any(|v| v.get("method") == Some(&serde_json::json!("session/request_permission")));
         let perm_in_b = b_frames
             .iter()
-            .any(|v| v.get("method") == Some(&serde_json::json!("permission/request")));
+            .any(|v| v.get("method") == Some(&serde_json::json!("session/request_permission")));
         assert!(
             perm_in_a,
-            "driving subscriber A should receive permission/request, frames: {a_frames:?}",
+            "subscriber A should receive session/request_permission, frames: {a_frames:?}",
         );
         assert!(
-            !perm_in_b,
-            "non-driving subscriber B should NOT receive permission/request, frames: {b_frames:?}",
+            perm_in_b,
+            "subscriber B should also receive session/request_permission (broadcast), frames: {b_frames:?}",
         );
+
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
+    }
+
+    /// When two subscribers reply to the same agent-initiated request id,
+    /// only the first reply is forwarded to the agent. Proven by counting
+    /// `mock/response_echo` notifications emitted by the mock for the
+    /// specific permission id.
+    #[tokio::test]
+    async fn agent_request_first_reply_wins() {
+        let (addr, _) = spawn_server_with_mock_env(&[
+            ("MOCK_ACP_EMIT_PERMISSION", "1"),
+            ("MOCK_ACP_ECHO_RESPONSES", "1"),
+            ("MOCK_ACP_PROMPT_DELAY_MS", "400"),
+        ])
+        .await;
+        let url_a = format!("ws://{addr}/acp?session=first-wins&peer_id=A");
+        let url_b = format!("ws://{addr}/acp?session=first-wins&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let _ = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+        )
+        .await;
+
+        // Kick off the prompt; the prompt delay holds the agent open so
+        // both A and B have time to reply to the permission request.
+        ws_a.send(ClientMsg::Text(
+            r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        // Find the permission request id from the broadcast both sides
+        // received. The mock allocates 10_001 for the first prompt, but
+        // we read it from the wire so the test doesn't lock to the
+        // mock's internal counter.
+        async fn wait_for_perm_id<S>(
+            ws: &mut tokio_tungstenite::WebSocketStream<S>,
+            collected: &mut Vec<serde_json::Value>,
+        ) -> serde_json::Value
+        where
+            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if let Ok(Some(Ok(ClientMsg::Text(t)))) =
+                    timeout(Duration::from_millis(200), ws.next()).await
+                {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                    let is_perm =
+                        v.get("method") == Some(&serde_json::json!("session/request_permission"));
+                    collected.push(v.clone());
+                    if is_perm {
+                        return v["id"].clone();
+                    }
+                }
+            }
+            panic!("session/request_permission never arrived");
+        }
+
+        let mut a_frames = vec![];
+        let mut b_frames = vec![];
+        let perm_id_a = wait_for_perm_id(&mut ws_a, &mut a_frames).await;
+        let perm_id_b = wait_for_perm_id(&mut ws_b, &mut b_frames).await;
+        assert_eq!(
+            perm_id_a, perm_id_b,
+            "both subscribers must see the same agent request id"
+        );
+
+        // Both reply with spec-shaped outcomes. The agent should accept
+        // exactly one of them; amux/agent_request_resolved should echo
+        // whichever result was forwarded.
+        let reply_a = format!(
+            r#"{{"jsonrpc":"2.0","id":{perm_id_a},"result":{{"outcome":{{"outcome":"selected","optionId":"allow_once"}}}}}}"#,
+        );
+        let reply_b = format!(
+            r#"{{"jsonrpc":"2.0","id":{perm_id_b},"result":{{"outcome":{{"outcome":"selected","optionId":"deny"}}}}}}"#,
+        );
+        ws_a.send(ClientMsg::Text(reply_a.into())).await.unwrap();
+        ws_b.send(ClientMsg::Text(reply_b.into())).await.unwrap();
+
+        // Drain both sides for a fixed window. The mock is single-threaded
+        // and won't process the (buffered) permission reply until AFTER
+        // the prompt response is sent and it loops back to read stdin,
+        // so the echo arrives later than id=7. Keep collecting long
+        // enough to observe (or rule out) the late echo.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut saw_prompt_response = false;
+        while std::time::Instant::now() < deadline {
+            tokio::select! {
+                msg = ws_a.next() => {
+                    if let Some(Ok(ClientMsg::Text(t))) = msg {
+                        let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                        if v.get("id") == Some(&serde_json::json!(7))
+                            && v.get("result").is_some()
+                        {
+                            saw_prompt_response = true;
+                        }
+                        a_frames.push(v);
+                    }
+                }
+                msg = ws_b.next() => {
+                    if let Some(Ok(ClientMsg::Text(t))) = msg {
+                        let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                        b_frames.push(v);
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+        assert!(saw_prompt_response, "A never received the prompt response");
+
+        let perm_echoes: usize = a_frames
+            .iter()
+            .filter(|v| {
+                v.get("method") == Some(&serde_json::json!("mock/response_echo"))
+                    && v["params"]["id"] == perm_id_a
+            })
+            .count();
+        assert_eq!(
+            perm_echoes, 1,
+            "agent must receive exactly one reply for permission id; A frames: {a_frames:?}",
+        );
+
+        // Both peers should also see exactly one amux/agent_request_resolved
+        // for the resolved permission id, carrying the winning result and
+        // the resolving peer's id.
+        fn resolved_for<'a>(
+            frames: &'a [serde_json::Value],
+            req_id: &serde_json::Value,
+        ) -> Vec<&'a serde_json::Value> {
+            frames
+                .iter()
+                .filter(|v| {
+                    v.get("method") == Some(&serde_json::json!("amux/agent_request_resolved"))
+                        && &v["params"]["requestId"] == req_id
+                })
+                .collect()
+        }
+        let a_resolved = resolved_for(&a_frames, &perm_id_a);
+        let b_resolved = resolved_for(&b_frames, &perm_id_a);
+        assert_eq!(
+            a_resolved.len(),
+            1,
+            "A must see exactly one amux/agent_request_resolved; frames: {a_frames:?}"
+        );
+        assert_eq!(
+            b_resolved.len(),
+            1,
+            "B must see exactly one amux/agent_request_resolved; frames: {b_frames:?}"
+        );
+        let resolver = a_resolved[0]["params"]["resolvedBy"]
+            .as_str()
+            .expect("resolvedBy is a string");
+        assert!(
+            resolver == "A" || resolver == "B",
+            "resolvedBy must be one of the subscribers; got {resolver:?}"
+        );
+        // Whichever reply won, the broadcast result echoes its outcome
+        // (A=allow_once, B=deny). Both sides must see the same outcome.
+        let outcome = &a_resolved[0]["params"]["result"]["outcome"];
+        assert_eq!(outcome["outcome"], serde_json::json!("selected"));
+        let option_id = outcome["optionId"].as_str().expect("optionId is a string");
+        assert!(
+            option_id == "allow_once" || option_id == "deny",
+            "unexpected optionId {option_id:?}"
+        );
+        assert_eq!(
+            a_resolved[0], b_resolved[0],
+            "A and B must see identical amux/agent_request_resolved frames"
+        );
+
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
+    }
+
+    /// When a turn completes with an agent-initiated request still
+    /// outstanding (no peer ever replied — the agent's own deadline
+    /// fired and it carried on), the mux must sweep the entry and
+    /// broadcast `amux/agent_request_resolved { resolvedBy:
+    /// "mux:turn-ended" }` so peers can dismiss the stale UI.
+    #[tokio::test]
+    async fn agent_request_resolved_on_turn_end_when_no_reply() {
+        let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_EMIT_PERMISSION", "1")]).await;
+        let url_a = format!("ws://{addr}/acp?session=turn-end&peer_id=A");
+        let url_b = format!("ws://{addr}/acp?session=turn-end&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let _ = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+        )
+        .await;
+
+        // A sends a prompt. Neither A nor B replies to the permission
+        // request the mock emits; the mock proceeds anyway (mimicking
+        // an agent whose internal deadline fired without a reply).
+        ws_a.send(ClientMsg::Text(
+            r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let (a_frames, b_frames) =
+            collect_frames(&mut ws_a, &mut ws_b, Duration::from_secs(3)).await;
+
+        // Capture the permission id from the broadcast — comes through
+        // before turn end on both sides.
+        let perm_id_a = a_frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("session/request_permission")))
+            .map(|v| v["id"].clone())
+            .expect("A must have seen the permission/request");
+        assert_eq!(
+            perm_id_a,
+            b_frames
+                .iter()
+                .find(|v| v.get("method") == Some(&serde_json::json!("session/request_permission")))
+                .map(|v| v["id"].clone())
+                .expect("B must have seen the permission/request"),
+        );
+
+        // Both peers must see exactly one cleanup
+        // amux/agent_request_resolved with resolvedBy=mux:turn-ended
+        // for that id, and it must appear before amux/turn_complete.
+        fn find_resolved(
+            frames: &[serde_json::Value],
+            req_id: &serde_json::Value,
+        ) -> Option<usize> {
+            frames.iter().position(|v| {
+                v.get("method") == Some(&serde_json::json!("amux/agent_request_resolved"))
+                    && &v["params"]["requestId"] == req_id
+                    && v["params"]["resolvedBy"] == serde_json::json!("mux:turn-ended")
+            })
+        }
+        fn find_turn_complete(frames: &[serde_json::Value]) -> Option<usize> {
+            frames
+                .iter()
+                .position(|v| v.get("method") == Some(&serde_json::json!("amux/turn_complete")))
+        }
+
+        for (label, frames) in [("A", &a_frames), ("B", &b_frames)] {
+            let resolved_idx = find_resolved(frames, &perm_id_a).unwrap_or_else(|| {
+                panic!("{label}: missing mux:turn-ended cleanup; frames: {frames:?}")
+            });
+            let turn_complete_idx = find_turn_complete(frames).unwrap_or_else(|| {
+                panic!("{label}: missing amux/turn_complete; frames: {frames:?}")
+            });
+            assert!(
+                resolved_idx < turn_complete_idx,
+                "{label}: cleanup must precede turn_complete; resolved@{resolved_idx} turn_complete@{turn_complete_idx}",
+            );
+            // result and error are both absent on the cleanup broadcast.
+            let resolved = &frames[resolved_idx];
+            assert!(
+                resolved["params"].get("result").is_none()
+                    || resolved["params"]["result"].is_null(),
+                "{label}: cleanup must not carry a result; got {resolved:?}",
+            );
+            assert!(
+                resolved["params"].get("error").is_none() || resolved["params"]["error"].is_null(),
+                "{label}: cleanup must not carry an error; got {resolved:?}",
+            );
+        }
 
         let _ = ws_a.send(ClientMsg::Close(None)).await;
         let _ = ws_b.send(ClientMsg::Close(None)).await;
@@ -1339,8 +1629,8 @@ mod tests {
         drop(ws_a);
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        // B sends a prompt — without driver fallback the permission/request
-        // would have nowhere to go. With fallback it reaches B.
+        // B sends a prompt — the resulting session/request_permission must reach
+        // B (the only remaining subscriber, so broadcast = single-target).
         ws_b.send(ClientMsg::Text(
             r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#.into(),
         ))
@@ -1353,7 +1643,7 @@ mod tests {
             match timeout(Duration::from_millis(200), ws_b.next()).await {
                 Ok(Some(Ok(ClientMsg::Text(t)))) => {
                     let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
-                    if v.get("method") == Some(&serde_json::json!("permission/request")) {
+                    if v.get("method") == Some(&serde_json::json!("session/request_permission")) {
                         saw_perm = true;
                     }
                     if v.get("id") == Some(&serde_json::json!(7)) && v.get("result").is_some() {
@@ -1365,7 +1655,7 @@ mod tests {
         }
         assert!(
             saw_perm,
-            "B should have received the permission/request via driver fallback (B became driver after sending prompt)"
+            "B should have received the session/request_permission (sole attached subscriber)"
         );
 
         let _ = ws_b.send(ClientMsg::Close(None)).await;

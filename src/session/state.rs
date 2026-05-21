@@ -16,7 +16,10 @@
 //!   Otherwise allocate a per-session `mux_id`, store the
 //!   `(peer_id, original_id)` mapping, rewrite the `id`, and forward.
 //!   Substantive (non-`initialize`) requests also mark the sender as the
-//!   current "driving subscriber" — the target for agent-initiated requests.
+//!   current "driving subscriber" — surfaced in `amux/turn_started` and
+//!   `/debug/sessions`. Agent-initiated requests are broadcast (see the
+//!   Inbound (agent → subscribers) `request` arm below), so the driver
+//!   no longer has a privileged role at routing time.
 //! - `session/prompt` requests participate in turn serialization: while a
 //!   prompt is in flight, a second `session/prompt` is rejected locally
 //!   with JSON-RPC error code `-32001` ("session busy"). The active turn
@@ -32,10 +35,27 @@
 //!   originator only. If the original request was the first `initialize`
 //!   or `session/new`, cache the `result` for later joiners. If it matches
 //!   `active_turn_mux_id`, clear the active turn.
-//! - `request` → route to the driving subscriber if it is still attached,
-//!   otherwise fall back to one arbitrary attached subscriber. If none,
-//!   drop with a warn. Broadcasting would invite duplicate replies back to
-//!   the agent.
+//! - `request` → broadcast to every attached subscriber and record the
+//!   agent's request id as `InFlight`. Whichever subscriber replies first
+//!   gets its response forwarded to the agent; the id transitions to
+//!   `Consumed` and any later responses with the same id are dropped with
+//!   a debug log. On the InFlight → Consumed transition the mux also
+//!   broadcasts `amux/agent_request_resolved { requestId, resolvedBy,
+//!   result | error }` so peers that lost the race (or never replied)
+//!   can dismiss the request from their UI. This lets any attached peer
+//!   (not just the driver) confirm an agent-initiated request while
+//!   preserving the JSON-RPC contract that the agent sees exactly one
+//!   reply per id.
+//!
+//! Turn-end cleanup: when the session/prompt response arrives and
+//! `active_turn_mux_id` clears, the mux sweeps every `agent_pending`
+//! entry still `InFlight`, transitions them to `Consumed`, and
+//! broadcasts `amux/agent_request_resolved { resolvedBy:
+//! "mux:turn-ended", result: null, error: null }` for each. This catches
+//! the case where the agent times out an unanswered permission
+//! internally (e.g. hermes' 60s default) and proceeds without writing a
+//! response frame — without that sweep, TUI clients would be stuck
+//! displaying a permission the agent has already abandoned.
 //!
 //! Frames that fail JSON-RPC envelope parsing fall back to raw broadcast
 //! on the agent → subscribers direction (so non-JSON debug output, if any,
@@ -151,6 +171,16 @@ struct PendingRequest {
     handshake: Option<HandshakeKind>,
 }
 
+/// Lifecycle of an agent-initiated request id while we wait for the first
+/// subscriber to reply. `InFlight` accepts the next response; `Consumed`
+/// drops all further responses for the same id with a debug log so the
+/// agent never receives duplicate replies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentReqState {
+    InFlight,
+    Consumed,
+}
+
 struct SessionInner {
     session_id: String,
     subscribers: HashMap<String, Subscriber>,
@@ -174,6 +204,12 @@ struct SessionInner {
     /// Otherwise, every broadcast-tier frame (amux/* + agent notifications)
     /// is appended; new subscribers receive a snapshot at attach time.
     replay_log: Option<VecDeque<Bytes>>,
+    /// State for every agent-initiated request id we have ever broadcast
+    /// in this session. `InFlight` until the first subscriber reply
+    /// arrives; `Consumed` thereafter. We keep `Consumed` ids around for
+    /// the session lifetime so late/duplicate responses can be recognized
+    /// and dropped instead of leaking back to the agent.
+    agent_pending: HashMap<Id, AgentReqState>,
 }
 
 impl SessionInner {
@@ -201,6 +237,7 @@ impl SessionInner {
             active_amux_turn_id: None,
             next_amux_turn_id: 1,
             replay_log,
+            agent_pending: HashMap::new(),
         }
     }
 
@@ -341,9 +378,146 @@ impl SessionInner {
         };
         match frame {
             Incoming::Notification(_) => Some(bytes),
-            Incoming::Response(_) => Some(bytes),
+            Incoming::Response(resp) => self.gate_subscriber_response(peer_id, resp, bytes),
             Incoming::Request(req) => self.translate_outbound_request(peer_id, req),
         }
+    }
+
+    /// First-reply-wins gate for subscriber-originated responses. If the
+    /// id matches an agent-initiated request we broadcast, only the first
+    /// reply is forwarded; later replies for the same id are dropped.
+    /// Responses whose id is not tracked (stray replies, or replies
+    /// against ids the agent never asked us to multiplex) are forwarded
+    /// unchanged for robustness — the agent will ignore them if it has
+    /// no matching outstanding request.
+    fn gate_subscriber_response(
+        &mut self,
+        peer_id: &str,
+        resp: IncomingResponse,
+        bytes: Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        enum Decision {
+            Forward,
+            Drop,
+            Passthrough,
+        }
+        let decision = match self.agent_pending.get_mut(&resp.id) {
+            Some(state @ AgentReqState::InFlight) => {
+                *state = AgentReqState::Consumed;
+                Decision::Forward
+            }
+            Some(AgentReqState::Consumed) => Decision::Drop,
+            None => Decision::Passthrough,
+        };
+        match decision {
+            Decision::Forward => {
+                tracing::debug!(
+                    session = %self.session_id,
+                    %peer_id,
+                    id = ?resp.id,
+                    "first reply to agent-initiated request; forwarding to agent",
+                );
+                self.emit_agent_request_resolved(peer_id, &resp);
+                Some(bytes)
+            }
+            Decision::Drop => {
+                tracing::debug!(
+                    session = %self.session_id,
+                    %peer_id,
+                    id = ?resp.id,
+                    "duplicate reply to agent-initiated request; dropping",
+                );
+                None
+            }
+            Decision::Passthrough => Some(bytes),
+        }
+    }
+
+    /// Transition every `InFlight` `agent_pending` entry to `Consumed`
+    /// and broadcast a cleanup `amux/agent_request_resolved` for each.
+    /// Called at turn-end (`route_agent_response` clearing
+    /// `active_turn_mux_id`) — by that point any unresolved
+    /// agent-initiated request has been abandoned by the agent (hermes,
+    /// for example, internally times out at 60s and proceeds without
+    /// writing a response frame), so peers need to dismiss the prompt.
+    /// `result` and `error` are both `null` on the broadcast since no
+    /// reply was ever forwarded to the agent.
+    fn sweep_stale_agent_pending(&mut self, reason: &str) {
+        let stale_ids: Vec<Id> = self
+            .agent_pending
+            .iter()
+            .filter(|(_, state)| matches!(state, AgentReqState::InFlight))
+            .map(|(id, _)| id.clone())
+            .collect();
+        if stale_ids.is_empty() {
+            return;
+        }
+        for id in &stale_ids {
+            if let Some(state) = self.agent_pending.get_mut(id) {
+                *state = AgentReqState::Consumed;
+            }
+        }
+        tracing::info!(
+            session = %self.session_id,
+            stale_count = stale_ids.len(),
+            reason,
+            "sweeping unresolved agent-initiated requests",
+        );
+        for id in stale_ids {
+            let request_id_value = match serde_json::to_value(&id) {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(
+                        session = %self.session_id,
+                        error = %err,
+                        "failed to serialize stale agent-request id; skipping cleanup broadcast",
+                    );
+                    continue;
+                }
+            };
+            let frame = amux::agent_request_resolved(
+                &self.session_id,
+                &request_id_value,
+                reason,
+                None,
+                None,
+            );
+            self.broadcast(frame);
+        }
+    }
+
+    /// Broadcast `amux/agent_request_resolved` so peers can dismiss the
+    /// matching pending UI. Called once per agent-initiated request id
+    /// (on the InFlight → Consumed transition). The frame echoes the
+    /// winning subscriber's `result` or `error` verbatim; for the only
+    /// agent-initiated request the protocol currently has —
+    /// `session/request_permission` — the result is derived entirely
+    /// from `options[]` that was already broadcast in the request, so
+    /// no new information leaks.
+    fn emit_agent_request_resolved(&mut self, resolved_by: &str, resp: &IncomingResponse) {
+        let request_id_value = match serde_json::to_value(&resp.id) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    error = %err,
+                    "failed to serialize agent-request id; skipping resolved broadcast",
+                );
+                return;
+            }
+        };
+        let error_value = resp
+            .error
+            .as_ref()
+            .and_then(|e| serde_json::to_value(e).ok());
+        let frame = amux::agent_request_resolved(
+            &self.session_id,
+            &request_id_value,
+            resolved_by,
+            resp.result.as_ref(),
+            error_value.as_ref(),
+        );
+        self.broadcast(frame);
     }
 
     fn translate_outbound_request(
@@ -547,46 +721,45 @@ impl SessionInner {
                 self.route_agent_response(resp);
                 false
             }
-            Incoming::Request(_) => {
-                self.route_agent_request(line);
+            Incoming::Request(req) => {
+                self.route_agent_request(req.id, line);
                 false
             }
         }
     }
 
-    /// Route an agent-initiated request frame. Prefers the current driving
-    /// subscriber; falls back to one arbitrary attached subscriber if the
-    /// driver has detached; drops with a warn if no one is attached.
-    /// Not broadcast-tier — not appended to the replay log.
-    fn route_agent_request(&mut self, line: Vec<u8>) {
-        let target = self
-            .driving_subscriber_peer_id
-            .as_deref()
-            .filter(|peer_id| self.subscribers.contains_key(*peer_id))
-            .map(str::to_string)
-            .or_else(|| self.subscribers.keys().next().cloned());
-        match target {
-            Some(peer_id) => {
-                let drove = self.driving_subscriber_peer_id.as_deref() == Some(&peer_id);
-                tracing::debug!(
-                    session = %self.session_id,
-                    %peer_id,
-                    drove,
-                    "routing agent-initiated request",
-                );
-                if let Some(sub) = self.subscribers.get(&peer_id)
-                    && sub.outbound.send(OutMsg::Frame(Bytes::from(line))).is_err()
-                {
-                    tracing::debug!(%peer_id, "subscriber dropped while delivering agent request");
+    /// Fan out an agent-initiated request to every attached subscriber and
+    /// record the request id in `agent_pending` so the first subscriber
+    /// reply wins. Not broadcast-tier — not appended to the replay log
+    /// (replies are per-subscriber, and rejoining peers shouldn't be
+    /// asked to confirm something already resolved).
+    fn route_agent_request(&mut self, id: Id, line: Vec<u8>) {
+        if self.subscribers.is_empty() {
+            tracing::warn!(
+                session = %self.session_id,
+                id = ?id,
+                "agent-initiated request with no attached subscribers; dropping",
+            );
+            return;
+        }
+        self.agent_pending
+            .insert(id.clone(), AgentReqState::InFlight);
+        tracing::debug!(
+            session = %self.session_id,
+            id = ?id,
+            subscribers = self.subscribers.len(),
+            "broadcasting agent-initiated request",
+        );
+        let frame = Bytes::from(line);
+        self.subscribers.retain(|peer_id, sub| {
+            match sub.outbound.send(OutMsg::Frame(frame.clone())) {
+                Ok(()) => true,
+                Err(_) => {
+                    tracing::debug!(%peer_id, "outbound channel closed; dropping subscriber");
+                    false
                 }
             }
-            None => {
-                tracing::warn!(
-                    session = %self.session_id,
-                    "agent-initiated request with no attached subscribers; dropping",
-                );
-            }
-        }
+        });
     }
 
     fn route_agent_response(&mut self, mut resp: IncomingResponse) {
@@ -615,6 +788,13 @@ impl SessionInner {
                 amux_turn_id = ?turn_id.map(|t| t.formatted()),
                 "session/prompt response received; active turn cleared",
             );
+            // Sweep before emitting amux/turn_complete so subscribers see
+            // any abandoned-request cleanup events ahead of the turn
+            // closure. Any agent-initiated request still InFlight at this
+            // point was given up on by the agent (e.g. hermes' 60s
+            // permission timeout fires internally without writing a
+            // response frame).
+            self.sweep_stale_agent_pending("mux:turn-ended");
             if let Some(turn_id) = turn_id {
                 self.emit_turn_complete(turn_id, resp.result.as_ref());
             }

@@ -160,13 +160,72 @@ response with code `-32001`.
 }
 ```
 
+### `amux/agent_request_resolved`
+
+Broadcast when an agent-initiated request (e.g. `session/request_permission`)
+that the mux fanned out to every subscriber receives its first reply.
+The first reply is forwarded to the agent; later replies for the same
+id are dropped. This notification lets peers that lost the race (or
+never replied) dismiss the request from their UI.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "amux/agent_request_resolved",
+  "params": {
+    "sessionId": "work",
+    "requestId": 10001,
+    "resolvedBy": "phone-1",
+    "result": {
+      "outcome": { "outcome": "selected", "optionId": "allow_once" }
+    }
+  }
+}
+```
+
+Exactly one of `result` or `error` is populated and echoes the winning
+reply verbatim. For `session/request_permission` the body is derived
+entirely from `params.options[]` of the original request (which every
+peer already saw), so no new information leaks. If/when other agent →
+client request types start flowing through this path with sensitive
+response bodies, the design should be revisited.
+
+#### Turn-end cleanup variant
+
+When `session/prompt` completes with an agent-initiated request still
+unresolved (no subscriber ever replied — the agent likely fired its own
+deadline and proceeded without writing a response), the mux emits one
+`amux/agent_request_resolved` per stale id immediately before
+`amux/turn_complete`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "amux/agent_request_resolved",
+  "params": {
+    "sessionId": "work",
+    "requestId": 10001,
+    "resolvedBy": "mux:turn-ended",
+    "result": null,
+    "error": null
+  }
+}
+```
+
+Clients can distinguish a peer-resolved request (`resolvedBy` is a peer
+id) from a turn-end cleanup (`resolvedBy` is the literal string
+`"mux:turn-ended"` and both `result` and `error` are `null`). After the
+sweep the mux drops any late subscriber reply for the same id at the
+first-reply-wins gate, so the agent never sees a duplicate or stale
+answer.
+
 ## Late-join / replay log
 
 The multiplexer maintains a per-session event log: every broadcast-tier
 frame it has sent — its own `amux/*` notifications and the agent's
 `session/update` notifications. Per-subscriber frames (responses to a
-specific subscriber's requests, agent-initiated `permission/request`) are
-NOT logged; they're directed by definition.
+specific subscriber's requests, agent-initiated `session/request_permission`)
+are NOT logged; they're directed by definition.
 
 When a new subscriber attaches:
 
