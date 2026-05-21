@@ -1,7 +1,7 @@
 # acp-mux roadmap
 
 Build plan for `acp-mux`. Protocol contract is locked in
-`docs/design/bridge-namespace.md`; this doc covers *when* and *how* the
+`docs/design/amux-namespace.md`; this doc covers *when* and *how* the
 implementation lands.
 
 **Status legend:** `[ ]` not started · `[~]` in progress · `[x]` done
@@ -12,7 +12,7 @@ implementation lands.
 
 - Parse JSON-RPC envelopes only; payloads are `serde_json::Value`
 - Method-name string matching is the only ACP-aware policy hook
-- `bridge/*` namespace carries every multiplex fact
+- `amux/*` namespace carries every multiplex fact
 - No synthesized in-band ACP frames, ever
 - Single static binary, no runtime dependencies beyond the agent subprocess
 
@@ -25,7 +25,7 @@ implementation lands.
 - Driving-subscriber tracking for agent-initiated request routing
 - Turn serialization (one in-flight `session/prompt` per session, reject concurrents with `-32001`)
 - TTL reconnect grace on last-subscriber-leave
-- Full `bridge/*` namespace (turn_started, turn_complete, peer_joined, peer_left, session_busy)
+- Full `amux/*` namespace (turn_started, turn_complete, peer_joined, peer_left, session_busy)
 - Unbounded broadcast-tier replay log with attach-time playback
 - `/debug/sessions` introspection endpoint
 
@@ -33,7 +33,7 @@ implementation lands.
 
 ## v0.1 — initial multiplex implementation
 
-**Goal:** ship a non-opinionated ACP multiplexer with the full `bridge/*`
+**Goal:** ship a non-opinionated ACP multiplexer with the full `amux/*`
 namespace, multi-subscriber session sharing via id translation and
 handshake caching, turn serialization, and an unbounded replay log. Single
 static binary.
@@ -47,7 +47,7 @@ commit/PR.
 
 - [x] `cargo new --bin acp-mux` (run from `~/Code/acp-mux`)
 - [x] add deps: tokio, axum, tokio-tungstenite, serde, serde_json, tracing, tracing-subscriber, clap, anyhow, thiserror, url, futures
-- [x] module skeleton: `src/{main, cli, server, session/{mod,registry,state}, agent/{mod,process}, protocol/{mod,jsonrpc,bridge}, multiplex/{mod,subscriber}}`
+- [x] module skeleton: `src/{main, cli, server, session/{mod,registry,state}, agent/{mod,process}, protocol/{mod,jsonrpc,amux}, multiplex/{mod,subscriber}}`
 - [x] `protocol/jsonrpc.rs`: `Incoming` enum, `IncomingRequest`/`IncomingNotification`/`IncomingResponse`, `JsonRpcError`, parser (aliases dropped — same shape suffices for outgoing)
 - [x] update `README.md` (one-line, install placeholder, CLI placeholder)
 - [x] CI: rustfmt + clippy + cargo test on push (GitHub Actions)
@@ -102,18 +102,18 @@ commit/PR.
 - [x] `active_turn_bridge_id` cleared when the response matching that bridge_id arrives
 - [x] **DoD:** `concurrent_prompt_rejected_with_32001` (mock_acp with `MOCK_ACP_PROMPT_DELAY_MS=600`) proves second prompt is rejected with `-32001`, A's prompt completes, B can issue a fresh prompt after A's turn clears
 
-### Phase B — bridge namespace + replay
+### Phase B — amux namespace + replay
 
-#### Chunk 7 — `bridge/*` namespace notifications `1 day`
+#### Chunk 7 — `amux/*` namespace notifications `1 day`
 
-- [ ] `protocol/bridge.rs`: serde types for `BridgeTurnStarted`, `BridgeTurnComplete`, `BridgePeerJoined`, `BridgePeerLeft`, `BridgeSessionBusy`
-- [ ] emit `bridge/turn_started` on `session/prompt` forward (before sending to subprocess) — broadcast to all subscribers, `content` mirrored verbatim from request `params.prompt`
-- [ ] emit `bridge/turn_complete` when `session/prompt` response lands (or on abnormal turn termination) — broadcast with `stopReason`
-- [ ] emit `bridge/peer_joined` on attach (broadcast to existing subscribers)
-- [ ] emit `bridge/peer_left` on detach (broadcast to remaining subscribers)
-- [ ] emit `bridge/session_busy` on turn-rejection (finalize payload shape from chunk 6 stub)
-- [ ] `bridgeTurnId` allocation: monotonic per session (e.g. `bt-<n>`)
-- [ ] **DoD:** two-subscriber session: A prompts, both see `bridge/turn_started { peerId: A }` followed by ACP chunks followed by `bridge/turn_complete`; B's join triggers `peer_joined` to A
+- [ ] `protocol/amux.rs`: serde types for `AmuxTurnStarted`, `AmuxTurnComplete`, `AmuxPeerJoined`, `AmuxPeerLeft`, `AmuxSessionBusy`
+- [ ] emit `amux/turn_started` on `session/prompt` forward (before sending to subprocess) — broadcast to all subscribers, `content` mirrored verbatim from request `params.prompt`
+- [ ] emit `amux/turn_complete` when `session/prompt` response lands (or on abnormal turn termination) — broadcast with `stopReason`
+- [ ] emit `amux/peer_joined` on attach (broadcast to existing subscribers)
+- [ ] emit `amux/peer_left` on detach (broadcast to remaining subscribers)
+- [ ] emit `amux/session_busy` on turn-rejection (finalize payload shape from chunk 6 stub)
+- [ ] `amuxTurnId` allocation: monotonic per session (e.g. `at-<n>`)
+- [ ] **DoD:** two-subscriber session: A prompts, both see `amux/turn_started { peerId: A }` followed by ACP chunks followed by `amux/turn_complete`; B's join triggers `peer_joined` to A
 
 #### Chunk 8 — Replay log + `--replay-turns` flag `½–1 day`
 
@@ -151,7 +151,7 @@ commit/PR.
 
 Not committed; ideas only.
 
-- Bounded eviction for `--replay-turns N` (N > 0) using `bridge/turn_complete` bookends to mark eviction points
+- Bounded eviction for `--replay-turns N` (N > 0) using `amux/turn_complete` bookends to mark eviction points
 - Persistent on-disk log (survives `acp-mux` restart)
 - `/debug/replay-log` introspection endpoint
 - Replay log compaction (drop superseded `tool_call_update` frames)
@@ -159,7 +159,7 @@ Not committed; ideas only.
 ## v1.0 — future scope
 
 - Per-subscriber auth (token-based, separate from transport trust)
-- Subprocess crash recovery + auto-restart + `bridge/session_restored` event
+- Subprocess crash recovery + auto-restart + `amux/session_restored` event
 - Session discovery API (`GET /sessions`)
 - Concurrent turn handling — queue mode (`--turn-policy=queue`)
 - Multi-session per subprocess (if upstream agents support it)
@@ -180,6 +180,6 @@ Not committed; ideas only.
 
 - [ ] Axum vs raw hyper for the WS surface — lean axum for ergonomics. Confirm in chunk 2.
 - [ ] WS frame size limits and backpressure policy — defer to chunk 10 polish, document the v0.1 default.
-- [ ] `bridgeTurnId` format — `bt-<u64>` is fine; confirm in chunk 7.
+- [ ] `amuxTurnId` format — `at-<u64>` is fine; confirm in chunk 7.
 - [ ] Replay log storage type — lean `VecDeque<bytes::Bytes>` for cheap clone on fan-out. Confirm in chunk 8.
 - [ ] `/debug/sessions` schema — fields to surface: subscribers (address + peerId + isDriving), pending requests, cached initialize/sessionId, active turn, driving sub, subprocess_dead, ttl_pending, replay log length, next bridge id. Confirm in chunk 10.

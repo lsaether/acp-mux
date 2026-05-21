@@ -1,4 +1,4 @@
-# Bridge-namespace multiplex metadata
+# amux-namespace multiplex metadata
 
 **Status:** v0.1 spec.
 
@@ -15,7 +15,7 @@ calls, tracking plan state, and everything else that depends on what ACP
 
 Concretely, the multiplexer MUST NOT fabricate frames in the ACP namespace.
 Any out-of-band signal it needs to publish — peer presence, turn boundaries,
-busy state, late-join history — goes under `bridge/*` with explicit payload.
+busy state, late-join history — goes under `amux/*` with explicit payload.
 
 ACP frames flow byte-for-byte from agent to clients; multiplex facts flow
 through their own namespace. Clients receive two distinguishable channels and
@@ -33,12 +33,12 @@ subscriber initiated a turn, which subscribers are currently attached, when
 a turn opened and closed, when a session is busy. Two ways to do this:
 
 - **In-band:** synthesize ACP-namespace frames that encode the metadata.
-- **Out-of-band:** publish under a distinct method namespace (`bridge/*`).
+- **Out-of-band:** publish under a distinct method namespace (`amux/*`).
 
 Out-of-band wins for these reasons:
 
 - **Frames are unambiguous.** A frame under `session/*` is something the
-  agent emitted. A frame under `bridge/*` is something the multiplexer
+  agent emitted. A frame under `amux/*` is something the multiplexer
   emitted. Clients can't confuse them.
 - **Attribution survives.** ACP frame shapes don't carry a "from which
   subscriber" field — it isn't in the spec. A custom namespace can
@@ -47,29 +47,29 @@ Out-of-band wins for these reasons:
   servers don't emit (e.g.) `user_message_chunk` because the local
   client renders its own input. Synthesizing such frames in a multiplex
   context pretends the agent did something it didn't.
-- **Forward compatible.** New multiplex facts add new `bridge/*` methods
+- **Forward compatible.** New multiplex facts add new `amux/*` methods
   without touching the ACP surface.
 
-The cost: clients must demultiplex two channels. `bridge/*` is a small
+The cost: clients must demultiplex two channels. `amux/*` is a small
 namespace and clients already need to handle unknown methods gracefully, so
 this is cheap.
 
-## The `bridge/*` namespace
+## The `amux/*` namespace
 
-### `bridge/turn_started`
+### `amux/turn_started`
 
 Broadcast to every subscriber (including the originator) when the
 multiplexer forwards a `session/prompt` to the subprocess. Pairs with
-`bridge/turn_complete` as a bookend, and carries the prompt content so peer
+`amux/turn_complete` as a bookend, and carries the prompt content so peer
 clients can render it without a separate notification.
 
 ```json
 {
   "jsonrpc": "2.0",
-  "method": "bridge/turn_started",
+  "method": "amux/turn_started",
   "params": {
     "sessionId": "work",
-    "bridgeTurnId": "bt-42",
+    "amuxTurnId": "at-42",
     "peerId": "phone-1",
     "peerName": "phone",
     "role": "default",
@@ -89,7 +89,7 @@ This event single-handedly carries everything needed to open a turn:
 attribution, content, and a stable id. Clients route all ACP output between
 `turn_started` and `turn_complete` into the named turn.
 
-### `bridge/turn_complete`
+### `amux/turn_complete`
 
 Broadcast to every subscriber when the active turn's `session/prompt`
 response lands, or when the subprocess aborts the turn.
@@ -97,25 +97,25 @@ response lands, or when the subprocess aborts the turn.
 ```json
 {
   "jsonrpc": "2.0",
-  "method": "bridge/turn_complete",
+  "method": "amux/turn_complete",
   "params": {
     "sessionId": "work",
-    "bridgeTurnId": "bt-42",
+    "amuxTurnId": "at-42",
     "stopReason": "end_turn"
   }
 }
 ```
 
-`bridgeTurnId` matches a prior `bridge/turn_started`. Abnormal terminations
+`amuxTurnId` matches a prior `amux/turn_started`. Abnormal terminations
 (subprocess crash mid-turn, etc.) surface as a distinguished `stopReason`
 value rather than a separate event type.
 
-### `bridge/peer_joined` / `bridge/peer_left`
+### `amux/peer_joined` / `amux/peer_left`
 
 ```json
 {
   "jsonrpc": "2.0",
-  "method": "bridge/peer_joined",
+  "method": "amux/peer_joined",
   "params": {
     "sessionId": "work",
     "peerId": "phone-1",
@@ -128,7 +128,7 @@ value rather than a separate event type.
 ```json
 {
   "jsonrpc": "2.0",
-  "method": "bridge/peer_left",
+  "method": "amux/peer_left",
   "params": {
     "sessionId": "work",
     "peerId": "phone-1"
@@ -142,7 +142,7 @@ the replay log (see below), which already contains `peer_joined` events for
 every peer still in the session — no per-peer presence replay needed at
 attach time.
 
-### `bridge/session_busy`
+### `amux/session_busy`
 
 Broadcast when a `session/prompt` is rejected because another turn is
 already in flight. The rejected subscriber also gets a JSON-RPC error
@@ -151,7 +151,7 @@ response with code `-32001`.
 ```json
 {
   "jsonrpc": "2.0",
-  "method": "bridge/session_busy",
+  "method": "amux/session_busy",
   "params": {
     "sessionId": "work",
     "busy": true,
@@ -163,7 +163,7 @@ response with code `-32001`.
 ## Late-join / replay log
 
 The multiplexer maintains a per-session event log: every broadcast-tier
-frame it has sent — its own `bridge/*` notifications and the agent's
+frame it has sent — its own `amux/*` notifications and the agent's
 `session/update` notifications. Per-subscriber frames (responses to a
 specific subscriber's requests, agent-initiated `permission/request`) are
 NOT logged; they're directed by definition.
@@ -222,7 +222,7 @@ reconnects feel continuous without the human picking an identity by hand.
 
 A client consuming this protocol needs to:
 
-1. On `bridge/turn_started`, open a Turn record attributed to `peerId`,
+1. On `amux/turn_started`, open a Turn record attributed to `peerId`,
    with `content` as the prompt. Render `content` unless
    `peerId == self.peerId` — that subscriber already rendered the prompt
    locally before sending it.
@@ -230,25 +230,25 @@ A client consuming this protocol needs to:
    `agent_message_chunk` → response text, `agent_thought_chunk` →
    thinking buffer, `tool_call` / `tool_call_update` → tool call records,
    `plan` → plan, `usage_update` → context-window indicator.
-3. On `bridge/turn_complete`, close the Turn with `stopReason`.
+3. On `amux/turn_complete`, close the Turn with `stopReason`.
 
-The `bridge/*` bookends remove the need for client-side heuristics like
+The `amux/*` bookends remove the need for client-side heuristics like
 "close the previous turn when a new prompt arrives" or "dedup my own
-prompt's echo from the bridge fan-out" — those become protocol-side
-problems the `bridge/*` namespace solves explicitly via `peerId` and
+prompt's echo from the amux fan-out" — those become protocol-side
+problems the `amux/*` namespace solves explicitly via `peerId` and
 explicit boundaries.
 
 ## Tradeoffs
 
 - **Vanilla ACP clients pointed at the multiplexer lose peer visibility.**
-  They won't understand `bridge/turn_started`, so peer prompts become
+  They won't understand `amux/turn_started`, so peer prompts become
   invisible to them. This is the correct cost: pretending multiplex facts
   were agent facts produces subtle confusion downstream. Explicit
   ignorance beats silent corruption.
 - **Two-channel mental model on clients.** Clients demultiplex ACP from
-  `bridge/*` rather than treating everything as `session/update`.
+  `amux/*` rather than treating everything as `session/update`.
 - **Multiplexer models turn-of-conversation boundaries explicitly.** It
-  already needs to (to serialize `session/prompt`); the `bridge/*`
+  already needs to (to serialize `session/prompt`); the `amux/*`
   namespace just makes the boundary visible to clients. Not new state,
   just published state.
 - **Unbounded replay log in v0.1.** Long-running sessions accumulate

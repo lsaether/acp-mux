@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn notification_without_params() {
-        let v = json!({ "jsonrpc": "2.0", "method": "bridge/peer_left" });
+        let v = json!({ "jsonrpc": "2.0", "method": "amux/peer_left" });
         let inc = Incoming::from_value(v.clone()).unwrap();
         assert!(matches!(inc, Incoming::Notification(_)));
         // Params absent stays absent (not serialized as null).
