@@ -118,15 +118,16 @@ commit/PR.
   - `amux_turn_started_and_complete` — A's prompt with `content=[{type:text,text:hi}]` produces `turn_started{amuxTurnId:at-1, content:[…]}` to both A and B before mock_acp responds, and `turn_complete{amuxTurnId:at-1, stopReason:end_turn}` after
   - `amux_session_busy_on_concurrent_prompt` — B's concurrent prompt produces `session_busy{busy:true, heldBy:A}` to B (broadcast)
 
-#### Chunk 8 — Replay log + `--replay-turns` flag `½–1 day`
+#### Chunk 8 — Replay log + `--replay-turns` flag `½–1 day` — **done**
 
-- [ ] `SessionState.broadcast_log: VecDeque<Bytes>` — append every broadcast-tier frame (raw bytes, no introspection)
-- [ ] log excludes: responses to specific subscribers, agent-initiated requests
-- [ ] on subscriber attach: flush full log to newcomer before adding them to live broadcast set; queue live events during replay and drain after
-- [ ] `--replay-turns 0` → skip the replay entirely (do not maintain log either, to avoid wasted memory)
-- [ ] `--replay-turns unbounded` (default) → append-only, no eviction
-- [ ] `--replay-turns N` (N > 0) → **stub**: accept the value, log warning that bounded eviction is not yet implemented, fall through to unbounded behavior. Bounded eviction logic deferred (see v0.2)
-- [ ] **DoD:** subscriber A prompts and completes a turn; subscriber B attaches and receives a full replay (peer_joined for A, turn_started + ACP chunks + turn_complete) before any live events; ordering preserved across replay/live boundary
+- [x] `SessionInner.replay_log: Option<VecDeque<Bytes>>` — `None` when policy is `Disabled` so no memory is reserved
+- [x] `Subscriber.outbound` channel switched to `mpsc::UnboundedSender<Bytes>`; fan-out is now an atomic ref-count bump per subscriber rather than a full memcpy. `ws_out_task` consumes `Bytes` and converts to `Utf8Bytes` for the text frame
+- [x] `broadcast()` is the single broadcast-tier gate: appends to log (if enabled) AND fans out to subscribers in one place. Per-subscriber frames (responses, agent-initiated requests) bypass `broadcast()` and therefore the log
+- [x] on attach: snapshot the log BEFORE emitting the newcomer's own `peer_joined`, then emit + broadcast + insert + send snapshot to newcomer. Because the actor serializes all SessionMsg handling, no live frames interleave
+- [x] `--replay-turns 0` → `ReplayTurns::Disabled` → `replay_log = None`
+- [x] `--replay-turns unbounded` (default) → `ReplayTurns::Unbounded` → empty `VecDeque`, append-only, no eviction
+- [x] `--replay-turns N` (N > 0) → stub: warn at session creation, behave as unbounded for v0.1
+- [x] **DoD:** `replay_log_delivers_history_to_late_joiner` proves A completes a full turn, B attaches afterward and receives `peer_joined(A)` → `turn_started` → two `session/update` → `turn_complete` in order; A's prompt response (per-subscriber) is NOT in B's replay. `replay_turns_disabled_emits_no_history` proves the disabled policy keeps B's queue empty until the next live event
 
 ### Phase C — lifecycle + polish
 

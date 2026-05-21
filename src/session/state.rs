@@ -43,14 +43,16 @@
 //! subscriber → agent direction (we will not feed garbage to a real ACP
 //! server).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
+use bytes::Bytes;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::agent::process::AgentProcess;
+use crate::cli::ReplayTurns;
 use crate::multiplex::subscriber::Subscriber;
 use crate::protocol::amux::{self, AmuxTurnId};
 use crate::protocol::jsonrpc::{
@@ -133,10 +135,25 @@ struct SessionInner {
     active_amux_turn_id: Option<AmuxTurnId>,
     /// Monotonic per-session counter for `amuxTurnId` allocation.
     next_amux_turn_id: u64,
+    /// Replay log. `None` when policy is `Disabled` (saves memory).
+    /// Otherwise, every broadcast-tier frame (amux/* + agent notifications)
+    /// is appended; new subscribers receive a snapshot at attach time.
+    replay_log: Option<VecDeque<Bytes>>,
 }
 
 impl SessionInner {
-    fn new(session_id: String) -> Self {
+    fn new(session_id: String, replay_policy: ReplayTurns) -> Self {
+        let replay_log = match replay_policy {
+            ReplayTurns::Disabled => None,
+            ReplayTurns::Unbounded => Some(VecDeque::new()),
+            ReplayTurns::Bounded(n) => {
+                tracing::warn!(
+                    bound = n,
+                    "--replay-turns N (bounded eviction) accepted but not yet implemented; behaving as unbounded for v0.1",
+                );
+                Some(VecDeque::new())
+            }
+        };
         Self {
             session_id,
             subscribers: HashMap::new(),
@@ -148,17 +165,32 @@ impl SessionInner {
             active_turn_bridge_id: None,
             active_amux_turn_id: None,
             next_amux_turn_id: 1,
+            replay_log,
         }
     }
 
-    /// Attach a subscriber. Emits `amux/peer_joined` to every existing
-    /// subscriber before inserting — so the newcomer does not see their
-    /// own join. The replay log (chunk 8) records the frame so late
-    /// joiners learn about everyone.
+    /// Attach a subscriber. Order:
+    ///
+    /// 1. Snapshot the replay log (before newcomer's own peer_joined enters).
+    /// 2. Emit amux/peer_joined → broadcast to existing subs (newcomer is
+    ///    not in the map yet) + append to log.
+    /// 3. Insert newcomer into subscriber map.
+    /// 4. Deliver the snapshot to the newcomer's outbound. The snapshot
+    ///    contains every broadcast-tier frame that happened before this
+    ///    attach, in order, so the newcomer reconstructs the session.
+    ///
+    /// Because the actor serializes all SessionMsg handling, no live frames
+    /// can interleave during this sequence.
     fn attach(&mut self, subscriber: Subscriber) -> Result<(), AttachError> {
         if self.subscribers.contains_key(&subscriber.peer_id) {
             return Err(AttachError::PeerIdInUse);
         }
+        let snapshot: Vec<Bytes> = self
+            .replay_log
+            .as_ref()
+            .map(|log| log.iter().cloned().collect())
+            .unwrap_or_default();
+
         let frame = amux::peer_joined(
             &self.session_id,
             &subscriber.peer_id,
@@ -166,13 +198,24 @@ impl SessionInner {
             subscriber.role.as_deref(),
         );
         self.broadcast(frame);
+
+        let peer_id = subscriber.peer_id.clone();
         tracing::info!(
             session = %self.session_id,
-            peer_id = %subscriber.peer_id,
+            peer_id = %peer_id,
+            replay_frames = snapshot.len(),
             "subscriber joined session",
         );
-        self.subscribers
-            .insert(subscriber.peer_id.clone(), subscriber);
+        self.subscribers.insert(peer_id.clone(), subscriber);
+
+        if let Some(sub) = self.subscribers.get(&peer_id) {
+            for frame in snapshot {
+                if sub.outbound.send(frame).is_err() {
+                    tracing::debug!(%peer_id, "newcomer dropped during replay");
+                    break;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -365,7 +408,7 @@ impl SessionInner {
             }),
         };
         let bytes = match serde_json::to_vec(&resp) {
-            Ok(b) => b,
+            Ok(b) => Bytes::from(b),
             Err(err) => {
                 tracing::error!(error = %err, "failed to serialize error response");
                 return;
@@ -386,7 +429,7 @@ impl SessionInner {
             error: None,
         };
         let bytes = match serde_json::to_vec(&resp) {
-            Ok(b) => b,
+            Ok(b) => Bytes::from(b),
             Err(err) => {
                 tracing::error!(error = %err, "failed to serialize cached response");
                 return;
@@ -429,6 +472,7 @@ impl SessionInner {
     /// Route an agent-initiated request frame. Prefers the current driving
     /// subscriber; falls back to one arbitrary attached subscriber if the
     /// driver has detached; drops with a warn if no one is attached.
+    /// Not broadcast-tier — not appended to the replay log.
     fn route_agent_request(&mut self, line: Vec<u8>) {
         let target = self
             .driving_subscriber_peer_id
@@ -446,7 +490,7 @@ impl SessionInner {
                     "routing agent-initiated request",
                 );
                 if let Some(sub) = self.subscribers.get(&peer_id)
-                    && sub.outbound.send(line).is_err()
+                    && sub.outbound.send(Bytes::from(line)).is_err()
                 {
                     tracing::debug!(%peer_id, "subscriber dropped while delivering agent request");
                 }
@@ -513,7 +557,7 @@ impl SessionInner {
 
         resp.id = pr.original_id;
         let bytes = match serde_json::to_vec(&resp) {
-            Ok(b) => b,
+            Ok(b) => Bytes::from(b),
             Err(err) => {
                 tracing::error!(error = %err, "failed to serialize translated response");
                 return;
@@ -528,12 +572,21 @@ impl SessionInner {
         }
     }
 
-    /// Send `line` to every subscriber. Drops subscribers whose outbound
-    /// channel has closed. Returns true if the session has no live
-    /// subscribers afterward.
-    fn broadcast(&mut self, line: Vec<u8>) -> bool {
+    /// Send `frame` to every subscriber and append to the replay log if
+    /// enabled. Drops subscribers whose outbound channel has closed.
+    /// Returns true if the session has no live subscribers afterward.
+    ///
+    /// Only broadcast-tier frames flow through here: amux/* notifications
+    /// and the agent's session/update (and other notification-shaped)
+    /// frames. Per-subscriber frames (responses, agent-initiated requests)
+    /// do NOT go through `broadcast` and are NOT logged.
+    fn broadcast(&mut self, frame: impl Into<Bytes>) -> bool {
+        let frame: Bytes = frame.into();
+        if let Some(log) = self.replay_log.as_mut() {
+            log.push_back(frame.clone());
+        }
         self.subscribers
-            .retain(|peer_id, sub| match sub.outbound.send(line.clone()) {
+            .retain(|peer_id, sub| match sub.outbound.send(frame.clone()) {
                 Ok(()) => true,
                 Err(_) => {
                     tracing::debug!(%peer_id, "outbound channel closed; dropping subscriber");
@@ -552,6 +605,7 @@ pub fn spawn_session(
     initial_subscriber: Subscriber,
     mut agent: AgentProcess,
     session_id: String,
+    replay_policy: ReplayTurns,
 ) -> (SessionHandle, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<SessionMsg>(SESSION_QUEUE_CAPACITY);
     let stdout_rx = agent
@@ -575,7 +629,14 @@ pub fn spawn_session(
         tracing::debug!(session = %pump_session_id, "stdout pump finished");
     });
 
-    let actor = tokio::spawn(run_session(rx, agent, initial_subscriber, pump, session_id));
+    let actor = tokio::spawn(run_session(
+        rx,
+        agent,
+        initial_subscriber,
+        pump,
+        session_id,
+        replay_policy,
+    ));
     (SessionHandle { tx }, actor)
 }
 
@@ -585,8 +646,9 @@ async fn run_session(
     initial_subscriber: Subscriber,
     pump: JoinHandle<()>,
     session_id: String,
+    replay_policy: ReplayTurns,
 ) {
-    let mut inner = SessionInner::new(session_id.clone());
+    let mut inner = SessionInner::new(session_id.clone(), replay_policy);
     // Unified attach path: the initial subscriber goes through `attach`
     // just like late joiners, so `amux/peer_joined` fires consistently
     // (and goes into the replay log in chunk 8).

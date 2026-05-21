@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let registry = SessionRegistry::new(agent_cmd);
+    let registry = SessionRegistry::new(agent_cmd, cli.replay_turns);
     let app = server::router(server::AppState::new(registry));
 
     let addr = SocketAddr::new(cli.host, cli.port);

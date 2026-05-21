@@ -13,6 +13,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, oneshot};
 
 use crate::agent::process::AgentProcess;
+use crate::cli::ReplayTurns;
 use crate::multiplex::subscriber::Subscriber;
 use crate::session::state::{AttachError, SessionHandle, SessionMsg, spawn_session};
 
@@ -36,13 +37,15 @@ pub enum RegistryError {
 
 pub struct SessionRegistry {
     agent_cmd: Option<AgentCmd>,
+    replay_policy: ReplayTurns,
     sessions: Mutex<HashMap<String, SessionHandle>>,
 }
 
 impl SessionRegistry {
-    pub fn new(agent_cmd: Option<AgentCmd>) -> Arc<Self> {
+    pub fn new(agent_cmd: Option<AgentCmd>, replay_policy: ReplayTurns) -> Arc<Self> {
         Arc::new(Self {
             agent_cmd,
+            replay_policy,
             sessions: Mutex::new(HashMap::new()),
         })
     }
@@ -117,7 +120,12 @@ impl SessionRegistry {
         let agent = AgentProcess::spawn(&cmd.program, &cmd.args)
             .await
             .map_err(RegistryError::AgentSpawn)?;
-        let (handle, _actor) = spawn_session(subscriber, agent, session_id.to_string());
+        let (handle, _actor) = spawn_session(
+            subscriber,
+            agent,
+            session_id.to_string(),
+            self.replay_policy,
+        );
         sessions.insert(session_id.to_string(), handle.clone());
         tracing::info!(session = %session_id, "spawned session");
         Ok(handle)
