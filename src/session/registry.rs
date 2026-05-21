@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use thiserror::Error;
 use tokio::sync::{Mutex, oneshot};
@@ -38,14 +39,20 @@ pub enum RegistryError {
 pub struct SessionRegistry {
     agent_cmd: Option<AgentCmd>,
     replay_policy: ReplayTurns,
+    session_ttl: Duration,
     sessions: Mutex<HashMap<String, SessionHandle>>,
 }
 
 impl SessionRegistry {
-    pub fn new(agent_cmd: Option<AgentCmd>, replay_policy: ReplayTurns) -> Arc<Self> {
+    pub fn new(
+        agent_cmd: Option<AgentCmd>,
+        replay_policy: ReplayTurns,
+        session_ttl: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             agent_cmd,
             replay_policy,
+            session_ttl,
             sessions: Mutex::new(HashMap::new()),
         })
     }
@@ -125,6 +132,7 @@ impl SessionRegistry {
             agent,
             session_id.to_string(),
             self.replay_policy,
+            self.session_ttl,
         );
         sessions.insert(session_id.to_string(), handle.clone());
         tracing::info!(session = %session_id, "spawned session");

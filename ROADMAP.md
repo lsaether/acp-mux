@@ -131,13 +131,18 @@ commit/PR.
 
 ### Phase C — lifecycle + polish
 
-#### Chunk 9 — TTL reconnect grace `½ day`
+#### Chunk 9 — TTL reconnect grace `½ day` — **done**
 
-- [ ] `SessionState.ttl_task: Option<JoinHandle<()>>` scheduled on last-subscriber-leave
-- [ ] new subscriber attaching cancels pending TTL task
-- [ ] TTL expiry → tear down subprocess + remove session from registry
-- [ ] subprocess crash → set `subprocess_dead = true`, skip TTL grace, close subscribers with WS code 1011
-- [ ] **DoD:** disconnect → reconnect within TTL → same subprocess (verify via debug snapshot); disconnect → wait past TTL → subprocess gone
+- [x] TTL grace driven by `tokio::select!` in the actor loop with an optional `Pin<Box<tokio::time::Sleep>>` (no separate JoinHandle to track or cancel — drop the Sleep to "cancel"). Simpler than the roadmap's `ttl_task` sketch and avoids self-channel ownership issues
+- [x] new subscriber attaching takes the Sleep out of the option (cancellation)
+- [x] TTL expiry → break out of actor loop → `agent.shutdown()` + pump abort + session_handle becomes dead
+- [x] subprocess crash (stdout EOF → AgentDied) → `close_all_subscribers(1011, "agent subprocess exited")` then teardown — TTL grace is skipped entirely
+- [x] structured WS close plumbed via `OutMsg::Close { code, reason }` in `Subscriber.outbound`; chunk-3's "just drop the sender" path is replaced for the agent-death case (defaults still drop for clean disconnects)
+- [x] CLI `--session-ttl-seconds` flows through `SessionRegistry::new` → `spawn_session` → `run_session`
+- [x] **DoD:** integration tests prove all three behaviors:
+  - `ttl_grace_cancelled_by_reconnect` — A connects, A initializes, A disconnects; live_session_count stays 1 during grace; B reconnects within grace; B's `initialize` is answered from A's cache (`_invocation: 1`), proving same subprocess
+  - `ttl_grace_expires_when_idle` — A disconnects with no reconnect; live_session_count stays 1 during grace, drops to 0 after expiry
+  - `agent_death_closes_subscribers_with_1011` — agent is `sleep 0.4`; subscriber attaches, agent exits; WS close frame arrives with application code 1011
 
 #### Chunk 10 — Tests + `/debug/sessions` + README + v0.1.0 cut `1–1½ days`
 

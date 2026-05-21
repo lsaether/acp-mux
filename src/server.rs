@@ -22,13 +22,12 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use bytes::Bytes;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-use crate::multiplex::subscriber::Subscriber;
+use crate::multiplex::subscriber::{OutMsg, Subscriber};
 use crate::session::registry::{RegistryError, SessionRegistry};
 use crate::session::state::SessionMsg;
 
@@ -95,7 +94,7 @@ async fn handle_attach(state: AppState, q: AttachQuery, mut socket: WebSocket) {
         role,
     } = validated;
 
-    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Bytes>();
+    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutMsg>();
     let subscriber = Subscriber::new(peer_id.clone(), peer_name, role, outbound_tx);
 
     let handle = match state.registry.attach(&session, subscriber).await {
@@ -207,20 +206,32 @@ async fn ws_in_task(
 
 async fn ws_out_task(
     mut ws_sink: SplitSink<WebSocket, Message>,
-    mut outbound_rx: mpsc::UnboundedReceiver<Bytes>,
+    mut outbound_rx: mpsc::UnboundedReceiver<OutMsg>,
     peer_id: String,
     session: String,
 ) {
-    while let Some(bytes) = outbound_rx.recv().await {
-        match Utf8Bytes::try_from(bytes) {
-            Ok(text) => {
-                if ws_sink.send(Message::Text(text)).await.is_err() {
-                    tracing::debug!(%session, %peer_id, "ws_out: peer dropped");
-                    return;
+    while let Some(msg) = outbound_rx.recv().await {
+        match msg {
+            OutMsg::Frame(bytes) => match Utf8Bytes::try_from(bytes) {
+                Ok(text) => {
+                    if ws_sink.send(Message::Text(text)).await.is_err() {
+                        tracing::debug!(%session, %peer_id, "ws_out: peer dropped");
+                        return;
+                    }
                 }
-            }
-            Err(err) => {
-                tracing::warn!(%session, %peer_id, error = %err, "non-UTF8 agent stdout line; dropped");
+                Err(err) => {
+                    tracing::warn!(%session, %peer_id, error = %err, "non-UTF8 agent stdout line; dropped");
+                }
+            },
+            OutMsg::Close { code, reason } => {
+                tracing::info!(%session, %peer_id, code, %reason, "ws_out: structured close");
+                let _ = ws_sink
+                    .send(Message::Close(Some(CloseFrame {
+                        code,
+                        reason: reason.into(),
+                    })))
+                    .await;
+                return;
             }
         }
     }
@@ -304,8 +315,20 @@ mod tests {
         .await
     }
 
+    /// Default short TTL for tests so last-subscriber-leave teardown is
+    /// observable within a normal test budget. Tests that specifically
+    /// exercise the grace window override via `spawn_server_with_ttl`.
+    const TEST_DEFAULT_TTL: Duration = Duration::from_millis(150);
+
     async fn spawn_server(agent_cmd: Option<AgentCmd>) -> (SocketAddr, Arc<SessionRegistry>) {
-        let registry = SessionRegistry::new(agent_cmd, ReplayTurns::Unbounded);
+        spawn_server_with_ttl(agent_cmd, TEST_DEFAULT_TTL).await
+    }
+
+    async fn spawn_server_with_ttl(
+        agent_cmd: Option<AgentCmd>,
+        ttl: Duration,
+    ) -> (SocketAddr, Arc<SessionRegistry>) {
+        let registry = SessionRegistry::new(agent_cmd, ReplayTurns::Unbounded, ttl);
         let app = router(AppState::new(registry.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -803,6 +826,107 @@ mod tests {
         let _ = ws_a.send(ClientMsg::Close(None)).await;
     }
 
+    /// Chunk 9: a reconnect within the TTL grace window cancels the
+    /// pending teardown and the new subscriber lands on the same session
+    /// — proven by hitting the initialize cache populated by A.
+    #[tokio::test]
+    async fn ttl_grace_cancelled_by_reconnect() {
+        let (addr, registry) =
+            spawn_server_with_ttl(Some(mock_agent_cmd()), Duration::from_millis(500)).await;
+        let url_a = format!("ws://{addr}/acp?session=grace&peer_id=A");
+        let url_b = format!("ws://{addr}/acp?session=grace&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        assert_eq!(registry.live_session_count().await, 1);
+
+        // A disconnects → TTL grace starts; session must stay alive.
+        ws_a.send(ClientMsg::Close(None)).await.unwrap();
+        drop(ws_a);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            registry.live_session_count().await,
+            1,
+            "session must still be alive during TTL grace",
+        );
+
+        // B reconnects within the grace window. The cache should still be
+        // present → B's initialize is answered from cache (mock_acp would
+        // produce _invocation:2 if a fresh process was spawned).
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let resp = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["_invocation"],
+            serde_json::json!(1),
+            "B's initialize must hit A's cached response (same session preserved)",
+        );
+
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
+    }
+
+    /// Chunk 9: with no reconnect, the session is torn down once TTL
+    /// expires.
+    #[tokio::test]
+    async fn ttl_grace_expires_when_idle() {
+        let (addr, registry) =
+            spawn_server_with_ttl(Some(mock_agent_cmd()), Duration::from_millis(150)).await;
+        let url_a = format!("ws://{addr}/acp?session=idle&peer_id=A");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        assert_eq!(registry.live_session_count().await, 1);
+
+        ws_a.send(ClientMsg::Close(None)).await.unwrap();
+        drop(ws_a);
+
+        // Within grace, session still alive.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(registry.live_session_count().await, 1);
+
+        // After grace, session torn down.
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            if registry.live_session_count().await == 0 {
+                return;
+            }
+        }
+        panic!("session did not tear down after TTL expiry");
+    }
+
+    /// Chunk 9: when the agent subprocess exits, subscribers are closed
+    /// with WS application code 1011 (skipping the TTL grace).
+    #[tokio::test]
+    async fn agent_death_closes_subscribers_with_1011() {
+        // `sleep 0.4` exits cleanly after 400ms; its stdout closes,
+        // triggering AgentDied in the session actor.
+        let agent_cmd = AgentCmd {
+            program: "sleep".into(),
+            args: vec!["0.4".into()],
+        };
+        let (addr, _) = spawn_server_with_ttl(Some(agent_cmd), Duration::from_secs(30)).await;
+        let url = format!("ws://{addr}/acp?session=die&peer_id=A");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+        let close = wait_for_close(&mut ws).await.expect("expected close frame");
+        assert_eq!(
+            u16::from(close),
+            1011,
+            "agent death must close subscriber with WS code 1011"
+        );
+    }
+
     /// Chunk 8: late joiner receives the replay log: peer_joined for A,
     /// turn_started + session/update notifications + turn_complete for A's
     /// completed turn — all delivered to B before any live events, in
@@ -908,7 +1032,11 @@ mod tests {
     #[tokio::test]
     async fn replay_turns_disabled_emits_no_history() {
         let agent_cmd = mock_agent_cmd();
-        let registry = SessionRegistry::new(Some(agent_cmd), ReplayTurns::Disabled);
+        let registry = SessionRegistry::new(
+            Some(agent_cmd),
+            ReplayTurns::Disabled,
+            Duration::from_secs(60),
+        );
         let app = router(AppState::new(registry));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

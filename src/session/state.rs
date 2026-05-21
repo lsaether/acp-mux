@@ -53,7 +53,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent::process::AgentProcess;
 use crate::cli::ReplayTurns;
-use crate::multiplex::subscriber::Subscriber;
+use crate::multiplex::subscriber::{OutMsg, Subscriber};
 use crate::protocol::amux::{self, AmuxTurnId};
 use crate::protocol::jsonrpc::{
     Id, Incoming, IncomingRequest, IncomingResponse, JsonRpcError, JsonRpcVersion,
@@ -70,6 +70,10 @@ const FIRST_BRIDGE_ID: u64 = 1;
 /// -32000..=-32099 range is reserved by the spec for implementation
 /// defined errors; -32001 was chosen by the ROADMAP.
 const SESSION_BUSY_ERROR_CODE: i64 = -32001;
+
+/// WebSocket close code used when the agent subprocess exits while
+/// subscribers are still attached. 1011 = "internal error" per RFC 6455.
+const WS_CLOSE_AGENT_DEAD: u16 = 1011;
 
 pub enum SessionMsg {
     Attach {
@@ -210,13 +214,29 @@ impl SessionInner {
 
         if let Some(sub) = self.subscribers.get(&peer_id) {
             for frame in snapshot {
-                if sub.outbound.send(frame).is_err() {
+                if sub.outbound.send(OutMsg::Frame(frame)).is_err() {
                     tracing::debug!(%peer_id, "newcomer dropped during replay");
                     break;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Close every attached subscriber with a structured WS close frame.
+    /// Used on subprocess crash to emit code 1011 cleanly. After this
+    /// returns, the subscribers map is left intact — drop callers should
+    /// `clear()` it explicitly if they want the senders gone.
+    fn close_all_subscribers(&self, code: u16, reason: &str) {
+        for (peer_id, sub) in &self.subscribers {
+            let msg = OutMsg::Close {
+                code,
+                reason: reason.to_string(),
+            };
+            if sub.outbound.send(msg).is_err() {
+                tracing::debug!(%peer_id, "subscriber already gone during close");
+            }
+        }
     }
 
     /// Returns true if the session should end (no subscribers left).
@@ -415,7 +435,7 @@ impl SessionInner {
             }
         };
         if let Some(sub) = self.subscribers.get(peer_id)
-            && sub.outbound.send(bytes).is_err()
+            && sub.outbound.send(OutMsg::Frame(bytes)).is_err()
         {
             tracing::debug!(%peer_id, "subscriber dropped before error response delivered");
         }
@@ -436,7 +456,7 @@ impl SessionInner {
             }
         };
         if let Some(sub) = self.subscribers.get(peer_id)
-            && sub.outbound.send(bytes).is_err()
+            && sub.outbound.send(OutMsg::Frame(bytes)).is_err()
         {
             tracing::debug!(%peer_id, "subscriber dropped before cached response delivered");
         }
@@ -490,7 +510,7 @@ impl SessionInner {
                     "routing agent-initiated request",
                 );
                 if let Some(sub) = self.subscribers.get(&peer_id)
-                    && sub.outbound.send(Bytes::from(line)).is_err()
+                    && sub.outbound.send(OutMsg::Frame(Bytes::from(line))).is_err()
                 {
                     tracing::debug!(%peer_id, "subscriber dropped while delivering agent request");
                 }
@@ -564,7 +584,7 @@ impl SessionInner {
             }
         };
         if let Some(sub) = self.subscribers.get(&pr.peer_id) {
-            if sub.outbound.send(bytes).is_err() {
+            if sub.outbound.send(OutMsg::Frame(bytes)).is_err() {
                 tracing::debug!(peer_id = %pr.peer_id, "subscriber dropped before response delivered");
             }
         } else {
@@ -585,14 +605,15 @@ impl SessionInner {
         if let Some(log) = self.replay_log.as_mut() {
             log.push_back(frame.clone());
         }
-        self.subscribers
-            .retain(|peer_id, sub| match sub.outbound.send(frame.clone()) {
+        self.subscribers.retain(|peer_id, sub| {
+            match sub.outbound.send(OutMsg::Frame(frame.clone())) {
                 Ok(()) => true,
                 Err(_) => {
                     tracing::debug!(%peer_id, "outbound channel closed; dropping subscriber");
                     false
                 }
-            });
+            }
+        });
         if self.subscribers.is_empty() {
             tracing::info!(session = %self.session_id, "no live subscribers after fan-out; ending session");
             return true;
@@ -606,6 +627,7 @@ pub fn spawn_session(
     mut agent: AgentProcess,
     session_id: String,
     replay_policy: ReplayTurns,
+    session_ttl: Duration,
 ) -> (SessionHandle, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<SessionMsg>(SESSION_QUEUE_CAPACITY);
     let stdout_rx = agent
@@ -636,8 +658,19 @@ pub fn spawn_session(
         pump,
         session_id,
         replay_policy,
+        session_ttl,
     ));
     (SessionHandle { tx }, actor)
+}
+
+/// Reason the session loop exited. Drives the teardown sequence — agent
+/// death gets a structured 1011 close to subscribers; TTL expiry and
+/// natural shutdown drop subscriber senders without a close frame.
+enum ExitReason {
+    LastSubscriberLeft, // followed TTL grace; subscribers map already empty
+    TtlExpired,         // subscribers map still empty after grace
+    AgentDied,
+    ChannelClosed, // registry dropped tx; uncommon
 }
 
 async fn run_session(
@@ -647,48 +680,107 @@ async fn run_session(
     pump: JoinHandle<()>,
     session_id: String,
     replay_policy: ReplayTurns,
+    session_ttl: Duration,
 ) {
     let mut inner = SessionInner::new(session_id.clone(), replay_policy);
-    // Unified attach path: the initial subscriber goes through `attach`
-    // just like late joiners, so `amux/peer_joined` fires consistently
-    // (and goes into the replay log in chunk 8).
     inner
         .attach(initial_subscriber)
         .expect("initial subscriber cannot collide on an empty map");
     tracing::info!(session = %session_id, subscribers = inner.subscribers.len(), "session started");
 
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            SessionMsg::Attach { subscriber, ack } => {
-                let result = inner.attach(subscriber);
-                let _ = ack.send(result);
-            }
-            SessionMsg::Detach { peer_id } => {
-                if inner.detach(&peer_id) {
-                    break;
+    // None when at least one subscriber is attached; Some(sleep) while in
+    // TTL grace. The select! arm only fires when the sleep is armed.
+    let mut ttl_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+
+    let reason = loop {
+        let exit = tokio::select! {
+            biased;
+            msg = rx.recv() => {
+                match msg {
+                    None => Some(ExitReason::ChannelClosed),
+                    Some(SessionMsg::Attach { subscriber, ack }) => {
+                        let result = inner.attach(subscriber);
+                        if result.is_ok() && ttl_sleep.take().is_some() {
+                            tracing::info!(
+                                session = %session_id,
+                                "TTL grace cancelled by attach",
+                            );
+                        }
+                        let _ = ack.send(result);
+                        None
+                    }
+                    Some(SessionMsg::Detach { peer_id }) => {
+                        let now_empty = inner.detach(&peer_id);
+                        if now_empty {
+                            tracing::info!(
+                                session = %session_id,
+                                ttl_secs = session_ttl.as_secs_f64(),
+                                "last subscriber gone; starting TTL grace",
+                            );
+                            ttl_sleep = Some(Box::pin(tokio::time::sleep(session_ttl)));
+                        }
+                        None
+                    }
+                    Some(SessionMsg::InboundFromSubscriber { peer_id, bytes }) => {
+                        if let Some(out) = inner.handle_inbound(&peer_id, bytes)
+                            && let Err(err) = agent.send(&out).await
+                        {
+                            tracing::warn!(
+                                session = %session_id,
+                                %peer_id,
+                                error = %err,
+                                "agent stdin write failed",
+                            );
+                        }
+                        None
+                    }
+                    Some(SessionMsg::AgentStdoutLine(line)) => {
+                        if inner.handle_agent_line(line) {
+                            Some(ExitReason::LastSubscriberLeft)
+                        } else {
+                            None
+                        }
+                    }
+                    Some(SessionMsg::AgentDied) => {
+                        Some(ExitReason::AgentDied)
+                    }
                 }
             }
-            SessionMsg::InboundFromSubscriber { peer_id, bytes } => {
-                if let Some(out) = inner.handle_inbound(&peer_id, bytes)
-                    && let Err(err) = agent.send(&out).await
-                {
-                    tracing::warn!(
-                        session = %session_id,
-                        %peer_id,
-                        error = %err,
-                        "agent stdin write failed",
-                    );
+            _ = async {
+                match ttl_sleep.as_mut() {
+                    Some(s) => s.as_mut().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                if inner.subscribers.is_empty() {
+                    Some(ExitReason::TtlExpired)
+                } else {
+                    // Shouldn't happen — sleep was armed when no subs were
+                    // present, attach disarms it. Defensive: clear and
+                    // continue.
+                    ttl_sleep = None;
+                    None
                 }
             }
-            SessionMsg::AgentStdoutLine(line) => {
-                if inner.handle_agent_line(line) {
-                    break;
-                }
-            }
-            SessionMsg::AgentDied => {
-                tracing::warn!(session = %session_id, "agent subprocess exited; ending session");
-                break;
-            }
+        };
+        if let Some(r) = exit {
+            break r;
+        }
+    };
+
+    match reason {
+        ExitReason::AgentDied => {
+            tracing::warn!(session = %session_id, "agent subprocess exited; closing subscribers with 1011");
+            inner.close_all_subscribers(WS_CLOSE_AGENT_DEAD, "agent subprocess exited");
+        }
+        ExitReason::TtlExpired => {
+            tracing::info!(session = %session_id, "TTL expired; tearing down session");
+        }
+        ExitReason::LastSubscriberLeft => {
+            tracing::info!(session = %session_id, "session ended (no subscribers)");
+        }
+        ExitReason::ChannelClosed => {
+            tracing::info!(session = %session_id, "session ended (channel closed)");
         }
     }
 
