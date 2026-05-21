@@ -75,16 +75,18 @@ commit/PR.
 - [x] missing `--agent-cmd` / agent spawn failure → close 1011
 - [x] **DoD:** raw byte relay both directions; `initialize` round-trips through `acp-mux` against `hermes acp` (hermes-agent 0.14.0); 30 tests green including cat-loopback round-trip, two-subscriber naive fan-out, peer_id collision, no-agent-cmd 1011
 
-#### Chunk 4 — Multi-subscriber fan-out + id translation + handshake caching `1–2 days`
+#### Chunk 4 — Multi-subscriber fan-out + id translation + handshake caching `1–2 days` — **done**
 
-- [ ] subscriber set: multiple subscribers per `?session=` permitted
-- [ ] notification fan-out: parse JSON-RPC envelope on inbound; if no `id` → broadcast to all
-- [ ] id translation table: per-session `next_bridge_id`, `pending_requests: HashMap<bridge_id, (Subscriber, original_id)>`
-- [ ] outbound request rewriting (client `id` → `bridge_id` before forwarding)
-- [ ] inbound response routing (rewrite `bridge_id` → `original_id`, send only to originator)
-- [ ] `initialize` cache: first one forwarded; later ones answered locally from cached `result`
-- [ ] `session/new` cache: same pattern, cached `sessionId` replayed for late subscribers
-- [ ] **DoD:** two subscribers on same session: A sends `initialize` first, B's `initialize` answered from cache; A sends a prompt, both see streaming notifications; B's prompt response goes only to B
+- [x] subscriber set: multiple subscribers per `?session=` permitted (already in chunk 3)
+- [x] notification fan-out: parse JSON-RPC envelope on inbound; notifications broadcast to all subscribers
+- [x] id translation table: per-session `next_bridge_id: u64`, `pending: HashMap<u64, PendingRequest{peer_id, original_id, handshake}>`
+- [x] outbound request rewriting (client `id` → `bridge_id` before forwarding, original preserved in pending mapping)
+- [x] inbound response routing (rewrite `bridge_id` → `original_id`, send only to originator)
+- [x] `initialize` cache: first response cached; later `initialize` requests answered locally without touching the agent
+- [x] `session/new` cache: same pattern
+- [x] agent-initiated requests: chunk-4 interim routes to one arbitrary subscriber; chunk 5 replaces with explicit driving-subscriber routing
+- [x] frames with non-JSON content: agent → subscribers falls back to raw broadcast; subscriber → agent is dropped with a warn
+- [x] **DoD:** integration tests (mock_acp) prove initialize/session-new caching, id translation across numeric and string ids, prompt notifications broadcast to all subscribers, prompt responses route only to originator. Manual verify against `hermes acp` (hermes-agent 0.14.0): 3 sequential `initialize` requests → hermes logs "Initialize from unknown" exactly **once**; client receives 3 distinct responses with original ids 1/2/3.
 
 #### Chunk 5 — Driving subscriber + agent-initiated request routing `½ day`
 

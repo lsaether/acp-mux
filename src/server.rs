@@ -425,6 +425,258 @@ mod tests {
         let _ = ws_b.send(ClientMsg::Close(None)).await;
     }
 
+    fn mock_acp_path() -> String {
+        // CARGO_BIN_EXE_<name> is only set for integration tests under
+        // `tests/`. For inline unit tests we reconstruct the path from
+        // CARGO_MANIFEST_DIR + the active cargo profile dir; `cargo test`
+        // builds every bin into target/{debug,release}/ alongside the
+        // test binary.
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        format!("{}/target/{}/mock_acp", env!("CARGO_MANIFEST_DIR"), profile)
+    }
+
+    fn mock_agent_cmd() -> AgentCmd {
+        AgentCmd {
+            program: mock_acp_path(),
+            args: vec![],
+        }
+    }
+
+    async fn spawn_server_with_mock() -> (SocketAddr, Arc<SessionRegistry>) {
+        spawn_server(Some(mock_agent_cmd())).await
+    }
+
+    /// Send `payload` over `ws`, wait for the next text frame, return its body.
+    async fn ws_request(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        payload: &str,
+    ) -> serde_json::Value {
+        ws.send(ClientMsg::Text(payload.into())).await.unwrap();
+        let msg = timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("ws recv timeout")
+            .expect("stream ended")
+            .expect("recv err");
+        match msg {
+            ClientMsg::Text(t) => serde_json::from_str(t.as_str()).expect("response is JSON"),
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_caches_for_late_joiners() {
+        let (addr, _) = spawn_server_with_mock().await;
+        let url_a = format!("ws://{addr}/acp?session=cache&peer_id=A");
+        let url_b = format!("ws://{addr}/acp?session=cache&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let resp_a = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}"#,
+        )
+        .await;
+        assert_eq!(resp_a["id"], serde_json::json!(1));
+        assert_eq!(resp_a["result"]["_invocation"], serde_json::json!(1));
+
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        // B uses a different original id to also confirm id translation.
+        let resp_b = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":"req-b","method":"initialize","params":{"protocolVersion":1}}"#,
+        )
+        .await;
+        // B's original id is preserved.
+        assert_eq!(resp_b["id"], serde_json::json!("req-b"));
+        // The mock would emit _invocation=2 if reached; cached path keeps =1.
+        assert_eq!(
+            resp_b["result"]["_invocation"],
+            serde_json::json!(1),
+            "B's initialize should be answered from cache, not re-sent to the agent",
+        );
+        assert_eq!(
+            resp_b["result"]["agentInfo"]["name"],
+            serde_json::json!("mock-acp")
+        );
+
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
+    }
+
+    #[tokio::test]
+    async fn session_new_caches_for_late_joiners() {
+        let (addr, _) = spawn_server_with_mock().await;
+        let url_a = format!("ws://{addr}/acp?session=newcache&peer_id=A");
+        let url_b = format!("ws://{addr}/acp?session=newcache&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let r1 = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#,
+        )
+        .await;
+        assert_eq!(r1["result"]["_invocation"], serde_json::json!(1));
+
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let _ = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":10,"method":"initialize"}"#,
+        )
+        .await;
+        let r2 = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":11,"method":"session/new"}"#,
+        )
+        .await;
+        assert_eq!(
+            r2["result"]["_invocation"],
+            serde_json::json!(1),
+            "B's session/new should be served from cache",
+        );
+        assert_eq!(r2["result"]["sessionId"], serde_json::json!("sess-mock"));
+
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
+    }
+
+    #[tokio::test]
+    async fn prompt_notifications_broadcast_response_routes_to_originator() {
+        let (addr, _) = spawn_server_with_mock().await;
+        let url_a = format!("ws://{addr}/acp?session=prompt&peer_id=A");
+        let url_b = format!("ws://{addr}/acp?session=prompt&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let _ = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+        )
+        .await;
+
+        // A sends a prompt with original id 7.
+        ws_a.send(ClientMsg::Text(
+            r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[]}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        // Collect frames on each side until A receives a response (id=7).
+        let mut a_frames: Vec<serde_json::Value> = vec![];
+        let mut b_frames: Vec<serde_json::Value> = vec![];
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            tokio::select! {
+                msg = ws_a.next() => {
+                    if let Some(Ok(ClientMsg::Text(t))) = msg {
+                        let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                        let is_response = v.get("id").is_some() && v.get("method").is_none();
+                        a_frames.push(v);
+                        if is_response {
+                            break;
+                        }
+                    }
+                }
+                msg = ws_b.next() => {
+                    if let Some(Ok(ClientMsg::Text(t))) = msg {
+                        let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                        b_frames.push(v);
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+        // Drain any pending B frames.
+        for _ in 0..20 {
+            tokio::select! {
+                msg = ws_b.next() => {
+                    if let Some(Ok(ClientMsg::Text(t))) = msg {
+                        let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                        b_frames.push(v);
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(20)) => break,
+            }
+        }
+
+        // Both A and B should have seen two session/update notifications.
+        let count_updates = |frames: &[serde_json::Value]| {
+            frames
+                .iter()
+                .filter(|v| v.get("method") == Some(&serde_json::json!("session/update")))
+                .count()
+        };
+        assert_eq!(count_updates(&a_frames), 2, "A frames: {a_frames:?}");
+        assert_eq!(count_updates(&b_frames), 2, "B frames: {b_frames:?}");
+
+        // A must have received the prompt response with original id 7.
+        let a_response = a_frames
+            .iter()
+            .find(|v| v.get("id") == Some(&serde_json::json!(7)) && v.get("result").is_some())
+            .expect("A should have received the prompt response");
+        assert_eq!(
+            a_response["result"]["stopReason"],
+            serde_json::json!("end_turn")
+        );
+
+        // B must NOT have received the prompt response.
+        let b_got_response = b_frames
+            .iter()
+            .any(|v| v.get("result").is_some() && v.get("method").is_none());
+        assert!(
+            !b_got_response,
+            "B should not see A's prompt response, got {b_frames:?}"
+        );
+
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
+    }
+
+    #[tokio::test]
+    async fn original_id_is_preserved_across_bridge() {
+        let (addr, _) = spawn_server_with_mock().await;
+        let url = format!("ws://{addr}/acp?session=id&peer_id=A");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+        // Use a high non-overlapping id to ensure we're not just lucky that
+        // bridge_id == original_id.
+        let resp = ws_request(
+            &mut ws,
+            r#"{"jsonrpc":"2.0","id":99999,"method":"initialize"}"#,
+        )
+        .await;
+        assert_eq!(resp["id"], serde_json::json!(99999));
+        assert_eq!(resp["jsonrpc"], serde_json::json!("2.0"));
+
+        let resp2 = ws_request(
+            &mut ws,
+            r#"{"jsonrpc":"2.0","id":"abc-123","method":"session/new"}"#,
+        )
+        .await;
+        assert_eq!(resp2["id"], serde_json::json!("abc-123"));
+
+        let _ = ws.send(ClientMsg::Close(None)).await;
+    }
+
     #[tokio::test]
     async fn ws_peer_id_collision_closes_4409() {
         let (addr, _) = spawn_server_with_cat().await;

@@ -2,29 +2,56 @@
 //! actor task that serializes all mutations.
 //!
 //! All state mutation flows through a single tokio task driven by an mpsc
-//! `SessionMsg` queue. Subscribers push inbound frames via `InboundFromSubscriber`
-//! and detach via `Detach`. The agent's stdout pump task forwards each NDJSON
-//! line as `AgentStdoutLine` and signals exit via `AgentDied`. This avoids
-//! interior mutability over the subscriber map and the agent stdin handle.
+//! `SessionMsg` queue. Subscribers push inbound frames via
+//! `InboundFromSubscriber` and detach via `Detach`. The agent's stdout pump
+//! task forwards each NDJSON line as `AgentStdoutLine` and signals exit
+//! via `AgentDied`.
+//!
+//! ## Chunk 4 routing contract
+//!
+//! Inbound (subscriber → agent), per JSON-RPC envelope shape:
+//! - `notification` → forward to agent unchanged.
+//! - `request` → check the `initialize` / `session/new` response cache; if
+//!   present, answer the subscriber locally without touching the agent.
+//!   Otherwise allocate a per-session `bridge_id`, store the
+//!   `(peer_id, original_id)` mapping, rewrite the `id`, and forward.
+//! - `response` → forward unchanged. Subscriber-originated responses only
+//!   show up as replies to agent-initiated requests, whose ids belong to
+//!   the agent's own id space (never our `bridge_id` space), so they round
+//!   trip without rewriting.
+//!
+//! Inbound (agent → subscribers):
+//! - `notification` → broadcast to every attached subscriber.
+//! - `response` → look up `bridge_id`, restore `original_id`, send to the
+//!   originator only. If the original request was the first `initialize`
+//!   or `session/new`, cache the `result` for later joiners.
+//! - `request` → chunk-4 interim: forward to one arbitrary subscriber.
+//!   Broadcasting would cause duplicate replies back to the agent. Chunk 5
+//!   replaces this with explicit driving-subscriber routing.
+//!
+//! Frames that fail JSON-RPC envelope parsing fall back to chunk-3 raw
+//! broadcast on the agent → subscribers direction (so non-JSON debug
+//! output, if any, still reaches clients), and are dropped with a warn on
+//! the subscriber → agent direction (we will not feed garbage to a real
+//! ACP server).
 
 use std::collections::HashMap;
 use std::time::Duration;
 
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::agent::process::AgentProcess;
 use crate::multiplex::subscriber::Subscriber;
+use crate::protocol::jsonrpc::{Id, Incoming, IncomingRequest, IncomingResponse, JsonRpcVersion};
 
-/// Bound on the SessionMsg queue. Sized so a steady stream of agent stdout
-/// lines plus subscriber inbound traffic has room without backpressuring
-/// the WS-in tasks under bursts.
 const SESSION_QUEUE_CAPACITY: usize = 256;
-
-/// Time we wait for the agent subprocess to exit cleanly before SIGKILL.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Message types delivered to the session actor.
+/// Bridge ids start at 1; 0 is reserved as a sentinel.
+const FIRST_BRIDGE_ID: u64 = 1;
+
 pub enum SessionMsg {
     Attach {
         subscriber: Subscriber,
@@ -46,8 +73,6 @@ pub enum AttachError {
     PeerIdInUse,
 }
 
-/// Handle held by the registry. Cheap to clone; sending after the actor
-/// task ends is detected via `is_closed`.
 #[derive(Clone)]
 pub struct SessionHandle {
     pub tx: mpsc::Sender<SessionMsg>,
@@ -59,15 +84,290 @@ impl SessionHandle {
     }
 }
 
-/// Spawn a new session: take the first subscriber, the agent process, and
-/// return a handle plus the actor's JoinHandle for shutdown coordination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandshakeKind {
+    Initialize,
+    SessionNew,
+}
+
+#[derive(Debug)]
+struct PendingRequest {
+    peer_id: String,
+    original_id: Id,
+    handshake: Option<HandshakeKind>,
+}
+
+struct SessionInner {
+    session_id: String,
+    subscribers: HashMap<String, Subscriber>,
+    next_bridge_id: u64,
+    pending: HashMap<u64, PendingRequest>,
+    initialize_cache: Option<Value>,
+    session_new_cache: Option<Value>,
+}
+
+impl SessionInner {
+    fn new(session_id: String, initial: Subscriber) -> Self {
+        let mut subs = HashMap::new();
+        subs.insert(initial.peer_id.clone(), initial);
+        Self {
+            session_id,
+            subscribers: subs,
+            next_bridge_id: FIRST_BRIDGE_ID,
+            pending: HashMap::new(),
+            initialize_cache: None,
+            session_new_cache: None,
+        }
+    }
+
+    fn attach(&mut self, subscriber: Subscriber) -> Result<(), AttachError> {
+        if self.subscribers.contains_key(&subscriber.peer_id) {
+            return Err(AttachError::PeerIdInUse);
+        }
+        tracing::info!(
+            session = %self.session_id,
+            peer_id = %subscriber.peer_id,
+            "subscriber joined existing session",
+        );
+        self.subscribers
+            .insert(subscriber.peer_id.clone(), subscriber);
+        Ok(())
+    }
+
+    /// Returns true if the session should end (no subscribers left).
+    fn detach(&mut self, peer_id: &str) -> bool {
+        if self.subscribers.remove(peer_id).is_some() {
+            tracing::info!(session = %self.session_id, %peer_id, "subscriber detached");
+        }
+        if self.subscribers.is_empty() {
+            tracing::info!(session = %self.session_id, "last subscriber gone; ending session");
+            return true;
+        }
+        false
+    }
+
+    /// Process one inbound frame from a subscriber. Returns Ok(Some(bytes))
+    /// when a frame should be written to the agent stdin; Ok(None) means
+    /// the frame was either dropped, answered locally from cache, or
+    /// otherwise handled without touching the agent.
+    fn handle_inbound(&mut self, peer_id: &str, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        let frame = match Incoming::parse(&bytes) {
+            Ok(f) => f,
+            Err(err) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    %peer_id,
+                    error = %err,
+                    "invalid JSON-RPC frame from subscriber; dropping",
+                );
+                return None;
+            }
+        };
+        match frame {
+            Incoming::Notification(_) => Some(bytes),
+            Incoming::Response(_) => Some(bytes),
+            Incoming::Request(req) => self.translate_outbound_request(peer_id, req),
+        }
+    }
+
+    fn translate_outbound_request(
+        &mut self,
+        peer_id: &str,
+        mut req: IncomingRequest,
+    ) -> Option<Vec<u8>> {
+        // Cache short-circuits.
+        if req.method == "initialize"
+            && let Some(cached) = self.initialize_cache.clone()
+        {
+            self.send_cached_response(peer_id, req.id, cached);
+            return None;
+        }
+        if req.method == "session/new"
+            && let Some(cached) = self.session_new_cache.clone()
+        {
+            self.send_cached_response(peer_id, req.id, cached);
+            return None;
+        }
+
+        let handshake = match req.method.as_str() {
+            "initialize" => Some(HandshakeKind::Initialize),
+            "session/new" => Some(HandshakeKind::SessionNew),
+            _ => None,
+        };
+
+        let bridge_id = self.next_bridge_id;
+        self.next_bridge_id += 1;
+        let original_id = req.id.clone();
+        self.pending.insert(
+            bridge_id,
+            PendingRequest {
+                peer_id: peer_id.to_string(),
+                original_id,
+                handshake,
+            },
+        );
+        req.id = Id::Number(bridge_id as i64);
+
+        match serde_json::to_vec(&req) {
+            Ok(out) => Some(out),
+            Err(err) => {
+                tracing::error!(
+                    session = %self.session_id,
+                    bridge_id,
+                    error = %err,
+                    "failed to serialize translated request; dropping",
+                );
+                self.pending.remove(&bridge_id);
+                None
+            }
+        }
+    }
+
+    fn send_cached_response(&self, peer_id: &str, original_id: Id, cached: Value) {
+        let resp = IncomingResponse {
+            jsonrpc: JsonRpcVersion,
+            id: original_id,
+            result: Some(cached),
+            error: None,
+        };
+        let bytes = match serde_json::to_vec(&resp) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to serialize cached response");
+                return;
+            }
+        };
+        if let Some(sub) = self.subscribers.get(peer_id)
+            && sub.outbound.send(bytes).is_err()
+        {
+            tracing::debug!(%peer_id, "subscriber dropped before cached response delivered");
+        }
+    }
+
+    /// Process one stdout line from the agent. Returns true if every
+    /// subscriber has dropped during fan-out and the session should end.
+    fn handle_agent_line(&mut self, line: Vec<u8>) -> bool {
+        let frame = match Incoming::parse(&line) {
+            Ok(f) => f,
+            Err(err) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    error = %err,
+                    "invalid JSON-RPC frame from agent; falling back to raw broadcast",
+                );
+                return self.broadcast(line);
+            }
+        };
+        match frame {
+            Incoming::Notification(_) => self.broadcast(line),
+            Incoming::Response(resp) => {
+                self.route_agent_response(resp);
+                false
+            }
+            Incoming::Request(_) => {
+                // Chunk 4 interim: deliver to one arbitrary attached
+                // subscriber. Broadcasting would invite duplicate replies
+                // back to the agent. Chunk 5 replaces this with explicit
+                // driving-subscriber routing.
+                if let Some((peer_id, sub)) = self.subscribers.iter().next() {
+                    tracing::warn!(
+                        session = %self.session_id,
+                        target_peer = %peer_id,
+                        "agent-initiated request: routing to arbitrary subscriber (chunk-5 driving-sub not yet wired)",
+                    );
+                    if sub.outbound.send(line).is_err() {
+                        tracing::debug!(%peer_id, "subscriber dropped while delivering agent request");
+                    }
+                } else {
+                    tracing::warn!(
+                        "agent-initiated request with no attached subscribers; dropping"
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    fn route_agent_response(&mut self, mut resp: IncomingResponse) {
+        let bridge_id = match resp.id {
+            Id::Number(n) if n >= 0 => n as u64,
+            ref other => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    id = ?other,
+                    "agent response with non-numeric or negative id; dropping",
+                );
+                return;
+            }
+        };
+        let Some(pr) = self.pending.remove(&bridge_id) else {
+            tracing::warn!(session = %self.session_id, bridge_id, "no pending request matches agent response; dropping");
+            return;
+        };
+
+        // First-success handshake response caching.
+        if let Some(kind) = pr.handshake
+            && let Some(result) = &resp.result
+        {
+            match kind {
+                HandshakeKind::Initialize => {
+                    if self.initialize_cache.is_none() {
+                        tracing::info!(session = %self.session_id, "caching initialize result");
+                        self.initialize_cache = Some(result.clone());
+                    }
+                }
+                HandshakeKind::SessionNew => {
+                    if self.session_new_cache.is_none() {
+                        tracing::info!(session = %self.session_id, "caching session/new result");
+                        self.session_new_cache = Some(result.clone());
+                    }
+                }
+            }
+        }
+
+        resp.id = pr.original_id;
+        let bytes = match serde_json::to_vec(&resp) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to serialize translated response");
+                return;
+            }
+        };
+        if let Some(sub) = self.subscribers.get(&pr.peer_id) {
+            if sub.outbound.send(bytes).is_err() {
+                tracing::debug!(peer_id = %pr.peer_id, "subscriber dropped before response delivered");
+            }
+        } else {
+            tracing::debug!(peer_id = %pr.peer_id, "originator no longer attached; dropping response");
+        }
+    }
+
+    /// Send `line` to every subscriber. Drops subscribers whose outbound
+    /// channel has closed. Returns true if the session has no live
+    /// subscribers afterward.
+    fn broadcast(&mut self, line: Vec<u8>) -> bool {
+        self.subscribers
+            .retain(|peer_id, sub| match sub.outbound.send(line.clone()) {
+                Ok(()) => true,
+                Err(_) => {
+                    tracing::debug!(%peer_id, "outbound channel closed; dropping subscriber");
+                    false
+                }
+            });
+        if self.subscribers.is_empty() {
+            tracing::info!(session = %self.session_id, "no live subscribers after fan-out; ending session");
+            return true;
+        }
+        false
+    }
+}
+
 pub fn spawn_session(
     initial_subscriber: Subscriber,
     mut agent: AgentProcess,
     session_id: String,
 ) -> (SessionHandle, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<SessionMsg>(SESSION_QUEUE_CAPACITY);
-
     let stdout_rx = agent
         .take_stdout_rx()
         .expect("AgentProcess::take_stdout_rx must succeed on a fresh process");
@@ -100,51 +400,34 @@ async fn run_session(
     pump: JoinHandle<()>,
     session_id: String,
 ) {
-    let mut subscribers: HashMap<String, Subscriber> = HashMap::new();
-    subscribers.insert(initial_subscriber.peer_id.clone(), initial_subscriber);
-    tracing::info!(session = %session_id, subscribers = subscribers.len(), "session started");
+    let mut inner = SessionInner::new(session_id.clone(), initial_subscriber);
+    tracing::info!(session = %session_id, subscribers = inner.subscribers.len(), "session started");
 
     while let Some(msg) = rx.recv().await {
         match msg {
             SessionMsg::Attach { subscriber, ack } => {
-                if subscribers.contains_key(&subscriber.peer_id) {
-                    let _ = ack.send(Err(AttachError::PeerIdInUse));
-                } else {
-                    tracing::info!(
-                        session = %session_id,
-                        peer_id = %subscriber.peer_id,
-                        "subscriber joined existing session",
-                    );
-                    subscribers.insert(subscriber.peer_id.clone(), subscriber);
-                    let _ = ack.send(Ok(()));
-                }
+                let result = inner.attach(subscriber);
+                let _ = ack.send(result);
             }
             SessionMsg::Detach { peer_id } => {
-                if subscribers.remove(&peer_id).is_some() {
-                    tracing::info!(session = %session_id, %peer_id, "subscriber detached");
-                }
-                if subscribers.is_empty() {
-                    tracing::info!(session = %session_id, "last subscriber gone; ending session");
+                if inner.detach(&peer_id) {
                     break;
                 }
             }
             SessionMsg::InboundFromSubscriber { peer_id, bytes } => {
-                if let Err(err) = agent.send(&bytes).await {
-                    tracing::warn!(session = %session_id, %peer_id, error = %err, "agent stdin write failed");
+                if let Some(out) = inner.handle_inbound(&peer_id, bytes)
+                    && let Err(err) = agent.send(&out).await
+                {
+                    tracing::warn!(
+                        session = %session_id,
+                        %peer_id,
+                        error = %err,
+                        "agent stdin write failed",
+                    );
                 }
             }
             SessionMsg::AgentStdoutLine(line) => {
-                // Naive fan-out: every subscriber receives every line.
-                // Chunk 4 layers id translation + handshake caching on top.
-                subscribers.retain(|peer_id, sub| match sub.outbound.send(line.clone()) {
-                    Ok(()) => true,
-                    Err(_) => {
-                        tracing::debug!(session = %session_id, %peer_id, "outbound channel closed; dropping subscriber");
-                        false
-                    }
-                });
-                if subscribers.is_empty() {
-                    tracing::info!(session = %session_id, "no live subscribers after fan-out; ending session");
+                if inner.handle_agent_line(line) {
                     break;
                 }
             }
@@ -155,9 +438,7 @@ async fn run_session(
         }
     }
 
-    // Tear down: drop all subscriber senders (closes WS-out tasks), then
-    // shut down the agent subprocess and abort the stdout pump.
-    subscribers.clear();
+    inner.subscribers.clear();
     if let Err(err) = agent.shutdown(SHUTDOWN_TIMEOUT).await {
         tracing::warn!(session = %session_id, error = %err, "agent shutdown error");
     }
