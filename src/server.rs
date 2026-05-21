@@ -403,22 +403,23 @@ mod tests {
         let payload = r#"{"jsonrpc":"2.0","method":"session/update"}"#;
         ws_a.send(ClientMsg::Text(payload.into())).await.unwrap();
 
-        // Both subscribers should see the echoed line (naive fan-out).
-        let from_a = timeout(Duration::from_secs(2), ws_a.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let from_b = timeout(Duration::from_secs(2), ws_b.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        for m in [from_a, from_b] {
-            match m {
-                ClientMsg::Text(t) => assert_eq!(t.as_str(), payload),
-                other => panic!("expected text, got {other:?}"),
+        // Both subscribers should see the echoed `session/update` line.
+        // amux/peer_joined frames may also be in the queue (A receives it
+        // when B joined); skip until we see the expected method.
+        for ws in [&mut ws_a, &mut ws_b] {
+            let mut found = false;
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                let msg = ws.next().await.unwrap().unwrap();
+                if let ClientMsg::Text(t) = msg {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                    if v.get("method") == Some(&serde_json::json!("session/update")) {
+                        found = true;
+                        break;
+                    }
+                }
             }
+            assert!(found, "did not see session/update broadcast");
         }
 
         let _ = ws_a.send(ClientMsg::Close(None)).await;
@@ -450,22 +451,36 @@ mod tests {
         spawn_server(Some(mock_agent_cmd())).await
     }
 
-    /// Send `payload` over `ws`, wait for the next text frame, return its body.
+    /// Send `payload` (a JSON-RPC request) over `ws`, skip any
+    /// notifications / unrelated frames, return the response matching the
+    /// request's id.
     async fn ws_request(
         ws: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
         payload: &str,
     ) -> serde_json::Value {
+        let req: serde_json::Value = serde_json::from_str(payload).expect("payload is JSON");
+        let req_id = req.get("id").cloned();
         ws.send(ClientMsg::Text(payload.into())).await.unwrap();
-        let msg = timeout(Duration::from_secs(2), ws.next())
-            .await
-            .expect("ws recv timeout")
-            .expect("stream ended")
-            .expect("recv err");
-        match msg {
-            ClientMsg::Text(t) => serde_json::from_str(t.as_str()).expect("response is JSON"),
-            other => panic!("expected text frame, got {other:?}"),
+        loop {
+            let msg = timeout(Duration::from_secs(2), ws.next())
+                .await
+                .expect("ws recv timeout")
+                .expect("stream ended")
+                .expect("recv err");
+            let ClientMsg::Text(t) = msg else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(t.as_str()).expect("frame is JSON");
+            // Skip notifications (no id) and any frame carrying a `method`
+            // — that's amux/* metadata or agent session/update broadcasts.
+            if v.get("method").is_some() {
+                continue;
+            }
+            if v.get("id") == req_id.as_ref() {
+                return v;
+            }
         }
     }
 
@@ -696,6 +711,202 @@ mod tests {
             args,
         }))
         .await
+    }
+
+    /// Drain all text frames from `ws` until `dur` elapses; returns them
+    /// as parsed JSON values. Used to collect amux/* notification streams
+    /// without locking the test to a specific arrival order.
+    async fn drain_for<S>(
+        ws: &mut tokio_tungstenite::WebSocketStream<S>,
+        dur: Duration,
+    ) -> Vec<serde_json::Value>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut out = vec![];
+        let deadline = std::time::Instant::now() + dur;
+        while std::time::Instant::now() < deadline {
+            match timeout(Duration::from_millis(80), ws.next()).await {
+                Ok(Some(Ok(ClientMsg::Text(t)))) => {
+                    out.push(serde_json::from_str(t.as_str()).unwrap());
+                }
+                Ok(Some(Ok(_))) | Ok(None) => {}
+                Ok(Some(Err(_))) => return out,
+                Err(_) => {}
+            }
+        }
+        out
+    }
+
+    /// Chunk 7: amux/peer_joined fires when B joins, A sees it; B does not
+    /// see their own join (emit-before-insert). On detach the remaining
+    /// subscriber sees amux/peer_left.
+    #[tokio::test]
+    async fn amux_peer_joined_and_peer_left() {
+        let (addr, _) = spawn_server_with_mock().await;
+        let url_a = format!("ws://{addr}/acp?session=presence&peer_id=A&peer_name=Alice");
+        let url_b = format!("ws://{addr}/acp?session=presence&peer_id=B&peer_name=Bob");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        // A is the initial sub — peer_joined for A is emitted to an empty
+        // map, so A sees nothing yet.
+        let a_early = drain_for(&mut ws_a, Duration::from_millis(100)).await;
+        assert!(
+            a_early.is_empty(),
+            "A should see no events before B joins, got {a_early:?}"
+        );
+
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        // Now A should receive peer_joined for B.
+        let a_after_b = drain_for(&mut ws_a, Duration::from_millis(150)).await;
+        let pj = a_after_b
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/peer_joined")))
+            .expect("A should see amux/peer_joined for B");
+        assert_eq!(pj["params"]["peerId"], serde_json::json!("B"));
+        assert_eq!(pj["params"]["peerName"], serde_json::json!("Bob"));
+        assert_eq!(pj["params"]["sessionId"], serde_json::json!("presence"));
+
+        // B should NOT see their own peer_joined.
+        let b_early = drain_for(&mut ws_b, Duration::from_millis(100)).await;
+        let b_self_join = b_early
+            .iter()
+            .any(|v| v.get("method") == Some(&serde_json::json!("amux/peer_joined")));
+        assert!(
+            !b_self_join,
+            "B should not see their own peer_joined, got {b_early:?}"
+        );
+
+        // B detaches → A sees peer_left.
+        ws_b.send(ClientMsg::Close(None)).await.unwrap();
+        drop(ws_b);
+        let a_after_detach = drain_for(&mut ws_a, Duration::from_millis(200)).await;
+        let pl = a_after_detach
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/peer_left")))
+            .expect("A should see amux/peer_left for B");
+        assert_eq!(pl["params"]["peerId"], serde_json::json!("B"));
+
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+    }
+
+    /// Chunk 7: amux/turn_started fires before forwarding session/prompt,
+    /// and amux/turn_complete fires when the matching response arrives.
+    /// Both broadcast to every subscriber. amuxTurnId bookends the pair.
+    #[tokio::test]
+    async fn amux_turn_started_and_complete() {
+        let (addr, _) = spawn_server_with_mock().await;
+        let url_a = format!("ws://{addr}/acp?session=turn&peer_id=A");
+        let url_b = format!("ws://{addr}/acp?session=turn&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let _ = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+        )
+        .await;
+
+        ws_a.send(ClientMsg::Text(
+            r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"hi"}]}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let a_frames = drain_for(&mut ws_a, Duration::from_secs(2)).await;
+        let b_frames = drain_for(&mut ws_b, Duration::from_secs(2)).await;
+
+        for (label, frames) in [("A", &a_frames), ("B", &b_frames)] {
+            let started = frames
+                .iter()
+                .find(|v| v.get("method") == Some(&serde_json::json!("amux/turn_started")))
+                .unwrap_or_else(|| {
+                    panic!("{label} should see amux/turn_started, frames: {frames:?}")
+                });
+            assert_eq!(started["params"]["peerId"], serde_json::json!("A"));
+            assert_eq!(started["params"]["sessionId"], serde_json::json!("turn"));
+            assert_eq!(started["params"]["amuxTurnId"], serde_json::json!("at-1"));
+            assert_eq!(
+                started["params"]["content"],
+                serde_json::json!([{"type":"text","text":"hi"}])
+            );
+
+            let complete = frames
+                .iter()
+                .find(|v| v.get("method") == Some(&serde_json::json!("amux/turn_complete")))
+                .unwrap_or_else(|| {
+                    panic!("{label} should see amux/turn_complete, frames: {frames:?}")
+                });
+            assert_eq!(complete["params"]["amuxTurnId"], serde_json::json!("at-1"));
+            assert_eq!(
+                complete["params"]["stopReason"],
+                serde_json::json!("end_turn")
+            );
+        }
+
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
+    }
+
+    /// Chunk 7: amux/session_busy fires alongside the -32001 rejection.
+    #[tokio::test]
+    async fn amux_session_busy_on_concurrent_prompt() {
+        let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "500")]).await;
+        let url_a = format!("ws://{addr}/acp?session=busy&peer_id=A");
+        let url_b = format!("ws://{addr}/acp?session=busy&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let _ = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+        )
+        .await;
+
+        ws_a.send(ClientMsg::Text(
+            r#"{"jsonrpc":"2.0","id":100,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        ws_b.send(ClientMsg::Text(
+            r#"{"jsonrpc":"2.0","id":200,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let b_frames = drain_for(&mut ws_b, Duration::from_secs(2)).await;
+        let busy = b_frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/session_busy")))
+            .expect("B should see amux/session_busy");
+        assert_eq!(busy["params"]["busy"], serde_json::json!(true));
+        assert_eq!(busy["params"]["heldBy"], serde_json::json!("A"));
+
+        // Drain A so the test cleans up promptly.
+        let _ = drain_for(&mut ws_a, Duration::from_secs(2)).await;
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
     }
 
     /// Chunk 5: agent-initiated requests route to the driving subscriber.

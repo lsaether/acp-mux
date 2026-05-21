@@ -104,16 +104,19 @@ commit/PR.
 
 ### Phase B — amux namespace + replay
 
-#### Chunk 7 — `amux/*` namespace notifications `1 day`
+#### Chunk 7 — `amux/*` namespace notifications `1 day` — **done**
 
-- [ ] `protocol/amux.rs`: serde types for `AmuxTurnStarted`, `AmuxTurnComplete`, `AmuxPeerJoined`, `AmuxPeerLeft`, `AmuxSessionBusy`
-- [ ] emit `amux/turn_started` on `session/prompt` forward (before sending to subprocess) — broadcast to all subscribers, `content` mirrored verbatim from request `params.prompt`
-- [ ] emit `amux/turn_complete` when `session/prompt` response lands (or on abnormal turn termination) — broadcast with `stopReason`
-- [ ] emit `amux/peer_joined` on attach (broadcast to existing subscribers)
-- [ ] emit `amux/peer_left` on detach (broadcast to remaining subscribers)
-- [ ] emit `amux/session_busy` on turn-rejection (finalize payload shape from chunk 6 stub)
-- [ ] `amuxTurnId` allocation: monotonic per session (e.g. `at-<n>`)
-- [ ] **DoD:** two-subscriber session: A prompts, both see `amux/turn_started { peerId: A }` followed by ACP chunks followed by `amux/turn_complete`; B's join triggers `peer_joined` to A
+- [x] `protocol/amux.rs`: frame builders + `AmuxTurnId(u64)` newtype with `at-<u64>` formatting. Typed inner-params structs serialize camelCase with `skip_serializing_if = Option::is_none` for optional fields
+- [x] emit `amux/turn_started` on `session/prompt` forward (before agent receives) — broadcast to all subscribers, `content` lifted verbatim from `params.prompt`
+- [x] emit `amux/turn_complete` when the response with matching `bridge_id` arrives — `stopReason` lifted from `result.stopReason` (or `null` if absent)
+- [x] emit `amux/peer_joined` on attach — broadcast BEFORE inserting newcomer (so newcomer doesn't see their own join; replay log will surface it to later joiners)
+- [x] emit `amux/peer_left` on detach — broadcast to remaining subscribers
+- [x] emit `amux/session_busy` on `-32001` rejection — `heldBy` = current turn's originator peer_id
+- [x] `amuxTurnId` allocation: monotonic per session, `at-<u64>`
+- [x] **DoD:** integration tests prove the full event lifecycle:
+  - `amux_peer_joined_and_peer_left` — A alone sees nothing; B joins, A sees `peer_joined{peerId:B,peerName:Bob}`; B doesn't see their own join; B detaches, A sees `peer_left`
+  - `amux_turn_started_and_complete` — A's prompt with `content=[{type:text,text:hi}]` produces `turn_started{amuxTurnId:at-1, content:[…]}` to both A and B before mock_acp responds, and `turn_complete{amuxTurnId:at-1, stopReason:end_turn}` after
+  - `amux_session_busy_on_concurrent_prompt` — B's concurrent prompt produces `session_busy{busy:true, heldBy:A}` to B (broadcast)
 
 #### Chunk 8 — Replay log + `--replay-turns` flag `½–1 day`
 

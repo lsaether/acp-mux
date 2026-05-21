@@ -52,6 +52,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent::process::AgentProcess;
 use crate::multiplex::subscriber::Subscriber;
+use crate::protocol::amux::{self, AmuxTurnId};
 use crate::protocol::jsonrpc::{
     Id, Incoming, IncomingRequest, IncomingResponse, JsonRpcError, JsonRpcVersion,
 };
@@ -127,32 +128,48 @@ struct SessionInner {
     /// `bridge_id` of the in-flight `session/prompt`, if any. While set, a
     /// second `session/prompt` is rejected locally with `-32001`.
     active_turn_bridge_id: Option<u64>,
+    /// `amuxTurnId` paired with the in-flight `session/prompt`. Used to
+    /// bookend `amux/turn_started` and `amux/turn_complete`.
+    active_amux_turn_id: Option<AmuxTurnId>,
+    /// Monotonic per-session counter for `amuxTurnId` allocation.
+    next_amux_turn_id: u64,
 }
 
 impl SessionInner {
-    fn new(session_id: String, initial: Subscriber) -> Self {
-        let mut subs = HashMap::new();
-        subs.insert(initial.peer_id.clone(), initial);
+    fn new(session_id: String) -> Self {
         Self {
             session_id,
-            subscribers: subs,
+            subscribers: HashMap::new(),
             next_bridge_id: FIRST_BRIDGE_ID,
             pending: HashMap::new(),
             initialize_cache: None,
             session_new_cache: None,
             driving_subscriber_peer_id: None,
             active_turn_bridge_id: None,
+            active_amux_turn_id: None,
+            next_amux_turn_id: 1,
         }
     }
 
+    /// Attach a subscriber. Emits `amux/peer_joined` to every existing
+    /// subscriber before inserting — so the newcomer does not see their
+    /// own join. The replay log (chunk 8) records the frame so late
+    /// joiners learn about everyone.
     fn attach(&mut self, subscriber: Subscriber) -> Result<(), AttachError> {
         if self.subscribers.contains_key(&subscriber.peer_id) {
             return Err(AttachError::PeerIdInUse);
         }
+        let frame = amux::peer_joined(
+            &self.session_id,
+            &subscriber.peer_id,
+            subscriber.peer_name.as_deref(),
+            subscriber.role.as_deref(),
+        );
+        self.broadcast(frame);
         tracing::info!(
             session = %self.session_id,
             peer_id = %subscriber.peer_id,
-            "subscriber joined existing session",
+            "subscriber joined session",
         );
         self.subscribers
             .insert(subscriber.peer_id.clone(), subscriber);
@@ -160,9 +177,12 @@ impl SessionInner {
     }
 
     /// Returns true if the session should end (no subscribers left).
+    /// Emits `amux/peer_left` to every remaining subscriber.
     fn detach(&mut self, peer_id: &str) -> bool {
         if self.subscribers.remove(peer_id).is_some() {
             tracing::info!(session = %self.session_id, %peer_id, "subscriber detached");
+            let frame = amux::peer_left(&self.session_id, peer_id);
+            self.broadcast(frame);
         }
         if self.driving_subscriber_peer_id.as_deref() == Some(peer_id) {
             self.driving_subscriber_peer_id = None;
@@ -222,16 +242,21 @@ impl SessionInner {
 
         // Turn serialization: a second concurrent `session/prompt` is
         // rejected locally with -32001 and does NOT update the driver
-        // (the in-flight turn's originator stays the driver).
+        // (the in-flight turn's originator stays the driver). Also broadcast
+        // an amux/session_busy notification so peers see the rejection.
         if req.method == "session/prompt"
             && let Some(active) = self.active_turn_bridge_id
         {
+            let held_by = self.pending.get(&active).map(|pr| pr.peer_id.clone());
             tracing::warn!(
                 session = %self.session_id,
                 %peer_id,
                 active_turn = active,
+                held_by = ?held_by,
                 "rejecting concurrent session/prompt with -32001",
             );
+            let busy_frame = amux::session_busy(&self.session_id, true, held_by.as_deref());
+            self.broadcast(busy_frame);
             self.send_error_response(
                 peer_id,
                 req.id,
@@ -269,12 +294,17 @@ impl SessionInner {
             Ok(out) => {
                 if is_prompt {
                     self.active_turn_bridge_id = Some(bridge_id);
+                    let turn_id = AmuxTurnId(self.next_amux_turn_id);
+                    self.next_amux_turn_id += 1;
+                    self.active_amux_turn_id = Some(turn_id);
                     tracing::info!(
                         session = %self.session_id,
                         %peer_id,
                         bridge_id,
+                        amux_turn_id = %turn_id.formatted(),
                         "session/prompt forwarded; active turn opened",
                     );
+                    self.emit_turn_started(peer_id, turn_id, req.params.as_ref());
                 }
                 Some(out)
             }
@@ -289,6 +319,31 @@ impl SessionInner {
                 None
             }
         }
+    }
+
+    /// Build and broadcast `amux/turn_started`. The `content` field carries
+    /// `params.prompt` verbatim; if missing we send `null`.
+    fn emit_turn_started(&mut self, peer_id: &str, turn_id: AmuxTurnId, params: Option<&Value>) {
+        let null = Value::Null;
+        let content = params.and_then(|p| p.get("prompt")).unwrap_or(&null);
+        let (peer_name, role) = self
+            .subscribers
+            .get(peer_id)
+            .map(|s| (s.peer_name.as_deref(), s.role.as_deref()))
+            .unwrap_or((None, None));
+        let frame =
+            amux::turn_started(&self.session_id, turn_id, peer_id, peer_name, role, content);
+        self.broadcast(frame);
+    }
+
+    /// Build and broadcast `amux/turn_complete`. `stop_reason` is the
+    /// `result.stopReason` value if present, else `null` (abnormal turns
+    /// land here in chunk 9; for chunk 7 only the happy path is wired).
+    fn emit_turn_complete(&mut self, turn_id: AmuxTurnId, result: Option<&Value>) {
+        let null = Value::Null;
+        let stop_reason = result.and_then(|r| r.get("stopReason")).unwrap_or(&null);
+        let frame = amux::turn_complete(&self.session_id, turn_id, stop_reason);
+        self.broadcast(frame);
     }
 
     fn note_driving_subscriber(&mut self, peer_id: &str) {
@@ -424,11 +479,16 @@ impl SessionInner {
 
         if self.active_turn_bridge_id == Some(bridge_id) {
             self.active_turn_bridge_id = None;
+            let turn_id = self.active_amux_turn_id.take();
             tracing::info!(
                 session = %self.session_id,
                 bridge_id,
+                amux_turn_id = ?turn_id.map(|t| t.formatted()),
                 "session/prompt response received; active turn cleared",
             );
+            if let Some(turn_id) = turn_id {
+                self.emit_turn_complete(turn_id, resp.result.as_ref());
+            }
         }
 
         // First-success handshake response caching.
@@ -526,7 +586,13 @@ async fn run_session(
     pump: JoinHandle<()>,
     session_id: String,
 ) {
-    let mut inner = SessionInner::new(session_id.clone(), initial_subscriber);
+    let mut inner = SessionInner::new(session_id.clone());
+    // Unified attach path: the initial subscriber goes through `attach`
+    // just like late joiners, so `amux/peer_joined` fires consistently
+    // (and goes into the replay log in chunk 8).
+    inner
+        .attach(initial_subscriber)
+        .expect("initial subscriber cannot collide on an empty map");
     tracing::info!(session = %session_id, subscribers = inner.subscribers.len(), "session started");
 
     while let Some(msg) = rx.recv().await {
