@@ -88,19 +88,19 @@ commit/PR.
 - [x] frames with non-JSON content: agent → subscribers falls back to raw broadcast; subscriber → agent is dropped with a warn
 - [x] **DoD:** integration tests (mock_acp) prove initialize/session-new caching, id translation across numeric and string ids, prompt notifications broadcast to all subscribers, prompt responses route only to originator. Manual verify against `hermes acp` (hermes-agent 0.14.0): 3 sequential `initialize` requests → hermes logs "Initialize from unknown" exactly **once**; client receives 3 distinct responses with original ids 1/2/3.
 
-#### Chunk 5 — Driving subscriber + agent-initiated request routing `½ day`
+#### Chunk 5 — Driving subscriber + agent-initiated request routing `½ day` — **done**
 
-- [ ] `SessionState.driving_subscriber: Option<Subscriber>` updated on every substantive (non-`initialize`) request
-- [ ] inbound frame with both `id` and `method` (agent-initiated request) routes to driving subscriber only
-- [ ] driving subscriber gone → fall back to first subscriber; no subscribers → drop with warning
-- [ ] **DoD:** `permission/request` from agent reaches the subscriber that initiated the turn, not other subscribers; driving-sub disconnect mid-request falls through correctly
+- [x] `SessionInner.driving_subscriber_peer_id: Option<String>` updated on every substantive (non-`initialize`) request from a subscriber, including cached `session/new` short-circuits
+- [x] inbound frame with both `id` and `method` (agent-initiated request) routes to driving subscriber only
+- [x] driving subscriber gone → fall back to one arbitrary attached subscriber; no subscribers → drop with warn. Driver field also cleared at detach time
+- [x] **DoD:** integration test `agent_request_routes_to_driving_subscriber` (mock_acp with `MOCK_ACP_EMIT_PERMISSION=1`) proves `permission/request` reaches A only when A drives; `agent_request_falls_through_when_driver_left` proves the detach-fallback path
 
-#### Chunk 6 — Turn serialization `½ day`
+#### Chunk 6 — Turn serialization `½ day` — **done**
 
-- [ ] `SessionState.active_turn_bridge_id: Option<u64>` set when `session/prompt` is forwarded
-- [ ] concurrent `session/prompt` while turn active → reject with JSON-RPC error code `-32001` to the requester
-- [ ] `active_turn_bridge_id` cleared when matching response arrives
-- [ ] **DoD:** two simultaneous `session/prompt` requests: first forwarded, second gets `-32001`; after first completes, a new prompt succeeds
+- [x] `SessionInner.active_turn_bridge_id: Option<u64>` set when `session/prompt` is forwarded
+- [x] concurrent `session/prompt` while turn active → reject with JSON-RPC error code `-32001` ("session busy") to the requester; does not consume a bridge_id and does not update the driver
+- [x] `active_turn_bridge_id` cleared when the response matching that bridge_id arrives
+- [x] **DoD:** `concurrent_prompt_rejected_with_32001` (mock_acp with `MOCK_ACP_PROMPT_DELAY_MS=600`) proves second prompt is rejected with `-32001`, A's prompt completes, B can issue a fresh prompt after A's turn clears
 
 ### Phase B — bridge namespace + replay
 

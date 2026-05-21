@@ -677,6 +677,296 @@ mod tests {
         let _ = ws.send(ClientMsg::Close(None)).await;
     }
 
+    /// Helper for chunk 5/6 tests: spawn acp-mux with mock_acp wrapped to
+    /// pass through env vars (permission emission, prompt delay).
+    async fn spawn_server_with_mock_env(
+        env: &[(&str, &str)],
+    ) -> (SocketAddr, Arc<SessionRegistry>) {
+        // We can't customize per-process env via AgentCmd directly without
+        // adding it to the schema; for now use `env -i` style invocation
+        // via /usr/bin/env if available, falling back to a wrapper that
+        // re-execs mock_acp with the desired vars.
+        let mut args = vec![];
+        for (k, v) in env {
+            args.push(format!("{k}={v}"));
+        }
+        args.push(mock_acp_path());
+        spawn_server(Some(AgentCmd {
+            program: "/usr/bin/env".to_string(),
+            args,
+        }))
+        .await
+    }
+
+    /// Chunk 5: agent-initiated requests route to the driving subscriber.
+    /// A drives by sending session/new, B is just attached. mock_acp emits
+    /// a permission/request on session/prompt — only A should see it.
+    #[tokio::test]
+    async fn agent_request_routes_to_driving_subscriber() {
+        let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_EMIT_PERMISSION", "1")]).await;
+        let url_a = format!("ws://{addr}/acp?session=drive&peer_id=A");
+        let url_b = format!("ws://{addr}/acp?session=drive&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let _ = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+
+        // A drives by sending session/new.
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+        )
+        .await;
+
+        // A sends prompt → mock emits permission/request (agent-initiated).
+        ws_a.send(ClientMsg::Text(
+            r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let (a_frames, b_frames) =
+            collect_frames(&mut ws_a, &mut ws_b, Duration::from_secs(3)).await;
+
+        let perm_in_a = a_frames
+            .iter()
+            .any(|v| v.get("method") == Some(&serde_json::json!("permission/request")));
+        let perm_in_b = b_frames
+            .iter()
+            .any(|v| v.get("method") == Some(&serde_json::json!("permission/request")));
+        assert!(
+            perm_in_a,
+            "driving subscriber A should receive permission/request, frames: {a_frames:?}",
+        );
+        assert!(
+            !perm_in_b,
+            "non-driving subscriber B should NOT receive permission/request, frames: {b_frames:?}",
+        );
+
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
+    }
+
+    /// Chunk 5: driving subscriber detaches mid-flight → agent-initiated
+    /// requests fall through to the remaining subscriber.
+    #[tokio::test]
+    async fn agent_request_falls_through_when_driver_left() {
+        let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_EMIT_PERMISSION", "1")]).await;
+        let url_a = format!("ws://{addr}/acp?session=fallback&peer_id=A");
+        let url_b = format!("ws://{addr}/acp?session=fallback&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let _ = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+
+        // A drives.
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+        )
+        .await;
+
+        // A disconnects; B should now receive the agent-initiated request.
+        ws_a.send(ClientMsg::Close(None)).await.unwrap();
+        let _ = ws_a.next().await;
+        drop(ws_a);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // B sends a prompt — without driver fallback the permission/request
+        // would have nowhere to go. With fallback it reaches B.
+        ws_b.send(ClientMsg::Text(
+            r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let mut saw_perm = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match timeout(Duration::from_millis(200), ws_b.next()).await {
+                Ok(Some(Ok(ClientMsg::Text(t)))) => {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                    if v.get("method") == Some(&serde_json::json!("permission/request")) {
+                        saw_perm = true;
+                    }
+                    if v.get("id") == Some(&serde_json::json!(7)) && v.get("result").is_some() {
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            saw_perm,
+            "B should have received the permission/request via driver fallback (B became driver after sending prompt)"
+        );
+
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
+    }
+
+    /// Chunk 6: while a session/prompt is in flight, a second concurrent
+    /// session/prompt is rejected with JSON-RPC -32001.
+    #[tokio::test]
+    async fn concurrent_prompt_rejected_with_32001() {
+        let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "600")]).await;
+        let url_a = format!("ws://{addr}/acp?session=busy&peer_id=A");
+        let url_b = format!("ws://{addr}/acp?session=busy&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let _ = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+        )
+        .await;
+
+        // A sends prompt 1 — mock holds it for 600ms.
+        ws_a.send(ClientMsg::Text(
+            r#"{"jsonrpc":"2.0","id":100,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        // Give the actor time to register the in-flight turn before B's prompt.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // B sends prompt 2 while A's turn is in flight — should be rejected.
+        ws_b.send(ClientMsg::Text(
+            r#"{"jsonrpc":"2.0","id":200,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        // B receives an error response for id 200. May arrive interleaved
+        // with session/update broadcasts from A's in-flight turn.
+        let mut b_err: Option<serde_json::Value> = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            match timeout(Duration::from_millis(200), ws_b.next()).await {
+                Ok(Some(Ok(ClientMsg::Text(t)))) => {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                    if v.get("id") == Some(&serde_json::json!(200)) {
+                        b_err = Some(v);
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+        let b_json = b_err.expect("B should have received a response for id 200");
+        assert_eq!(
+            b_json["error"]["code"],
+            serde_json::json!(-32001),
+            "B should have received session-busy -32001, got {b_json:?}",
+        );
+
+        // A's prompt eventually completes.
+        let mut a_response_seen = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match timeout(Duration::from_millis(200), ws_a.next()).await {
+                Ok(Some(Ok(ClientMsg::Text(t)))) => {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                    if v.get("id") == Some(&serde_json::json!(100)) && v.get("result").is_some() {
+                        a_response_seen = true;
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+        assert!(a_response_seen, "A's prompt should have completed");
+
+        // After A's turn, B can issue a fresh prompt successfully.
+        ws_b.send(ClientMsg::Text(
+            r#"{"jsonrpc":"2.0","id":201,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let mut b_ok = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match timeout(Duration::from_millis(200), ws_b.next()).await {
+                Ok(Some(Ok(ClientMsg::Text(t)))) => {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                    if v.get("id") == Some(&serde_json::json!(201)) && v.get("result").is_some() {
+                        b_ok = true;
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            b_ok,
+            "B's follow-up prompt should succeed after A's turn cleared"
+        );
+
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
+    }
+
+    /// Collect text frames from both WS streams for `dur`, returning the
+    /// frames seen on each side. Useful when an interaction emits a mix of
+    /// notifications and a final response without a fixed order.
+    async fn collect_frames(
+        ws_a: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        ws_b: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        dur: Duration,
+    ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        let mut a = vec![];
+        let mut b = vec![];
+        let deadline = std::time::Instant::now() + dur;
+        while std::time::Instant::now() < deadline {
+            tokio::select! {
+                msg = ws_a.next() => {
+                    if let Some(Ok(ClientMsg::Text(t))) = msg {
+                        a.push(serde_json::from_str(t.as_str()).unwrap());
+                    }
+                }
+                msg = ws_b.next() => {
+                    if let Some(Ok(ClientMsg::Text(t))) = msg {
+                        b.push(serde_json::from_str(t.as_str()).unwrap());
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(15)) => {}
+            }
+        }
+        (a, b)
+    }
+
     #[tokio::test]
     async fn ws_peer_id_collision_closes_4409() {
         let (addr, _) = spawn_server_with_cat().await;

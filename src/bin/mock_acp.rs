@@ -8,11 +8,25 @@
 //!   the param `sessionId`, then a response with `stopReason: "end_turn"`.
 //! - anything else with an id → empty `result`.
 //!
+//! Env knobs:
+//!
+//! - `MOCK_ACP_SESSION_ID` — sessionId returned by `session/new`.
+//! - `MOCK_ACP_EMIT_PERMISSION=1` — on `session/prompt`, emit an
+//!   agent-initiated `permission/request` (id 10000+counter) before the
+//!   updates and the response. The mock does NOT block on the permission
+//!   response; it carries on. This exercises chunk-5 driving-subscriber
+//!   routing.
+//! - `MOCK_ACP_PROMPT_DELAY_MS=N` — sleep N ms before responding to
+//!   `session/prompt`. Lets the test queue a second concurrent prompt at
+//!   acp-mux while the first turn is in flight (chunk 6).
+//!
 //! Per-line behavior is logged to stderr at info level so tests can grep
 //! the output if needed. The process exits when stdin closes.
 
 use std::env;
 use std::io::{self, BufRead, BufReader, Write};
+use std::thread;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -23,10 +37,18 @@ fn main() {
     let mut reader = BufReader::new(stdin.lock());
 
     let session_id = env::var("MOCK_ACP_SESSION_ID").unwrap_or_else(|_| "sess-mock".to_string());
+    let emit_permission = env::var("MOCK_ACP_EMIT_PERMISSION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let prompt_delay_ms = env::var("MOCK_ACP_PROMPT_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
 
     let mut initialize_count: u32 = 0;
     let mut session_new_count: u32 = 0;
     let mut prompt_count: u32 = 0;
+    let mut next_permission_id: u64 = 10_000;
 
     let mut line = String::new();
     loop {
@@ -101,6 +123,21 @@ fn main() {
                     .cloned()
                     .unwrap_or_else(|| json!(session_id));
 
+                if emit_permission {
+                    next_permission_id += 1;
+                    let perm = json!({
+                        "jsonrpc": "2.0",
+                        "id": next_permission_id,
+                        "method": "permission/request",
+                        "params": {
+                            "sessionId": sess,
+                            "toolCall": { "name": "demo_tool" },
+                        },
+                    });
+                    writeln!(stdout, "{perm}").ok();
+                    stdout.flush().ok();
+                }
+
                 // Stream two update notifications.
                 for chunk in ["hello ", "world"] {
                     let upd = json!({
@@ -116,6 +153,12 @@ fn main() {
                     });
                     writeln!(stdout, "{upd}").ok();
                 }
+
+                if prompt_delay_ms > 0 {
+                    stdout.flush().ok();
+                    thread::sleep(Duration::from_millis(prompt_delay_ms));
+                }
+
                 let resp = json!({
                     "jsonrpc": "2.0",
                     "id": id,
