@@ -63,14 +63,17 @@ commit/PR.
 - [x] invalid query → WS close code 4400; `peer_id` collision → close 4409 (per-session `HashSet<peer_id>` placeholder; replace with `SessionRegistry` in chunk 3)
 - [x] **DoD:** `acp-mux` launches; `curl /healthz` returns ok; WS connect + close round-trips cleanly; invalid `?session=` rejected with 4400 (15 chunk-2 tests; 27 total)
 
-#### Chunk 3 — Session registry + single-subscriber byte relay `½ day`
+#### Chunk 3 — Session registry + single-subscriber byte relay `½ day` — **done**
 
-- [ ] `session/registry.rs`: `SessionRegistry` — `attach`/`detach`/`shutdown`, lock-guarded `HashMap<session_id, SessionState>`
-- [ ] `session/state.rs`: `SessionState` — owns `AgentProcess`, `Vec<Subscriber>`, dispatcher task
-- [ ] `multiplex/subscriber.rs`: `Subscriber` — peer_id, peer_name, role, mpsc::UnboundedSender for outbound frames
-- [ ] dispatcher: read agent stdout line-by-line, write to all subscribers (no parsing yet)
-- [ ] outbound: read subscriber inbound, write to agent stdin (no parsing yet)
-- [ ] **DoD:** one subscriber per session, raw byte relay both directions, `initialize` round-trips through `acp-mux` against a real ACP server
+- [x] `session/registry.rs`: `SessionRegistry` — `attach`/`shutdown`, lock-guarded `HashMap<session_id, SessionHandle>` (detach is signalled to the actor and processed there)
+- [x] `session/state.rs`: per-session actor task owning `AgentProcess` + `HashMap<peer_id, Subscriber>`, driven by a `SessionMsg` enum (Attach/Detach/InboundFromSubscriber/AgentStdoutLine/AgentDied)
+- [x] `multiplex/subscriber.rs`: `Subscriber` — peer_id, peer_name, role, mpsc::UnboundedSender for outbound frames
+- [x] dispatcher: read agent stdout line-by-line, fan out to every attached subscriber (naive — chunk 4 layers id translation + handshake caching)
+- [x] outbound: read subscriber inbound, strip trailing `\n`, write to agent stdin (no JSON parsing)
+- [x] last-subscriber-leave → immediate session teardown; chunk 9 adds the TTL grace
+- [x] agent stdout EOF → drop subscribers (causes WS close); chunk 9 will switch to explicit code 1011
+- [x] missing `--agent-cmd` / agent spawn failure → close 1011
+- [x] **DoD:** raw byte relay both directions; `initialize` round-trips through `acp-mux` against `hermes acp` (hermes-agent 0.14.0); 30 tests green including cat-loopback round-trip, two-subscriber naive fan-out, peer_id collision, no-agent-cmd 1011
 
 #### Chunk 4 — Multi-subscriber fan-out + id translation + handshake caching `1–2 days`
 

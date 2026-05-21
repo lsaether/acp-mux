@@ -16,7 +16,7 @@ const STDOUT_CAPACITY: usize = 1024;
 pub struct AgentProcess {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout_rx: mpsc::Receiver<Vec<u8>>,
+    stdout_rx: Option<mpsc::Receiver<Vec<u8>>>,
     stdout_pump: Option<JoinHandle<()>>,
 }
 
@@ -71,9 +71,17 @@ impl AgentProcess {
         Ok(AgentProcess {
             child,
             stdin: Some(stdin),
-            stdout_rx: rx,
+            stdout_rx: Some(rx),
             stdout_pump: Some(pump),
         })
+    }
+
+    /// Take ownership of the stdout NDJSON channel. After this returns,
+    /// `recv_line` will yield `None`. Used by the session actor task so it
+    /// can own the receiver in its own loop while still calling `send` and
+    /// `shutdown` on the AgentProcess handle.
+    pub fn take_stdout_rx(&mut self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        self.stdout_rx.take()
     }
 
     /// Write one NDJSON frame to the agent. Caller passes the payload
@@ -90,9 +98,9 @@ impl AgentProcess {
     }
 
     /// Receive the next stdout line. Returns `None` once the subprocess
-    /// closes its stdout (EOF or pump aborted).
+    /// closes its stdout (EOF, pump aborted, or after `take_stdout_rx`).
     pub async fn recv_line(&mut self) -> Option<Vec<u8>> {
-        self.stdout_rx.recv().await
+        self.stdout_rx.as_mut()?.recv().await
     }
 
     /// Graceful stop: close stdin, wait up to `wait` for the child to exit,
