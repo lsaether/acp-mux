@@ -13,7 +13,7 @@ Initial release. Ten chunks per the roadmap, ~50 tests.
 
 ### Multiplex behavior
 
-- **Per-session id translation.** Subscriber request ids are rewritten to per-session bridge ids; responses are rewritten back and routed only to the originator.
+- **Per-session id translation.** Subscriber request ids are rewritten to per-session mux ids; responses are rewritten back and routed only to the originator.
 - **Handshake caching.** First `initialize` and `session/new` responses are cached; later joiners are answered locally.
 - **Driving subscriber.** Whoever last sent a substantive request becomes the target for agent-initiated requests; falls back to an arbitrary attached subscriber on detach.
 - **Turn serialization.** Concurrent `session/prompt` while a turn is in flight is rejected with JSON-RPC `-32001` and broadcasts `amux/session_busy`.
@@ -39,7 +39,7 @@ Spec: [`docs/design/amux-namespace.md`](docs/design/amux-namespace.md).
   - Missing required fields → close 4400
   - `peer_id` collision → close 4409
   - No `--agent-cmd` configured or agent spawn failure → close 1011
-- `GET /debug/sessions` → JSON snapshot of every live session (subscribers, pending request count, cache state, active turn, driving sub, TTL pending, replay log length, next bridge id, next amux turn id)
+- `GET /debug/sessions` → JSON snapshot of every live session (subscribers, pending request count, cache state, active turn, driving sub, TTL pending, replay log length, next mux id, next amux turn id)
 
 ### Testing
 

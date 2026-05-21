@@ -79,9 +79,9 @@ commit/PR.
 
 - [x] subscriber set: multiple subscribers per `?session=` permitted (already in chunk 3)
 - [x] notification fan-out: parse JSON-RPC envelope on inbound; notifications broadcast to all subscribers
-- [x] id translation table: per-session `next_bridge_id: u64`, `pending: HashMap<u64, PendingRequest{peer_id, original_id, handshake}>`
-- [x] outbound request rewriting (client `id` → `bridge_id` before forwarding, original preserved in pending mapping)
-- [x] inbound response routing (rewrite `bridge_id` → `original_id`, send only to originator)
+- [x] id translation table: per-session `next_mux_id: u64`, `pending: HashMap<u64, PendingRequest{peer_id, original_id, handshake}>`
+- [x] outbound request rewriting (client `id` → `mux_id` before forwarding, original preserved in pending mapping)
+- [x] inbound response routing (rewrite `mux_id` → `original_id`, send only to originator)
 - [x] `initialize` cache: first response cached; later `initialize` requests answered locally without touching the agent
 - [x] `session/new` cache: same pattern
 - [x] agent-initiated requests: chunk-4 interim routes to one arbitrary subscriber; chunk 5 replaces with explicit driving-subscriber routing
@@ -97,9 +97,9 @@ commit/PR.
 
 #### Chunk 6 — Turn serialization `½ day` — **done**
 
-- [x] `SessionInner.active_turn_bridge_id: Option<u64>` set when `session/prompt` is forwarded
-- [x] concurrent `session/prompt` while turn active → reject with JSON-RPC error code `-32001` ("session busy") to the requester; does not consume a bridge_id and does not update the driver
-- [x] `active_turn_bridge_id` cleared when the response matching that bridge_id arrives
+- [x] `SessionInner.active_turn_mux_id: Option<u64>` set when `session/prompt` is forwarded
+- [x] concurrent `session/prompt` while turn active → reject with JSON-RPC error code `-32001` ("session busy") to the requester; does not consume a mux_id and does not update the driver
+- [x] `active_turn_mux_id` cleared when the response matching that mux_id arrives
 - [x] **DoD:** `concurrent_prompt_rejected_with_32001` (mock_acp with `MOCK_ACP_PROMPT_DELAY_MS=600`) proves second prompt is rejected with `-32001`, A's prompt completes, B can issue a fresh prompt after A's turn clears
 
 ### Phase B — amux namespace + replay
@@ -108,7 +108,7 @@ commit/PR.
 
 - [x] `protocol/amux.rs`: frame builders + `AmuxTurnId(u64)` newtype with `at-<u64>` formatting. Typed inner-params structs serialize camelCase with `skip_serializing_if = Option::is_none` for optional fields
 - [x] emit `amux/turn_started` on `session/prompt` forward (before agent receives) — broadcast to all subscribers, `content` lifted verbatim from `params.prompt`
-- [x] emit `amux/turn_complete` when the response with matching `bridge_id` arrives — `stopReason` lifted from `result.stopReason` (or `null` if absent)
+- [x] emit `amux/turn_complete` when the response with matching `mux_id` arrives — `stopReason` lifted from `result.stopReason` (or `null` if absent)
 - [x] emit `amux/peer_joined` on attach — broadcast BEFORE inserting newcomer (so newcomer doesn't see their own join; replay log will surface it to later joiners)
 - [x] emit `amux/peer_left` on detach — broadcast to remaining subscribers
 - [x] emit `amux/session_busy` on `-32001` rejection — `heldBy` = current turn's originator peer_id
@@ -148,7 +148,7 @@ commit/PR.
 
 - [x] `src/bin/mock_acp.rs` serves the canonical NDJSON ACP fixture role (the roadmap's `tests/fake_acp.rs` lives at `src/bin/` instead, so it's a `cargo` bin alongside the test binaries and tests reach it via `CARGO_MANIFEST_DIR + target/<profile>/mock_acp`). Knobs: `MOCK_ACP_SESSION_ID`, `MOCK_ACP_EMIT_PERMISSION`, `MOCK_ACP_PROMPT_DELAY_MS`
 - [x] integration tests covering every chunk's DoD (see chunks 1–9). 53 tests total
-- [x] `GET /debug/sessions` returns `{sessions: [...], sessionCount: N}`. Each session: `sessionId`, `subscribers[{peerId, peerName, role, isDriving}]`, `pendingRequestCount`, `initializeCached`, `cachedSessionId`, `activeTurnBridgeId`, `activeAmuxTurnId`, `drivingSubscriber`, `subprocessDead`, `ttlPending`, `replayLogLen`, `nextBridgeId`, `nextAmuxTurnId`
+- [x] `GET /debug/sessions` returns `{sessions: [...], sessionCount: N}`. Each session: `sessionId`, `subscribers[{peerId, peerName, role, isDriving}]`, `pendingRequestCount`, `initializeCached`, `cachedSessionId`, `activeTurnMuxId`, `activeAmuxTurnId`, `drivingSubscriber`, `subprocessDead`, `ttlPending`, `replayLogLen`, `nextMuxId`, `nextAmuxTurnId`
 - [x] README: install, run snippet, CLI flags table, architecture summary, client contract, link to design doc
 - [x] CHANGELOG.md noting v0.1.0
 - [x] tag `v0.1.0`
@@ -191,4 +191,4 @@ Not committed; ideas only.
 - [ ] WS frame size limits and backpressure policy — defer to chunk 10 polish, document the v0.1 default.
 - [ ] `amuxTurnId` format — `at-<u64>` is fine; confirm in chunk 7.
 - [ ] Replay log storage type — lean `VecDeque<bytes::Bytes>` for cheap clone on fan-out. Confirm in chunk 8.
-- [ ] `/debug/sessions` schema — fields to surface: subscribers (address + peerId + isDriving), pending requests, cached initialize/sessionId, active turn, driving sub, subprocess_dead, ttl_pending, replay log length, next bridge id. Confirm in chunk 10.
+- [ ] `/debug/sessions` schema — fields to surface: subscribers (address + peerId + isDriving), pending requests, cached initialize/sessionId, active turn, driving sub, subprocess_dead, ttl_pending, replay log length, next mux id. Confirm in chunk 10.

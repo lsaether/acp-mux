@@ -710,13 +710,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn original_id_is_preserved_across_bridge() {
+    async fn original_id_is_preserved_across_mux() {
         let (addr, _) = spawn_server_with_mock().await;
         let url = format!("ws://{addr}/acp?session=id&peer_id=A");
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
 
         // Use a high non-overlapping id to ensure we're not just lucky that
-        // bridge_id == original_id.
+        // mux_id == original_id.
         let resp = ws_request(
             &mut ws,
             r#"{"jsonrpc":"2.0","id":99999,"method":"initialize"}"#,
@@ -884,7 +884,7 @@ mod tests {
         assert_eq!(s["initializeCached"], serde_json::json!(true));
         assert_eq!(s["cachedSessionId"], serde_json::json!("sess-mock"));
         assert_eq!(s["drivingSubscriber"], serde_json::json!("A"));
-        assert_eq!(s["activeTurnBridgeId"], serde_json::Value::Null);
+        assert_eq!(s["activeTurnMuxId"], serde_json::Value::Null);
         assert_eq!(s["ttlPending"], serde_json::json!(false));
 
         let _ = ws_a.send(ClientMsg::Close(None)).await;

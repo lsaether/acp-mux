@@ -13,7 +13,7 @@
 //! - `notification` → forward to agent unchanged.
 //! - `request` → check the `initialize` / `session/new` response cache; if
 //!   present, answer the subscriber locally without touching the agent.
-//!   Otherwise allocate a per-session `bridge_id`, store the
+//!   Otherwise allocate a per-session `mux_id`, store the
 //!   `(peer_id, original_id)` mapping, rewrite the `id`, and forward.
 //!   Substantive (non-`initialize`) requests also mark the sender as the
 //!   current "driving subscriber" — the target for agent-initiated requests.
@@ -23,15 +23,15 @@
 //!   clears when the matching response returns from the agent.
 //! - `response` → forward unchanged. Subscriber-originated responses only
 //!   show up as replies to agent-initiated requests, whose ids belong to
-//!   the agent's own id space (never our `bridge_id` space), so they round
+//!   the agent's own id space (never our `mux_id` space), so they round
 //!   trip without rewriting.
 //!
 //! Inbound (agent → subscribers):
 //! - `notification` → broadcast to every attached subscriber.
-//! - `response` → look up `bridge_id`, restore `original_id`, send to the
+//! - `response` → look up `mux_id`, restore `original_id`, send to the
 //!   originator only. If the original request was the first `initialize`
 //!   or `session/new`, cache the `result` for later joiners. If it matches
-//!   `active_turn_bridge_id`, clear the active turn.
+//!   `active_turn_mux_id`, clear the active turn.
 //! - `request` → route to the driving subscriber if it is still attached,
 //!   otherwise fall back to one arbitrary attached subscriber. If none,
 //!   drop with a warn. Broadcasting would invite duplicate replies back to
@@ -62,8 +62,8 @@ use crate::protocol::jsonrpc::{
 const SESSION_QUEUE_CAPACITY: usize = 256;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Bridge ids start at 1; 0 is reserved as a sentinel.
-const FIRST_BRIDGE_ID: u64 = 1;
+/// Mux ids start at 1; 0 is reserved as a sentinel.
+const FIRST_MUX_ID: u64 = 1;
 
 /// JSON-RPC error code returned to a subscriber that issues a second
 /// `session/prompt` while another turn is already in flight. The
@@ -103,13 +103,13 @@ pub struct SessionSnapshot {
     pub pending_request_count: usize,
     pub initialize_cached: bool,
     pub cached_session_id: Option<String>,
-    pub active_turn_bridge_id: Option<u64>,
+    pub active_turn_mux_id: Option<u64>,
     pub active_amux_turn_id: Option<String>,
     pub driving_subscriber: Option<String>,
     pub subprocess_dead: bool,
     pub ttl_pending: bool,
     pub replay_log_len: Option<usize>,
-    pub next_bridge_id: u64,
+    pub next_mux_id: u64,
     pub next_amux_turn_id: u64,
 }
 
@@ -154,7 +154,7 @@ struct PendingRequest {
 struct SessionInner {
     session_id: String,
     subscribers: HashMap<String, Subscriber>,
-    next_bridge_id: u64,
+    next_mux_id: u64,
     pending: HashMap<u64, PendingRequest>,
     initialize_cache: Option<Value>,
     session_new_cache: Option<Value>,
@@ -162,9 +162,9 @@ struct SessionInner {
     /// Target for agent-initiated requests. Cleared when that subscriber
     /// detaches; falls back to an arbitrary subscriber at routing time.
     driving_subscriber_peer_id: Option<String>,
-    /// `bridge_id` of the in-flight `session/prompt`, if any. While set, a
+    /// `mux_id` of the in-flight `session/prompt`, if any. While set, a
     /// second `session/prompt` is rejected locally with `-32001`.
-    active_turn_bridge_id: Option<u64>,
+    active_turn_mux_id: Option<u64>,
     /// `amuxTurnId` paired with the in-flight `session/prompt`. Used to
     /// bookend `amux/turn_started` and `amux/turn_complete`.
     active_amux_turn_id: Option<AmuxTurnId>,
@@ -192,12 +192,12 @@ impl SessionInner {
         Self {
             session_id,
             subscribers: HashMap::new(),
-            next_bridge_id: FIRST_BRIDGE_ID,
+            next_mux_id: FIRST_MUX_ID,
             pending: HashMap::new(),
             initialize_cache: None,
             session_new_cache: None,
             driving_subscriber_peer_id: None,
-            active_turn_bridge_id: None,
+            active_turn_mux_id: None,
             active_amux_turn_id: None,
             next_amux_turn_id: 1,
             replay_log,
@@ -277,13 +277,13 @@ impl SessionInner {
             pending_request_count: self.pending.len(),
             initialize_cached: self.initialize_cache.is_some(),
             cached_session_id,
-            active_turn_bridge_id: self.active_turn_bridge_id,
+            active_turn_mux_id: self.active_turn_mux_id,
             active_amux_turn_id: self.active_amux_turn_id.map(|t| t.formatted()),
             driving_subscriber: self.driving_subscriber_peer_id.clone(),
             subprocess_dead: false,
             ttl_pending,
             replay_log_len: self.replay_log.as_ref().map(|l| l.len()),
-            next_bridge_id: self.next_bridge_id,
+            next_mux_id: self.next_mux_id,
             next_amux_turn_id: self.next_amux_turn_id,
         }
     }
@@ -373,7 +373,7 @@ impl SessionInner {
         // (the in-flight turn's originator stays the driver). Also broadcast
         // an amux/session_busy notification so peers see the rejection.
         if req.method == "session/prompt"
-            && let Some(active) = self.active_turn_bridge_id
+            && let Some(active) = self.active_turn_mux_id
         {
             let held_by = self.pending.get(&active).map(|pr| pr.peer_id.clone());
             tracing::warn!(
@@ -404,31 +404,31 @@ impl SessionInner {
             _ => None,
         };
 
-        let bridge_id = self.next_bridge_id;
-        self.next_bridge_id += 1;
+        let mux_id = self.next_mux_id;
+        self.next_mux_id += 1;
         let original_id = req.id.clone();
         let is_prompt = req.method == "session/prompt";
         self.pending.insert(
-            bridge_id,
+            mux_id,
             PendingRequest {
                 peer_id: peer_id.to_string(),
                 original_id,
                 handshake,
             },
         );
-        req.id = Id::Number(bridge_id as i64);
+        req.id = Id::Number(mux_id as i64);
 
         match serde_json::to_vec(&req) {
             Ok(out) => {
                 if is_prompt {
-                    self.active_turn_bridge_id = Some(bridge_id);
+                    self.active_turn_mux_id = Some(mux_id);
                     let turn_id = AmuxTurnId(self.next_amux_turn_id);
                     self.next_amux_turn_id += 1;
                     self.active_amux_turn_id = Some(turn_id);
                     tracing::info!(
                         session = %self.session_id,
                         %peer_id,
-                        bridge_id,
+                        mux_id,
                         amux_turn_id = %turn_id.formatted(),
                         "session/prompt forwarded; active turn opened",
                     );
@@ -439,11 +439,11 @@ impl SessionInner {
             Err(err) => {
                 tracing::error!(
                     session = %self.session_id,
-                    bridge_id,
+                    mux_id,
                     error = %err,
                     "failed to serialize translated request; dropping",
                 );
-                self.pending.remove(&bridge_id);
+                self.pending.remove(&mux_id);
                 None
             }
         }
@@ -590,7 +590,7 @@ impl SessionInner {
     }
 
     fn route_agent_response(&mut self, mut resp: IncomingResponse) {
-        let bridge_id = match resp.id {
+        let mux_id = match resp.id {
             Id::Number(n) if n >= 0 => n as u64,
             ref other => {
                 tracing::warn!(
@@ -601,17 +601,17 @@ impl SessionInner {
                 return;
             }
         };
-        let Some(pr) = self.pending.remove(&bridge_id) else {
-            tracing::warn!(session = %self.session_id, bridge_id, "no pending request matches agent response; dropping");
+        let Some(pr) = self.pending.remove(&mux_id) else {
+            tracing::warn!(session = %self.session_id, mux_id, "no pending request matches agent response; dropping");
             return;
         };
 
-        if self.active_turn_bridge_id == Some(bridge_id) {
-            self.active_turn_bridge_id = None;
+        if self.active_turn_mux_id == Some(mux_id) {
+            self.active_turn_mux_id = None;
             let turn_id = self.active_amux_turn_id.take();
             tracing::info!(
                 session = %self.session_id,
-                bridge_id,
+                mux_id,
                 amux_turn_id = ?turn_id.map(|t| t.formatted()),
                 "session/prompt response received; active turn cleared",
             );

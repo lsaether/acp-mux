@@ -4,7 +4,7 @@ use clap::{Parser, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "acp-mux",
+    name = "amux",
     version,
     about = "Multi-subscriber ACP session multiplexer"
 )]

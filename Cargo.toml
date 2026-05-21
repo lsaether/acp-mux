@@ -3,6 +3,12 @@ name = "acp-mux"
 version = "0.1.0"
 edition = "2024"
 
+# The crate (and GitHub repo) is "acp-mux" but the installed binary is
+# the shorter "amux". `src/bin/mock_acp.rs` is still auto-detected.
+[[bin]]
+name = "amux"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.102"
 axum = { version = "0.8.9", features = ["ws", "macros"] }

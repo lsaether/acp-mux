@@ -10,13 +10,13 @@ Multi-subscriber session-sharing layer for ACP (Agent Client Protocol). Lets mul
 git clone https://github.com/lsaether/acp-mux
 cd acp-mux
 cargo build --release
-# binary: ./target/release/acp-mux
+# binary: ./target/release/amux
 ```
 
 ## Run
 
 ```sh
-acp-mux --agent-cmd 'hermes acp' --port 8765
+amux --agent-cmd 'hermes acp' --port 8765
 ```
 
 Then connect WebSocket clients to `ws://127.0.0.1:8765/acp?session=<id>&peer_id=<unique>&peer_name=<display>&role=<optional>`.
@@ -41,7 +41,7 @@ Health and debug endpoints:
 
 - **One subprocess per session.** Each `?session=` value spawns a fresh `--agent-cmd` subprocess. Multiple subscribers on the same session share that subprocess.
 - **JSON-RPC envelope routing.** The mux parses only the envelope (`id`, `method`, `params`, `result`, `error`). Payloads are forwarded byte-for-byte. Policy keys off the `method` string.
-- **Per-session id translation.** Each subscriber's request `id` is rewritten to a bridge id before forwarding; the response is rewritten back and sent only to the originator.
+- **Per-session id translation.** Each subscriber's request `id` is rewritten to a per-session `mux_id` before forwarding; the response is rewritten back and sent only to the originator.
 - **`initialize` / `session/new` caching.** First response is cached; later joiners are answered locally without re-sending to the agent.
 - **Driving subscriber + turn serialization.** Whichever subscriber last sent a substantive request is the driver — target for agent-initiated requests like `permission/request`. Concurrent `session/prompt` while a turn is in flight is rejected with JSON-RPC `-32001`.
 - **`amux/*` notification namespace.** The mux publishes its own metadata out-of-band: `amux/peer_joined`, `amux/peer_left`, `amux/turn_started`, `amux/turn_complete`, `amux/session_busy`. ACP frames stay clean; clients see two distinguishable channels and demultiplex by method prefix.
