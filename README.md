@@ -24,7 +24,7 @@ CLI surface lands in chunk 2; the current binary parses `--help`/`--version` onl
 ## Docs
 
 - Build plan: [ROADMAP.md](ROADMAP.md)
-- Protocol spec: [docs/design/bridge-namespace.md](docs/design/bridge-namespace.md)
+- Protocol spec: [docs/design/amux-namespace.md](docs/design/amux-namespace.md)
 
 ## License
 
