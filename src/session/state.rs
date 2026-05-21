@@ -89,6 +89,37 @@ pub enum SessionMsg {
     },
     AgentStdoutLine(Vec<u8>),
     AgentDied,
+    /// Build a JSON snapshot of session state for `/debug/sessions`.
+    Snapshot {
+        ack: oneshot::Sender<SessionSnapshot>,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSnapshot {
+    pub session_id: String,
+    pub subscribers: Vec<SubscriberSnapshot>,
+    pub pending_request_count: usize,
+    pub initialize_cached: bool,
+    pub cached_session_id: Option<String>,
+    pub active_turn_bridge_id: Option<u64>,
+    pub active_amux_turn_id: Option<String>,
+    pub driving_subscriber: Option<String>,
+    pub subprocess_dead: bool,
+    pub ttl_pending: bool,
+    pub replay_log_len: Option<usize>,
+    pub next_bridge_id: u64,
+    pub next_amux_turn_id: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriberSnapshot {
+    pub peer_id: String,
+    pub peer_name: Option<String>,
+    pub role: Option<String>,
+    pub is_driving: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +252,40 @@ impl SessionInner {
             }
         }
         Ok(())
+    }
+
+    /// Build a serializable snapshot of session state for /debug/sessions.
+    fn build_snapshot(&self, ttl_pending: bool) -> SessionSnapshot {
+        let subs: Vec<SubscriberSnapshot> = self
+            .subscribers
+            .values()
+            .map(|s| SubscriberSnapshot {
+                peer_id: s.peer_id.clone(),
+                peer_name: s.peer_name.clone(),
+                role: s.role.clone(),
+                is_driving: self.driving_subscriber_peer_id.as_ref() == Some(&s.peer_id),
+            })
+            .collect();
+        let cached_session_id = self.session_new_cache.as_ref().and_then(|v| {
+            v.get("sessionId")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+        });
+        SessionSnapshot {
+            session_id: self.session_id.clone(),
+            subscribers: subs,
+            pending_request_count: self.pending.len(),
+            initialize_cached: self.initialize_cache.is_some(),
+            cached_session_id,
+            active_turn_bridge_id: self.active_turn_bridge_id,
+            active_amux_turn_id: self.active_amux_turn_id.map(|t| t.formatted()),
+            driving_subscriber: self.driving_subscriber_peer_id.clone(),
+            subprocess_dead: false,
+            ttl_pending,
+            replay_log_len: self.replay_log.as_ref().map(|l| l.len()),
+            next_bridge_id: self.next_bridge_id,
+            next_amux_turn_id: self.next_amux_turn_id,
+        }
     }
 
     /// Close every attached subscriber with a structured WS close frame.
@@ -743,6 +808,11 @@ async fn run_session(
                     }
                     Some(SessionMsg::AgentDied) => {
                         Some(ExitReason::AgentDied)
+                    }
+                    Some(SessionMsg::Snapshot { ack }) => {
+                        let snap = inner.build_snapshot(ttl_sleep.is_some());
+                        let _ = ack.send(snap);
+                        None
                     }
                 }
             }

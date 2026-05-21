@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Router,
+    Json, Router,
     extract::{
         Query, State, WebSocketUpgrade,
         ws::{CloseFrame, Message, Utf8Bytes, WebSocket},
@@ -25,11 +25,12 @@ use axum::{
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::multiplex::subscriber::{OutMsg, Subscriber};
 use crate::session::registry::{RegistryError, SessionRegistry};
-use crate::session::state::SessionMsg;
+use crate::session::state::{SessionMsg, SessionSnapshot};
 
 const SESSION_ID_MAX_LEN: usize = 128;
 
@@ -63,11 +64,28 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/acp", get(acp_attach))
+        .route("/debug/sessions", get(debug_sessions))
         .with_state(state)
 }
 
 async fn healthz() -> &'static str {
     "ok\n"
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugSessionsResponse {
+    sessions: Vec<SessionSnapshot>,
+    session_count: usize,
+}
+
+async fn debug_sessions(State(state): State<AppState>) -> impl IntoResponse {
+    let sessions = state.registry.snapshot().await;
+    let count = sessions.len();
+    Json(DebugSessionsResponse {
+        sessions,
+        session_count: count,
+    })
 }
 
 async fn acp_attach(
@@ -829,6 +847,49 @@ mod tests {
     /// Chunk 9: a reconnect within the TTL grace window cancels the
     /// pending teardown and the new subscriber lands on the same session
     /// — proven by hitting the initialize cache populated by A.
+    /// Chunk 10: GET /debug/sessions returns the registry snapshot.
+    #[tokio::test]
+    async fn debug_sessions_reflects_live_state() {
+        let (addr, _) = spawn_server_with_mock().await;
+        let url_a = format!("ws://{addr}/acp?session=debug&peer_id=A&peer_name=Alice");
+
+        // Empty registry before any attaches.
+        let body = http_get(&format!("http://{addr}/debug/sessions")).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["sessionCount"], serde_json::json!(0));
+
+        // Attach, initialize, drive.
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+        )
+        .await;
+
+        let body = http_get(&format!("http://{addr}/debug/sessions")).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["sessionCount"], serde_json::json!(1));
+
+        let s = &v["sessions"][0];
+        assert_eq!(s["sessionId"], serde_json::json!("debug"));
+        assert_eq!(s["subscribers"].as_array().unwrap().len(), 1);
+        assert_eq!(s["subscribers"][0]["peerId"], serde_json::json!("A"));
+        assert_eq!(s["subscribers"][0]["peerName"], serde_json::json!("Alice"));
+        assert_eq!(s["subscribers"][0]["isDriving"], serde_json::json!(true));
+        assert_eq!(s["initializeCached"], serde_json::json!(true));
+        assert_eq!(s["cachedSessionId"], serde_json::json!("sess-mock"));
+        assert_eq!(s["drivingSubscriber"], serde_json::json!("A"));
+        assert_eq!(s["activeTurnBridgeId"], serde_json::Value::Null);
+        assert_eq!(s["ttlPending"], serde_json::json!(false));
+
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+    }
+
     #[tokio::test]
     async fn ttl_grace_cancelled_by_reconnect() {
         let (addr, registry) =
