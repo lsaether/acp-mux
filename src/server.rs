@@ -22,6 +22,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use bytes::Bytes;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -94,7 +95,7 @@ async fn handle_attach(state: AppState, q: AttachQuery, mut socket: WebSocket) {
         role,
     } = validated;
 
-    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Bytes>();
     let subscriber = Subscriber::new(peer_id.clone(), peer_name, role, outbound_tx);
 
     let handle = match state.registry.attach(&session, subscriber).await {
@@ -206,12 +207,12 @@ async fn ws_in_task(
 
 async fn ws_out_task(
     mut ws_sink: SplitSink<WebSocket, Message>,
-    mut outbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut outbound_rx: mpsc::UnboundedReceiver<Bytes>,
     peer_id: String,
     session: String,
 ) {
-    while let Some(line) = outbound_rx.recv().await {
-        match Utf8Bytes::try_from(line) {
+    while let Some(bytes) = outbound_rx.recv().await {
+        match Utf8Bytes::try_from(bytes) {
             Ok(text) => {
                 if ws_sink.send(Message::Text(text)).await.is_err() {
                     tracing::debug!(%session, %peer_id, "ws_out: peer dropped");
@@ -285,6 +286,7 @@ async fn close_with(socket: &mut WebSocket, code: u16, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::ReplayTurns;
     use crate::session::registry::AgentCmd;
     use futures::{SinkExt, StreamExt};
     use std::net::SocketAddr;
@@ -303,7 +305,7 @@ mod tests {
     }
 
     async fn spawn_server(agent_cmd: Option<AgentCmd>) -> (SocketAddr, Arc<SessionRegistry>) {
-        let registry = SessionRegistry::new(agent_cmd);
+        let registry = SessionRegistry::new(agent_cmd, ReplayTurns::Unbounded);
         let app = router(AppState::new(registry.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -767,13 +769,24 @@ mod tests {
         assert_eq!(pj["params"]["peerName"], serde_json::json!("Bob"));
         assert_eq!(pj["params"]["sessionId"], serde_json::json!("presence"));
 
-        // B should NOT see their own peer_joined.
-        let b_early = drain_for(&mut ws_b, Duration::from_millis(100)).await;
-        let b_self_join = b_early
-            .iter()
-            .any(|v| v.get("method") == Some(&serde_json::json!("amux/peer_joined")));
+        // B receives the replay log on join. The log contains peer_joined
+        // for A (so B learns about A) but NOT peer_joined for B (B's own
+        // join is appended to the log AFTER the snapshot is taken).
+        let b_early = drain_for(&mut ws_b, Duration::from_millis(150)).await;
+        let saw_a_join = b_early.iter().any(|v| {
+            v.get("method") == Some(&serde_json::json!("amux/peer_joined"))
+                && v["params"]["peerId"] == serde_json::json!("A")
+        });
+        let saw_own_join = b_early.iter().any(|v| {
+            v.get("method") == Some(&serde_json::json!("amux/peer_joined"))
+                && v["params"]["peerId"] == serde_json::json!("B")
+        });
         assert!(
-            !b_self_join,
+            saw_a_join,
+            "B should see A's peer_joined via replay, got {b_early:?}"
+        );
+        assert!(
+            !saw_own_join,
             "B should not see their own peer_joined, got {b_early:?}"
         );
 
@@ -788,6 +801,142 @@ mod tests {
         assert_eq!(pl["params"]["peerId"], serde_json::json!("B"));
 
         let _ = ws_a.send(ClientMsg::Close(None)).await;
+    }
+
+    /// Chunk 8: late joiner receives the replay log: peer_joined for A,
+    /// turn_started + session/update notifications + turn_complete for A's
+    /// completed turn — all delivered to B before any live events, in
+    /// order.
+    #[tokio::test]
+    async fn replay_log_delivers_history_to_late_joiner() {
+        let (addr, _) = spawn_server_with_mock().await;
+        let url_a = format!("ws://{addr}/acp?session=replay&peer_id=A");
+        let url_b = format!("ws://{addr}/acp?session=replay&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+        )
+        .await;
+
+        // A runs a full turn to completion.
+        ws_a.send(ClientMsg::Text(
+            r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"hi"}]}}"#.into(),
+        )).await.unwrap();
+        // Drain A until it sees the prompt response, ensuring the turn has
+        // closed (turn_complete is in the log) before B joins.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match timeout(Duration::from_millis(200), ws_a.next()).await {
+                Ok(Some(Ok(ClientMsg::Text(t)))) => {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                    if v.get("id") == Some(&serde_json::json!(7)) && v.get("result").is_some() {
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        // B attaches AFTER the turn has finished.
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let replay = drain_for(&mut ws_b, Duration::from_millis(400)).await;
+
+        // The replay should include, in this order:
+        //   peer_joined(A), turn_started(A), 2x session/update, turn_complete
+        let methods: Vec<&str> = replay
+            .iter()
+            .filter_map(|v| v.get("method").and_then(|m| m.as_str()))
+            .collect();
+
+        let pj_idx = methods
+            .iter()
+            .position(|m| *m == "amux/peer_joined")
+            .expect("replay should contain peer_joined");
+        let ts_idx = methods
+            .iter()
+            .position(|m| *m == "amux/turn_started")
+            .expect("replay should contain turn_started");
+        let tc_idx = methods
+            .iter()
+            .position(|m| *m == "amux/turn_complete")
+            .expect("replay should contain turn_complete");
+
+        assert!(pj_idx < ts_idx, "peer_joined before turn_started in replay");
+        assert!(
+            ts_idx < tc_idx,
+            "turn_started before turn_complete in replay"
+        );
+
+        let updates: Vec<_> = methods.iter().filter(|m| **m == "session/update").collect();
+        assert_eq!(
+            updates.len(),
+            2,
+            "two session/update notifications in replay"
+        );
+
+        // The session/update notifications must sit between turn_started
+        // and turn_complete in the replay order.
+        let upd_positions: Vec<_> = methods
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| **m == "session/update")
+            .map(|(i, _)| i)
+            .collect();
+        for pos in &upd_positions {
+            assert!(*pos > ts_idx && *pos < tc_idx, "session/update inside turn");
+        }
+
+        // B should NOT see a response to A's request (id=7) — that was a
+        // per-subscriber frame, not broadcast-tier.
+        let saw_a_response = replay
+            .iter()
+            .any(|v| v.get("id") == Some(&serde_json::json!(7)));
+        assert!(!saw_a_response, "B should not see A's prompt response");
+
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
+    }
+
+    /// Chunk 8: --replay-turns 0 disables the log; B sees no history.
+    #[tokio::test]
+    async fn replay_turns_disabled_emits_no_history() {
+        let agent_cmd = mock_agent_cmd();
+        let registry = SessionRegistry::new(Some(agent_cmd), ReplayTurns::Disabled);
+        let app = router(AppState::new(registry));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let url_a = format!("ws://{addr}/acp?session=nolog&peer_id=A");
+        let url_b = format!("ws://{addr}/acp?session=nolog&peer_id=B");
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let early = drain_for(&mut ws_b, Duration::from_millis(150)).await;
+        // peer_joined for B's own join doesn't broadcast to B; without a
+        // replay log, B sees nothing until the next live event.
+        assert!(
+            early.is_empty(),
+            "B should see no replay frames, got {early:?}"
+        );
+
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
     }
 
     /// Chunk 7: amux/turn_started fires before forwarding session/prompt,
