@@ -43,8 +43,9 @@ Health and debug endpoints:
 - **JSON-RPC envelope routing.** The mux parses only the envelope (`id`, `method`, `params`, `result`, `error`). Payloads are forwarded byte-for-byte. Policy keys off the `method` string.
 - **Per-session id translation.** Each subscriber's request `id` is rewritten to a per-session `mux_id` before forwarding; the response is rewritten back and sent only to the originator.
 - **`initialize` / `session/new` caching.** First response is cached; later joiners are answered locally without re-sending to the agent.
-- **Driving subscriber + turn serialization.** Whichever subscriber last sent a substantive request is the driver — target for agent-initiated requests like `permission/request`. Concurrent `session/prompt` while a turn is in flight is rejected with JSON-RPC `-32001`.
-- **`amux/*` notification namespace.** The mux publishes its own metadata out-of-band: `amux/peer_joined`, `amux/peer_left`, `amux/turn_started`, `amux/turn_complete`, `amux/session_busy`. ACP frames stay clean; clients see two distinguishable channels and demultiplex by method prefix.
+- **Broadcast agent-initiated requests.** Agent-initiated requests (e.g. `session/request_permission`) are fanned out to every attached subscriber; any peer can reply. The first reply for a given id is forwarded to the agent and later replies for the same id are dropped, so the agent always sees exactly one response.
+- **Turn serialization.** Concurrent `session/prompt` while a turn is in flight is rejected with JSON-RPC `-32001`. The last subscriber to issue a substantive request is still surfaced as the "driving subscriber" in `/debug/sessions` and `amux/turn_started` for UI attribution.
+- **`amux/*` notification namespace.** The mux publishes its own metadata out-of-band: `amux/peer_joined`, `amux/peer_left`, `amux/turn_started`, `amux/turn_complete`, `amux/session_busy`, `amux/agent_request_resolved`. ACP frames stay clean; clients see two distinguishable channels and demultiplex by method prefix.
 - **Replay log.** Every broadcast-tier frame (`amux/*` + agent notifications) is appended; a late joiner receives the full history before any live event.
 - **TTL grace.** Last subscriber leaving starts a countdown; a reconnect within `--session-ttl-seconds` reuses the same subprocess with all of its caches intact.
 

@@ -12,13 +12,21 @@
 //!
 //! - `MOCK_ACP_SESSION_ID` — sessionId returned by `session/new`.
 //! - `MOCK_ACP_EMIT_PERMISSION=1` — on `session/prompt`, emit an
-//!   agent-initiated `permission/request` (id 10000+counter) before the
-//!   updates and the response. The mock does NOT block on the permission
-//!   response; it carries on. This exercises chunk-5 driving-subscriber
-//!   routing.
+//!   agent-initiated `session/request_permission` (id 10000+counter)
+//!   before the updates and the response. Uses the canonical ACP wire
+//!   shape: `params.options[{optionId, kind, name}]` and expects a reply
+//!   of `result.outcome = {outcome: "selected", optionId} | {outcome:
+//!   "cancelled"}`. The mock does NOT block on the response; it carries
+//!   on so subscriber-side response handling can be tested independently
+//!   of agent turn timing.
 //! - `MOCK_ACP_PROMPT_DELAY_MS=N` — sleep N ms before responding to
 //!   `session/prompt`. Lets the test queue a second concurrent prompt at
 //!   acp-mux while the first turn is in flight (chunk 6).
+//! - `MOCK_ACP_ECHO_RESPONSES=1` — whenever the mock receives a response
+//!   frame (id + result/error, no method), emit an observable
+//!   `mock/response_echo` notification carrying the id and a monotonic
+//!   counter. Tests use this to confirm exactly one subscriber reply
+//!   reaches the agent for any given agent-initiated request id.
 //!
 //! Per-line behavior is logged to stderr at info level so tests can grep
 //! the output if needed. The process exits when stdin closes.
@@ -44,11 +52,15 @@ fn main() {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
+    let echo_responses = env::var("MOCK_ACP_ECHO_RESPONSES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     let mut initialize_count: u32 = 0;
     let mut session_new_count: u32 = 0;
     let mut prompt_count: u32 = 0;
     let mut next_permission_id: u64 = 10_000;
+    let mut response_echo_count: u32 = 0;
 
     let mut line = String::new();
     loop {
@@ -78,9 +90,23 @@ fn main() {
 
         eprintln!("mock_acp: rx method={method} id={id:?}");
 
-        // Responses from the multiplexer (id + result, no method) are
-        // ignored by this mock — it never initiates requests in chunk 4.
+        // Responses from the multiplexer (id + result/error, no method).
+        // Optionally echo them as observable notifications so tests can
+        // assert exactly one reply reached the agent for a given id.
         if id.is_some() && method.is_empty() {
+            if echo_responses {
+                response_echo_count += 1;
+                let echo = json!({
+                    "jsonrpc": "2.0",
+                    "method": "mock/response_echo",
+                    "params": {
+                        "id": id,
+                        "seq": response_echo_count,
+                    },
+                });
+                writeln!(stdout, "{echo}").ok();
+                stdout.flush().ok();
+            }
             continue;
         }
 
@@ -128,10 +154,19 @@ fn main() {
                     let perm = json!({
                         "jsonrpc": "2.0",
                         "id": next_permission_id,
-                        "method": "permission/request",
+                        "method": "session/request_permission",
                         "params": {
                             "sessionId": sess,
-                            "toolCall": { "name": "demo_tool" },
+                            "toolCall": {
+                                "toolCallId": format!("mock-tool-{next_permission_id}"),
+                                "title": "demo_tool",
+                                "kind": "execute",
+                                "status": "pending",
+                            },
+                            "options": [
+                                { "optionId": "allow_once", "kind": "allow_once", "name": "Allow once" },
+                                { "optionId": "deny", "kind": "reject_once", "name": "Deny" },
+                            ],
                         },
                     });
                     writeln!(stdout, "{perm}").ok();
