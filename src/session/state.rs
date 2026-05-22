@@ -1185,7 +1185,12 @@ impl SessionInner {
 
     /// Send `frame` to every subscriber and append to the replay log if
     /// enabled. Drops subscribers whose outbound channel has closed.
-    /// Returns true if the session has no live subscribers afterward.
+    /// Returns `true` only when fan-out *drained* subscribers — i.e.
+    /// the map was non-empty going in and is empty coming out. A
+    /// broadcast against an already-empty map (e.g. the initial
+    /// `amux/peer_joined` emitted before the first subscriber is
+    /// inserted) returns `false` and emits no "ending session" log,
+    /// since no subscribers were lost.
     ///
     /// Only broadcast-tier frames flow through here: amux/* notifications
     /// and the agent's session/update (and other notification-shaped)
@@ -1196,6 +1201,7 @@ impl SessionInner {
         if let Some(log) = self.replay_log.as_mut() {
             log.push_back(frame.clone());
         }
+        let pre_fanout = self.subscribers.len();
         self.subscribers.retain(|peer_id, sub| {
             match sub.outbound.send(OutMsg::Frame(frame.clone())) {
                 Ok(()) => true,
@@ -1205,7 +1211,7 @@ impl SessionInner {
                 }
             }
         });
-        if self.subscribers.is_empty() {
+        if pre_fanout > 0 && self.subscribers.is_empty() {
             tracing::info!(session = %self.session_id, "no live subscribers after fan-out; ending session");
             return true;
         }

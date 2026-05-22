@@ -2,7 +2,7 @@
 
 Multi-subscriber session-sharing layer for ACP (Agent Client Protocol). Lets multiple clients — desktop, phone, web — attach to one ACP agent session in real time. Each client sees the same conversation, can take turns prompting, and receives streaming updates from the agent.
 
-**Status:** v0.1.0.
+**Status:** v0.1.1.
 
 ## Install
 

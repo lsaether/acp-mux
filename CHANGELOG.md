@@ -1,33 +1,6 @@
 # Changelog
 
-## Unreleased — session/load canonical rebinding
-
-### Fixed
-
-- **Multi-client + `session/load` desync.** After a peer issued a successful `session/load` to switch the room to a different session, amux's cached canonical session id was still the original one from `session/new`. Late joiners that called `session/new` got the stale id back and silently desynced from the agent's actual current session. Now amux rebinds the room's canonical session id on every successful `session/load`:
-  - When `session_new_cache` already exists, its `sessionId` field is replaced in place; other fields the agent returned are preserved.
-  - When no prior `session/new` happened (client called `initialize` → `session/load` directly), amux synthesizes a minimal `{sessionId: "..."}` cache value.
-  - Failed `session/load` (error response from the agent) leaves the existing cache untouched.
-- `/debug/sessions` `cachedSessionId` reflects the loaded session id after a successful load, so operators can verify the rebinding without inspecting the wire.
-
-### Notes
-
-- Hermes 0.14.0 advertises `agentCapabilities.loadSession = true`, so this scenario is reachable on the canonical agent today.
-- `mock_acp` knob: `MOCK_ACP_FAIL_LOAD=1` returns an error to `session/load` (for testing that failures don't rebind).
-
-## Unreleased — session/list
-
-### Added
-
-- **`session/list` support via envelope passthrough.** When the upstream agent advertises `agentCapabilities.sessionCapabilities.list` ([Draft RFD](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/session-list.mdx)), amux propagates the capability to clients verbatim and forwards `session/list` requests through the standard id-translation path. The agent's response — the `sessions[]` array, optional `nextCursor`, `cwd` filter handling — flows back unmodified.
-- **`mock_acp` knob**: `MOCK_ACP_SESSION_LIST=1` advertises the capability and serves a canned three-entry session list with `cwd` filtering. Used to test end-to-end passthrough.
-
-### Notes
-
-- amux doesn't intercept or rewrite `session/list`. The agent is the source of truth; amux is plumbing. Decorating the response with amux-known per-session info (subscriber counts, proxy session ids) is tracked in [#6](https://github.com/lsaether/acp-mux/issues/6).
-- Cold-start discovery — listing the agent's persisted sessions *before* WS-attaching to one — is not supported (amux's WS contract requires a session id on every connection). Tracked as [#10](https://github.com/lsaether/acp-mux/issues/10).
-
-## Unreleased — cancellation
+## v0.1.1 — 2026-05-22
 
 ### Added
 
@@ -36,20 +9,31 @@
   - **Agent → subscribers**: when the agent emits `$/cancel_request` for an agent-initiated request still InFlight (in practice `session/request_permission`), amux marks the `agent_pending` entry Consumed (so late subscriber replies are dropped), forwards the cancellation to every subscriber, and emits `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`.
 - **`amux/cancel_active_turn` extension.** Any attached peer can cancel the in-flight turn (not just the driver). amux looks up `active_turn_mux_id`, broadcasts `amux/turn_cancelled { sessionId, amuxTurnId, cancelledBy, originalDriver, reason? }` to every peer (intent), and synthesizes a `$/cancel_request` to the agent using the active-turn `mux_id`. Strict `$/cancel_request` semantics still apply on the southbound side — the agent never sees the amux extension.
 - **`amux/turn_cancelled` notification.** Intent broadcast emitted on `amux/cancel_active_turn`. Distinct from `amux/turn_complete` (which fires later when the agent actually settles).
-
-### Notes
-
-- Cancellation is optional per the RFD. amux forwards cancellations honestly; if the agent doesn't honor them and finishes normally, subscribers see the regular response. Documented limitation, not amux's job.
-- The synthesized `$/cancel_request` from `amux/cancel_active_turn` is indistinguishable to the agent from a cancel sent by the original driver — same wire shape, same `mux_id`.
-
-## v0.1.1 — 2026-05-21
+- **`session/list` support via envelope passthrough.** When the upstream agent advertises `agentCapabilities.sessionCapabilities.list` ([Draft RFD](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/session-list.mdx)), amux propagates the capability to clients verbatim and forwards `session/list` requests through the standard id-translation path. The agent's response — the `sessions[]` array, optional `nextCursor`, `cwd` filter handling — flows back unmodified. amux is plumbing; decorating with amux-known per-session info is tracked in [#6](https://github.com/lsaether/acp-mux/issues/6).
+- **`mock_acp` knobs** for the new code paths: `MOCK_ACP_ECHO_CANCELS=1`, `MOCK_ACP_CANCEL_PERMISSION=1`, `MOCK_ACP_SESSION_LIST=1`, `MOCK_ACP_FAIL_LOAD=1`.
 
 ### Changed
 
-- **Agent-initiated requests now broadcast.** `session/request_permission` (and any other agent → subscriber request) fans out to every attached subscriber instead of being delivered only to the driving subscriber. Any peer can reply; the first reply for a given id is forwarded to the agent and later replies are dropped so the agent still sees exactly one response per id. The "driving subscriber" concept remains for UI attribution (`amux/turn_started`, `/debug/sessions`) but no longer gates who can answer the agent.
+- **Agent-initiated requests broadcast.** `session/request_permission` (and any other agent → subscriber request) fans out to every attached subscriber instead of being delivered only to the driving subscriber. Any peer can reply; the first reply for a given id is forwarded to the agent and later replies are dropped so the agent still sees exactly one response per id. The "driving subscriber" concept remains for UI attribution (`amux/turn_started`, `/debug/sessions`) but no longer gates who can answer the agent.
 - **New `amux/agent_request_resolved` notification.** When the first-reply-wins gate flips a tracked agent-initiated request to consumed, the mux broadcasts `{ sessionId, requestId, resolvedBy, result | error }` to every attached subscriber. Peers that lost the race (or never replied) use this to dismiss the request from their UI; the responder's own UI ignores it (the entry is already gone locally). For `session/request_permission` the `result` body is derived entirely from option metadata already present in the broadcast request, so no new information leaks.
 - **Turn-end cleanup for abandoned agent-initiated requests.** When `session/prompt` completes with `agent_pending` entries still `InFlight` (e.g. hermes' internal 60s permission deadline fired without a response frame), the mux now sweeps those entries to `Consumed` and broadcasts one `amux/agent_request_resolved { resolvedBy: "mux:turn-ended", result: null, error: null }` per stale id immediately before `amux/turn_complete`. This unblocks TUI clients that would otherwise show a permission prompt the agent has already given up on. No competing wire-level timeout is added on the mux side — it only emits cleanup after the agent has signaled the turn is done.
 - **`mock_acp` permission emission updated to ACP spec shape.** `MOCK_ACP_EMIT_PERMISSION=1` now emits the canonical `session/request_permission` (was: an ad-hoc `permission/request`) with the proper `params.toolCall` and `params.options[{optionId, kind, name}]`. Reply shape: `result.outcome = {outcome: "selected", optionId} | {outcome: "cancelled"}`.
+- **Crate split into lib + bin.** The crate is now `amux` (lib) consumed by the `amux` binary. Integration tests live under `tests/server.rs` and link the lib directly; pure-unit tests for private helpers (`strip_trailing_newline`, `validate`, `is_valid_session_id`) stay inline in `src/server.rs`. Fixes CI (`cargo test` now builds `mock_acp` automatically as a test dep via `CARGO_BIN_EXE_mock_acp`, no special workflow step). Lib name matches the bin name so `RUST_LOG=amux=trace` covers everything from a single filter.
+
+### Fixed
+
+- **Multi-client + `session/load` desync.** After a peer issued a successful `session/load` to switch the room to a different session, amux's cached canonical session id was still the original one from `session/new`. Late joiners that called `session/new` got the stale id back and silently desynced from the agent's actual current session. Now amux rebinds the room's canonical session id on every successful `session/load`:
+  - When `session_new_cache` already exists, its `sessionId` field is replaced in place; other fields the agent returned are preserved.
+  - When no prior `session/new` happened (client called `initialize` → `session/load` directly), amux synthesizes a minimal `{sessionId: "..."}` cache value.
+  - Failed `session/load` (error response from the agent) leaves the existing cache untouched.
+  - `/debug/sessions` `cachedSessionId` reflects the loaded session id after a successful load.
+- **Spurious "no live subscribers after fan-out; ending session" log.** The first `amux/peer_joined` broadcast on session creation fired against an empty subscriber map (the new subscriber isn't inserted until after the broadcast), making `broadcast()` log "ending session" — but nothing actually ended. The log now only fires when fan-out *drained* a previously non-empty subscriber map.
+
+### Notes
+
+- Cancellation is optional per the RFD. amux forwards cancellations honestly; if the agent doesn't honor them and finishes normally, subscribers see the regular response.
+- Hermes 0.14.0 advertises `agentCapabilities.loadSession = true` and `sessionCapabilities.list = {}`, so both the load-rebinding fix and `session/list` passthrough are exercised end-to-end against the canonical agent.
+- Cold-start session discovery (listing the agent's persisted sessions *before* WS-attaching) is not supported in this release — amux's WS contract requires a session id on every connection. Tracked as [#10](https://github.com/lsaether/acp-mux/issues/10).
 
 ## v0.1.0
 
