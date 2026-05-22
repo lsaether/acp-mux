@@ -201,10 +201,20 @@ impl SessionHandle {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum HandshakeKind {
     Initialize,
     SessionNew,
+    /// `session/load` request that asked the agent to switch to an
+    /// existing session id. On success the room's canonical session id
+    /// is rebound to this value so late joiners' `session/new` calls
+    /// return the loaded session (not the original one). Captured at
+    /// request-translation time from the client's `params.sessionId`
+    /// — re-reading it off the response isn't reliable because not
+    /// every agent echoes the loaded id back.
+    SessionLoad {
+        loaded_session_id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -837,6 +847,14 @@ impl SessionInner {
         let handshake = match req.method.as_str() {
             "initialize" => Some(HandshakeKind::Initialize),
             "session/new" => Some(HandshakeKind::SessionNew),
+            "session/load" => req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|s| s.as_str())
+                .map(|s| HandshakeKind::SessionLoad {
+                    loaded_session_id: s.to_string(),
+                }),
             _ => None,
         };
 
@@ -908,6 +926,47 @@ impl SessionInner {
         let stop_reason = result.and_then(|r| r.get("stopReason")).unwrap_or(&null);
         let frame = amux::turn_complete(&self.session_id, turn_id, stop_reason);
         self.broadcast(frame);
+    }
+
+    /// Rebind the room's canonical session id to `loaded` after a
+    /// successful `session/load`. Two cases:
+    ///
+    /// - **Existing `session_new_cache`**: mutate the `sessionId` field
+    ///   in place. Other fields the upstream agent included in its
+    ///   `session/new` response (e.g. agent-specific metadata) are
+    ///   preserved so a late joiner's `session/new` call still gets
+    ///   a structurally-valid response.
+    /// - **No prior `session_new_cache`** (client opened with
+    ///   `initialize` → `session/load` directly): synthesize a minimal
+    ///   `{"sessionId": loaded}` value. A late joiner gets just the id
+    ///   — enough to operate, missing any agent-specific session/new
+    ///   fields the room never observed.
+    ///
+    /// Idempotent; safe to call multiple times for the same loaded id.
+    fn rebind_canonical_session(&mut self, loaded: &str) {
+        match self.session_new_cache.as_mut() {
+            Some(Value::Object(obj)) => {
+                let previous = obj
+                    .insert("sessionId".to_string(), Value::String(loaded.to_string()))
+                    .and_then(|v| v.as_str().map(|s| s.to_string()));
+                tracing::info!(
+                    session = %self.session_id,
+                    previous = ?previous,
+                    loaded,
+                    "session/load: rebound canonical session id (existing cache)",
+                );
+            }
+            _ => {
+                self.session_new_cache = Some(serde_json::json!({
+                    "sessionId": loaded,
+                }));
+                tracing::info!(
+                    session = %self.session_id,
+                    loaded,
+                    "session/load: rebound canonical session id (synthesized cache)",
+                );
+            }
+        }
     }
 
     fn note_driving_subscriber(&mut self, peer_id: &str) {
@@ -1080,7 +1139,11 @@ impl SessionInner {
             }
         }
 
-        // First-success handshake response caching.
+        // First-success handshake response caching. `session/load`
+        // success rebinds the room's canonical session to the loaded
+        // id — late joiners that call `session/new` get the loaded
+        // session, not the previously-cached one. A failed load
+        // (error response) leaves the existing cache untouched.
         if let Some(kind) = pr.handshake
             && let Some(result) = &resp.result
         {
@@ -1096,6 +1159,9 @@ impl SessionInner {
                         tracing::info!(session = %self.session_id, "caching session/new result");
                         self.session_new_cache = Some(result.clone());
                     }
+                }
+                HandshakeKind::SessionLoad { loaded_session_id } => {
+                    self.rebind_canonical_session(&loaded_session_id);
                 }
             }
         }

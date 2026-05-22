@@ -42,6 +42,9 @@
 //!   a small canned set of sessions (the current `sess-mock` plus two
 //!   historical entries). Used to test session/list end-to-end
 //!   passthrough through amux.
+//! - `MOCK_ACP_FAIL_LOAD=1` — return an error response to
+//!   `session/load` instead of succeeding. Used to test that failed
+//!   loads don't rebind the room's canonical session.
 //!
 //! Per-line behavior is logged to stderr at info level so tests can grep
 //! the output if needed. The process exits when stdin closes.
@@ -77,6 +80,9 @@ fn main() {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let session_list = env::var("MOCK_ACP_SESSION_LIST")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let fail_load = env::var("MOCK_ACP_FAIL_LOAD")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
@@ -241,6 +247,33 @@ fn main() {
                         "_invocation": session_new_count,
                     },
                 });
+                writeln!(stdout, "{resp}").ok();
+                stdout.flush().ok();
+            }
+            "session/load" => {
+                let requested = frame
+                    .get("params")
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let resp = if fail_load {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32001,
+                            "message": "session not found",
+                            "data": { "sessionId": requested },
+                        },
+                    })
+                } else {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "sessionId": requested, "_loaded": true },
+                    })
+                };
                 writeln!(stdout, "{resp}").ok();
                 stdout.flush().ok();
             }

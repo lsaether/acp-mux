@@ -73,7 +73,7 @@ amux parses only JSON-RPC envelopes (`id`, `method`, `params`, `result`, `error`
 |---|---|---|---|
 | `initialize` | ✅ | Core | Forwarded; first response cached; `agentCapabilities` from the upstream agent passed through. |
 | `session/new` | ✅ | Core | Forwarded; first response cached for late joiners. |
-| `session/load` | ✅ (envelope passthrough) | Core | Not specifically tested against; should work since amux only routes envelopes. |
+| `session/load` | ✅ | Core | Forwarded to the agent like any other request. On success, amux rebinds the room's canonical session id (used by late joiners' `session/new` calls) to the loaded session; failed loads leave the cache untouched. |
 | `session/prompt` | ✅ | Core | Forwarded with id translation; turn serialization; concurrent prompts rejected with `-32001`. |
 | `session/cancel` | ✅ (envelope passthrough) | Core | Per-turn notification; flows through unchanged. |
 | `session/set_mode` | ✅ (envelope passthrough) | Core | Not specifically handled. |
