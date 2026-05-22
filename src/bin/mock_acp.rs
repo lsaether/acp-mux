@@ -27,6 +27,16 @@
 //!   `mock/response_echo` notification carrying the id and a monotonic
 //!   counter. Tests use this to confirm exactly one subscriber reply
 //!   reaches the agent for any given agent-initiated request id.
+//! - `MOCK_ACP_ECHO_CANCELS=1` — whenever the mock receives a
+//!   `$/cancel_request` notification, emit an observable
+//!   `mock/cancel_echo` notification carrying the `requestId` and a
+//!   monotonic counter. Tests use this to confirm the proxy translated
+//!   cancellation correctly.
+//! - `MOCK_ACP_CANCEL_PERMISSION=1` — on `session/prompt` (with
+//!   `MOCK_ACP_EMIT_PERMISSION=1`), after emitting the permission
+//!   request the mock immediately emits a `$/cancel_request` for that
+//!   permission's id (simulating an agent that gave up on the
+//!   permission). Used to test agent → subscribers cancellation.
 //!
 //! Per-line behavior is logged to stderr at info level so tests can grep
 //! the output if needed. The process exits when stdin closes.
@@ -55,12 +65,19 @@ fn main() {
     let echo_responses = env::var("MOCK_ACP_ECHO_RESPONSES")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let echo_cancels = env::var("MOCK_ACP_ECHO_CANCELS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let cancel_permission = env::var("MOCK_ACP_CANCEL_PERMISSION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     let mut initialize_count: u32 = 0;
     let mut session_new_count: u32 = 0;
     let mut prompt_count: u32 = 0;
     let mut next_permission_id: u64 = 10_000;
     let mut response_echo_count: u32 = 0;
+    let mut cancel_echo_count: u32 = 0;
 
     let mut line = String::new();
     loop {
@@ -110,8 +127,31 @@ fn main() {
             continue;
         }
 
-        // Notifications without an id are dropped silently.
-        let Some(id) = id else { continue };
+        // Notifications without an id. `$/cancel_request` from the proxy
+        // is the only one we care about — optionally echo it so tests
+        // can verify cancellation translation.
+        if id.is_none() {
+            if echo_cancels && method == "$/cancel_request" {
+                cancel_echo_count += 1;
+                let request_id = frame
+                    .get("params")
+                    .and_then(|p| p.get("requestId"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let echo = json!({
+                    "jsonrpc": "2.0",
+                    "method": "mock/cancel_echo",
+                    "params": {
+                        "requestId": request_id,
+                        "seq": cancel_echo_count,
+                    },
+                });
+                writeln!(stdout, "{echo}").ok();
+                stdout.flush().ok();
+            }
+            continue;
+        }
+        let id = id.expect("checked above");
 
         match method {
             "initialize" => {
@@ -171,6 +211,16 @@ fn main() {
                     });
                     writeln!(stdout, "{perm}").ok();
                     stdout.flush().ok();
+
+                    if cancel_permission {
+                        let cancel = json!({
+                            "jsonrpc": "2.0",
+                            "method": "$/cancel_request",
+                            "params": { "requestId": next_permission_id },
+                        });
+                        writeln!(stdout, "{cancel}").ok();
+                        stdout.flush().ok();
+                    }
                 }
 
                 // Stream two update notifications.

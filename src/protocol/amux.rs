@@ -16,6 +16,19 @@ const METHOD_TURN_STARTED: &str = "amux/turn_started";
 const METHOD_TURN_COMPLETE: &str = "amux/turn_complete";
 const METHOD_SESSION_BUSY: &str = "amux/session_busy";
 const METHOD_AGENT_REQUEST_RESOLVED: &str = "amux/agent_request_resolved";
+const METHOD_TURN_CANCELLED: &str = "amux/turn_cancelled";
+
+/// Method name for the amux extension that lets any attached peer cancel
+/// the in-flight turn (not just the driver). Internally resolves to a
+/// synthesized `$/cancel_request` toward the agent — strict
+/// `$/cancel_request` semantics still apply on the southbound side.
+pub const METHOD_CANCEL_ACTIVE_TURN: &str = "amux/cancel_active_turn";
+
+/// Resolved-by sentinel used in `amux/agent_request_resolved` cleanup
+/// broadcasts when the agent itself cancels an agent-initiated request
+/// via `$/cancel_request`. Companion to the existing `"mux:turn-ended"`
+/// sentinel used by the turn-end sweep.
+pub const RESOLVED_BY_AGENT_CANCELLED: &str = "agent:cancelled";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AmuxTurnId(pub u64);
@@ -99,6 +112,24 @@ struct AgentRequestResolvedParams<'a> {
     error: Option<&'a serde_json::Value>,
 }
 
+/// Intent broadcast emitted when *any* attached peer triggers
+/// `amux/cancel_active_turn`. Distinct from `amux/turn_complete`, which
+/// fires later when the agent actually returns the (possibly partial)
+/// response. The pair lets peers distinguish "stop was clicked" from
+/// "turn finished," and the `cancelledBy` / `originalDriver` fields
+/// preserve the cross-peer attribution that JSON-RPC `$/cancel_request`
+/// can't carry on its own.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnCancelledParams<'a> {
+    session_id: &'a str,
+    amux_turn_id: &'a str,
+    cancelled_by: &'a str,
+    original_driver: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+}
+
 fn encode<P: Serialize>(method: &'static str, params: P) -> Vec<u8> {
     serde_json::to_vec(&Frame {
         jsonrpc: "2.0",
@@ -180,6 +211,26 @@ pub fn session_busy(session_id: &str, busy: bool, held_by: Option<&str>) -> Vec<
             session_id,
             busy,
             held_by,
+        },
+    )
+}
+
+pub fn turn_cancelled(
+    session_id: &str,
+    amux_turn_id: AmuxTurnId,
+    cancelled_by: &str,
+    original_driver: &str,
+    reason: Option<&str>,
+) -> Vec<u8> {
+    let id = amux_turn_id.formatted();
+    encode(
+        METHOD_TURN_CANCELLED,
+        TurnCancelledParams {
+            session_id,
+            amux_turn_id: &id,
+            cancelled_by,
+            original_driver,
+            reason,
         },
     )
 }
