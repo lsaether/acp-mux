@@ -79,7 +79,7 @@ amux parses only JSON-RPC envelopes (`id`, `method`, `params`, `result`, `error`
 | `session/set_mode` | ✅ (envelope passthrough) | Core | Not specifically handled. |
 | `$/cancel_request` | ✅ | Draft RFD (optional per spec) | Strict per-peer semantics; cancels own in-flight requests only. |
 | `session/attach`, `session/detach` | ⏳ | Open RFD ([#533](https://github.com/agentclientprotocol/agent-client-protocol/pull/533)) | Implemented on branch [`rfd-533-alignment`](https://github.com/lsaether/acp-mux/pull/3), shelved pending RFD ratification. |
-| `session/list` | ❌ | Draft RFD | Tracked in [#5](https://github.com/lsaether/acp-mux/issues/5). `/debug/sessions` HTTP endpoint covers the same data out-of-band. |
+| `session/list` | ✅ (envelope passthrough) | Draft RFD | Forwarded to the agent like any other request; agent's response (with the `sessions[]` array) flows back unmodified. Capability advertisement (`sessionCapabilities.list`) propagates from the agent. Decorating the response with amux-known fields (`_meta.amuxSubscriberCount`, etc.) is tracked in [#6](https://github.com/lsaether/acp-mux/issues/6). |
 
 ### Agent-initiated (agent → subscriber)
 

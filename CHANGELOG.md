@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — session/list
+
+### Added
+
+- **`session/list` support via envelope passthrough.** When the upstream agent advertises `agentCapabilities.sessionCapabilities.list` ([Draft RFD](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/session-list.mdx)), amux propagates the capability to clients verbatim and forwards `session/list` requests through the standard id-translation path. The agent's response — the `sessions[]` array, optional `nextCursor`, `cwd` filter handling — flows back unmodified.
+- **`mock_acp` knob**: `MOCK_ACP_SESSION_LIST=1` advertises the capability and serves a canned three-entry session list with `cwd` filtering. Used to test end-to-end passthrough.
+
+### Notes
+
+- amux doesn't intercept or rewrite `session/list`. The agent is the source of truth; amux is plumbing. Decorating the response with amux-known per-session info (subscriber counts, proxy session ids) is tracked in [#6](https://github.com/lsaether/acp-mux/issues/6).
+- Cold-start discovery — listing the agent's persisted sessions *before* WS-attaching to one — is not supported (amux's WS contract requires a session id on every connection). Tracked as [#10](https://github.com/lsaether/acp-mux/issues/10).
+
 ## Unreleased — cancellation
 
 ### Added
