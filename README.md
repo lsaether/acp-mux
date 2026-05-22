@@ -65,29 +65,31 @@ Detailed protocol spec: [`docs/design/amux-namespace.md`](docs/design/amux-names
 
 amux parses only JSON-RPC envelopes (`id`, `method`, `params`, `result`, `error`) and forwards payloads byte-for-byte. Any ACP method amux doesn't specifically intercept passes through transparently. The table below lists methods that need special handling and where amux stands.
 
+"Spec status" reflects the upstream ACP lifecycle ([RFD process](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/about.mdx)): **Core** = part of the stable spec; **Draft RFD** = merged into `docs/rfds/` on main but not yet promoted to Preview/Completed (implementations may begin, not a stability commitment); **Open RFD** = still an unmerged PR.
+
 ### Client-initiated (subscriber → agent)
 
-| Method | Status | Notes |
-|---|---|---|
-| `initialize` | ✅ | Forwarded; first response cached; `agentCapabilities` advertised by the upstream agent passed through. |
-| `session/new` | ✅ | Forwarded; first response cached for late joiners. |
-| `session/load` | ✅ (envelope passthrough) | Not specifically tested against; should work since amux only routes envelopes. |
-| `session/prompt` | ✅ | Forwarded with id translation; turn serialization; concurrent prompts rejected with `-32001`. |
-| `session/cancel` | ✅ (envelope passthrough) | Per-turn notification; flows through unchanged. |
-| `session/set_mode` | ✅ (envelope passthrough) | Not specifically handled. |
-| `$/cancel_request` | ✅ | Strict per-peer semantics; cancels own in-flight requests only. |
-| `session/attach`, `session/detach` | ⏳ | Proposed in [RFD #533](https://github.com/agentclientprotocol/agent-client-protocol/pull/533); implemented on branch [`rfd-533-alignment`](https://github.com/lsaether/acp-mux/pull/3), shelved pending RFD ratification. |
-| `session/list` | ❌ | Tracked in [#5](https://github.com/lsaether/acp-mux/issues/5). `/debug/sessions` HTTP endpoint covers the same data out-of-band. |
+| Method | amux | Spec status | Notes |
+|---|---|---|---|
+| `initialize` | ✅ | Core | Forwarded; first response cached; `agentCapabilities` from the upstream agent passed through. |
+| `session/new` | ✅ | Core | Forwarded; first response cached for late joiners. |
+| `session/load` | ✅ (envelope passthrough) | Core | Not specifically tested against; should work since amux only routes envelopes. |
+| `session/prompt` | ✅ | Core | Forwarded with id translation; turn serialization; concurrent prompts rejected with `-32001`. |
+| `session/cancel` | ✅ (envelope passthrough) | Core | Per-turn notification; flows through unchanged. |
+| `session/set_mode` | ✅ (envelope passthrough) | Core | Not specifically handled. |
+| `$/cancel_request` | ✅ | Draft RFD (optional per spec) | Strict per-peer semantics; cancels own in-flight requests only. |
+| `session/attach`, `session/detach` | ⏳ | Open RFD ([#533](https://github.com/agentclientprotocol/agent-client-protocol/pull/533)) | Implemented on branch [`rfd-533-alignment`](https://github.com/lsaether/acp-mux/pull/3), shelved pending RFD ratification. |
+| `session/list` | ❌ | Draft RFD | Tracked in [#5](https://github.com/lsaether/acp-mux/issues/5). `/debug/sessions` HTTP endpoint covers the same data out-of-band. |
 
 ### Agent-initiated (agent → subscriber)
 
-| Method | Status | Notes |
-|---|---|---|
-| `session/update` | ✅ | Broadcast to every attached subscriber; appended to replay log. |
-| `session/request_permission` | ✅ | Broadcast with first-writer-wins reply; `amux/agent_request_resolved` fires when consumed; turn-end sweep cleans up abandoned requests. |
-| `$/cancel_request` | ✅ | Marks `agent_pending` Consumed; broadcasts to all peers; emits `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`. |
-| `fs/read_text_file`, `fs/write_text_file` | ❌ | Tracked in [#2](https://github.com/lsaether/acp-mux/issues/2). amux currently broadcasts these to subscribers, which is broken for any agent that delegates fs to the client (Codex, claude-code-acp, copilot-acp). Self-handling design agreed; implementation deferred. |
-| `terminal/create`, `terminal/output`, `terminal/wait_for_exit`, `terminal/kill`, `terminal/release` | ❌ | Same as `fs/*` — tracked in [#2](https://github.com/lsaether/acp-mux/issues/2). |
+| Method | amux | Spec status | Notes |
+|---|---|---|---|
+| `session/update` | ✅ | Core | Broadcast to every attached subscriber; appended to replay log. |
+| `session/request_permission` | ✅ | Core | Broadcast with first-writer-wins reply; `amux/agent_request_resolved` fires when consumed; turn-end sweep cleans up abandoned requests. |
+| `$/cancel_request` | ✅ | Draft RFD (optional per spec) | Marks `agent_pending` Consumed; broadcasts to all peers; emits `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`. |
+| `fs/read_text_file`, `fs/write_text_file` | ❌ | Core | Tracked in [#2](https://github.com/lsaether/acp-mux/issues/2). amux currently broadcasts these to subscribers, which is broken for any agent that delegates fs to the client (Codex, claude-code-acp, copilot-acp). Self-handling design agreed; implementation deferred. |
+| `terminal/create`, `terminal/output`, `terminal/wait_for_exit`, `terminal/kill`, `terminal/release` | ❌ | Core | Same as `fs/*` — tracked in [#2](https://github.com/lsaether/acp-mux/issues/2). |
 
 ### Agent compatibility
 
