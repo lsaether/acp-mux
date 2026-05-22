@@ -1,19 +1,11 @@
-#![allow(dead_code)]
-
-mod agent;
-mod cli;
-mod multiplex;
-mod protocol;
-mod server;
-mod session;
-
 use std::net::SocketAddr;
 
+use acp_mux::cli;
+use acp_mux::server;
+use acp_mux::session::registry::{AgentCmd, SessionRegistry};
 use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
-
-use crate::session::registry::{AgentCmd, SessionRegistry};
 
 #[tokio::main]
 async fn main() -> Result<()> {
