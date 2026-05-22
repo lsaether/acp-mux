@@ -8,7 +8,7 @@ edition = "2024"
 # The library exists so integration tests under `tests/` can use the
 # server/registry/protocol modules without spawning the binary.
 [lib]
-name = "acp_mux"
+name = "amux"
 path = "src/lib.rs"
 
 [[bin]]

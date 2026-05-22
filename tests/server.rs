@@ -11,11 +11,11 @@
 
 use std::sync::Arc;
 
-use acp_mux::cli::ReplayTurns;
-use acp_mux::server::{
+use amux::cli::ReplayTurns;
+use amux::server::{
     AppState, CLOSE_CODE_BAD_QUERY, CLOSE_CODE_INTERNAL, CLOSE_CODE_PEER_CONFLICT, router,
 };
-use acp_mux::session::registry::{AgentCmd, SessionRegistry};
+use amux::session::registry::{AgentCmd, SessionRegistry};
 use futures::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::time::Duration;

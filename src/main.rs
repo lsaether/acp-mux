@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
-use acp_mux::cli;
-use acp_mux::server;
-use acp_mux::session::registry::{AgentCmd, SessionRegistry};
+use amux::cli;
+use amux::server;
+use amux::session::registry::{AgentCmd, SessionRegistry};
 use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
