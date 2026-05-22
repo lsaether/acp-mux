@@ -37,6 +37,15 @@ Health and debug endpoints:
 | `--replay-turns`           | `unbounded`   | `unbounded` keeps the full broadcast log; `0` disables it; `N > 0` is accepted and warned (bounded eviction lands in v0.2). |
 | `--log-level`              | `info`        | `trace`/`debug`/`info`/`warn`/`error`. `RUST_LOG` wins when set. |
 
+## RFD #533 alignment
+
+amux implements the [Multi-Client Session Attach](https://github.com/agentclientprotocol/agent-client-protocol/pull/533) RFD. RFD-aware clients can use the standard methods and frames directly; existing amux clients keep working against the `amux/*` namespace via dual-emit.
+
+- `session/attach` and `session/detach` are intercepted by the proxy. Attach returns `{ sessionId, clientId, historyPolicy, connectedClients[], history? }` and re-issues any unresolved `session/request_permission` to the attaching client so it's actionable.
+- `historyPolicy`: `full` (default), `pending_only`, `none`, `after_message` (falls back to `full` pending the Message ID RFD).
+- `session/update` siblings of `amux/*` are emitted whenever an ACP session id is known: `prompt_received`, `turn_complete`, `permission_resolved`, `client_disconnected`. Distinguished from agent-emitted updates by `update.type` (proxy) vs `update.kind` (agent).
+- `initialize` advertises `agentCapabilities.sessionCapabilities.attach: true`, synthesized by the proxy on top of the upstream agent's reply.
+
 ## How it works
 
 - **One subprocess per session.** Each `?session=` value spawns a fresh `--agent-cmd` subprocess. Multiple subscribers on the same session share that subprocess.

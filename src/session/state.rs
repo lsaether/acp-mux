@@ -75,9 +75,15 @@ use crate::agent::process::AgentProcess;
 use crate::cli::ReplayTurns;
 use crate::multiplex::subscriber::{OutMsg, Subscriber};
 use crate::protocol::amux::{self, AmuxTurnId};
+use crate::protocol::attach;
+use crate::protocol::attach::{
+    AttachParams, AttachResult, ConnectedClient, DetachParams, DetachResult, HistoryEntry,
+    HistoryPolicy,
+};
 use crate::protocol::jsonrpc::{
     Id, Incoming, IncomingRequest, IncomingResponse, JsonRpcError, JsonRpcVersion,
 };
+use crate::protocol::session_update;
 
 const SESSION_QUEUE_CAPACITY: usize = 256;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -210,6 +216,16 @@ struct SessionInner {
     /// the session lifetime so late/duplicate responses can be recognized
     /// and dropped instead of leaking back to the agent.
     agent_pending: HashMap<Id, AgentReqState>,
+    /// Original frames for in-flight agent-initiated `session/request_permission`
+    /// requests. Used to re-issue the request to a client that calls
+    /// `session/attach` after the broadcast — without this, a late
+    /// joiner sees the permission in `history` but has no actionable
+    /// request to reply to (the original broadcast was sent to the
+    /// subscribers attached at that moment). Entries are inserted in
+    /// `route_agent_request` for permissions only, removed on the
+    /// InFlight → Consumed transition in `gate_subscriber_response`
+    /// and in `sweep_stale_agent_pending`.
+    pending_permission_frames: HashMap<Id, Bytes>,
 }
 
 impl SessionInner {
@@ -238,7 +254,20 @@ impl SessionInner {
             next_amux_turn_id: 1,
             replay_log,
             agent_pending: HashMap::new(),
+            pending_permission_frames: HashMap::new(),
         }
+    }
+
+    /// ACP session id (returned by the agent in its `session/new` response),
+    /// distinct from `self.session_id` which is the proxy session handle from
+    /// the WS query. RFD-compliant `session/update` variants use the ACP
+    /// session id so an RFD-aware client can correlate frames by sessionId
+    /// without knowing about the amux proxy at all.
+    fn acp_session_id(&self) -> Option<&str> {
+        self.session_new_cache
+            .as_ref()
+            .and_then(|v| v.get("sessionId"))
+            .and_then(|s| s.as_str())
     }
 
     /// Attach a subscriber. Order:
@@ -342,12 +371,21 @@ impl SessionInner {
     }
 
     /// Returns true if the session should end (no subscribers left).
-    /// Emits `amux/peer_left` to every remaining subscriber.
+    /// Emits `amux/peer_left` and (when an ACP session id is known) the
+    /// RFD #533 `session/update { type: "client_disconnected" }` sibling
+    /// to every remaining subscriber.
     fn detach(&mut self, peer_id: &str) -> bool {
-        if self.subscribers.remove(peer_id).is_some() {
+        let removed = self.subscribers.remove(peer_id);
+        if let Some(sub) = removed.as_ref() {
             tracing::info!(session = %self.session_id, %peer_id, "subscriber detached");
-            let frame = amux::peer_left(&self.session_id, peer_id);
-            self.broadcast(frame);
+            let amux_frame = amux::peer_left(&self.session_id, peer_id);
+            let su_frame = self.acp_session_id().map(|acp_id| {
+                session_update::client_disconnected(acp_id, peer_id, sub.peer_name.as_deref())
+            });
+            self.broadcast(amux_frame);
+            if let Some(frame) = su_frame {
+                self.broadcast(frame);
+            }
         }
         if self.driving_subscriber_peer_id.as_deref() == Some(peer_id) {
             self.driving_subscriber_peer_id = None;
@@ -404,6 +442,7 @@ impl SessionInner {
         let decision = match self.agent_pending.get_mut(&resp.id) {
             Some(state @ AgentReqState::InFlight) => {
                 *state = AgentReqState::Consumed;
+                self.pending_permission_frames.remove(&resp.id);
                 Decision::Forward
             }
             Some(AgentReqState::Consumed) => Decision::Drop,
@@ -456,6 +495,7 @@ impl SessionInner {
             if let Some(state) = self.agent_pending.get_mut(id) {
                 *state = AgentReqState::Consumed;
             }
+            self.pending_permission_frames.remove(id);
         }
         tracing::info!(
             session = %self.session_id,
@@ -510,14 +550,42 @@ impl SessionInner {
             .error
             .as_ref()
             .and_then(|e| serde_json::to_value(e).ok());
-        let frame = amux::agent_request_resolved(
+        let amux_frame = amux::agent_request_resolved(
             &self.session_id,
             &request_id_value,
             resolved_by,
             resp.result.as_ref(),
             error_value.as_ref(),
         );
-        self.broadcast(frame);
+        self.broadcast(amux_frame);
+        if let Some(acp_id) = self.acp_session_id() {
+            let acp_id = acp_id.to_string();
+            // Lift `result.outcome.optionId` into the RFD's `chosenOptionId`
+            // shortcut when the winning reply matches the ACP permission
+            // result shape. Bail to None if any layer is missing — the
+            // proxy stays envelope-only.
+            let chosen_option_id = resp
+                .result
+                .as_ref()
+                .and_then(|r| r.get("outcome"))
+                .and_then(|o| o.get("optionId"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            let resolved_by_name = self
+                .subscribers
+                .get(resolved_by)
+                .and_then(|s| s.peer_name.clone());
+            let su_frame = session_update::permission_resolved(
+                &acp_id,
+                &request_id_value,
+                resolved_by,
+                resolved_by_name.as_deref(),
+                chosen_option_id.as_deref(),
+                resp.result.as_ref(),
+                error_value.as_ref(),
+            );
+            self.broadcast(su_frame);
+        }
     }
 
     fn translate_outbound_request(
@@ -525,12 +593,30 @@ impl SessionInner {
         peer_id: &str,
         mut req: IncomingRequest,
     ) -> Option<Vec<u8>> {
+        // RFD #533 attach/detach are handled entirely in the proxy — they
+        // never reach the agent. They sit at the very top so cache and
+        // turn-busy gates don't interfere.
+        if req.method == attach::METHOD_ATTACH {
+            self.handle_attach(peer_id, req);
+            return None;
+        }
+        if req.method == attach::METHOD_DETACH {
+            self.handle_detach(peer_id, req);
+            return None;
+        }
+
         // Cache short-circuits. A cached `session/new` still updates the
         // driving subscriber — the subscriber asked the session a question,
         // even if we answered it locally.
         if req.method == "initialize"
-            && let Some(cached) = self.initialize_cache.clone()
+            && let Some(mut cached) = self.initialize_cache.clone()
         {
+            // Defensive: cache was populated by `route_agent_response`
+            // which already injects the capability, but inject again so
+            // an older cache (or one populated through some future code
+            // path) still advertises attach correctly. The helper is
+            // idempotent.
+            inject_attach_capability(&mut cached);
             self.send_cached_response(peer_id, req.id, cached);
             return None;
         }
@@ -624,28 +710,54 @@ impl SessionInner {
     }
 
     /// Build and broadcast `amux/turn_started`. The `content` field carries
-    /// `params.prompt` verbatim; if missing we send `null`.
+    /// `params.prompt` verbatim; if missing we send `null`. Also emits the
+    /// RFD #533 `session/update { type: "prompt_received" }` sibling when
+    /// an ACP session id is known.
     fn emit_turn_started(&mut self, peer_id: &str, turn_id: AmuxTurnId, params: Option<&Value>) {
         let null = Value::Null;
         let content = params.and_then(|p| p.get("prompt")).unwrap_or(&null);
         let (peer_name, role) = self
             .subscribers
             .get(peer_id)
-            .map(|s| (s.peer_name.as_deref(), s.role.as_deref()))
+            .map(|s| (s.peer_name.clone(), s.role.clone()))
             .unwrap_or((None, None));
-        let frame =
-            amux::turn_started(&self.session_id, turn_id, peer_id, peer_name, role, content);
-        self.broadcast(frame);
+        let amux_frame = amux::turn_started(
+            &self.session_id,
+            turn_id,
+            peer_id,
+            peer_name.as_deref(),
+            role.as_deref(),
+            content,
+        );
+        let acp_id = self.acp_session_id().map(|s| s.to_string());
+        let content_owned = acp_id.as_ref().map(|_| content.clone());
+        self.broadcast(amux_frame);
+        if let (Some(acp_id), Some(content_owned)) = (acp_id, content_owned) {
+            let su_frame = session_update::prompt_received(
+                &acp_id,
+                &content_owned,
+                peer_id,
+                peer_name.as_deref(),
+            );
+            self.broadcast(su_frame);
+        }
     }
 
     /// Build and broadcast `amux/turn_complete`. `stop_reason` is the
-    /// `result.stopReason` value if present, else `null` (abnormal turns
-    /// land here in chunk 9; for chunk 7 only the happy path is wired).
+    /// `result.stopReason` value if present, else `null`. Also emits
+    /// the RFD #533 `session/update { type: "turn_complete" }` sibling
+    /// when an ACP session id is known.
     fn emit_turn_complete(&mut self, turn_id: AmuxTurnId, result: Option<&Value>) {
         let null = Value::Null;
         let stop_reason = result.and_then(|r| r.get("stopReason")).unwrap_or(&null);
-        let frame = amux::turn_complete(&self.session_id, turn_id, stop_reason);
-        self.broadcast(frame);
+        let amux_frame = amux::turn_complete(&self.session_id, turn_id, stop_reason);
+        self.broadcast(amux_frame);
+        if let Some(acp_id) = self.acp_session_id() {
+            let acp_id = acp_id.to_string();
+            let stop_reason_owned = stop_reason.clone();
+            let su_frame = session_update::turn_complete(&acp_id, &stop_reason_owned);
+            self.broadcast(su_frame);
+        }
     }
 
     fn note_driving_subscriber(&mut self, peer_id: &str) {
@@ -701,6 +813,232 @@ impl SessionInner {
         }
     }
 
+    /// Send an arbitrary JSON `result` to a subscriber as a JSON-RPC
+    /// response. Used by the local-answer paths (`session/attach`,
+    /// `session/detach`).
+    fn send_local_result(&self, peer_id: &str, original_id: Id, result: Value) {
+        let resp = IncomingResponse {
+            jsonrpc: JsonRpcVersion,
+            id: original_id,
+            result: Some(result),
+            error: None,
+        };
+        let bytes = match serde_json::to_vec(&resp) {
+            Ok(b) => Bytes::from(b),
+            Err(err) => {
+                tracing::error!(error = %err, "failed to serialize local response");
+                return;
+            }
+        };
+        if let Some(sub) = self.subscribers.get(peer_id)
+            && sub.outbound.send(OutMsg::Frame(bytes)).is_err()
+        {
+            tracing::debug!(%peer_id, "subscriber dropped before local response delivered");
+        }
+    }
+
+    /// RFD #533 `session/attach` handler. The transport-level attach
+    /// already happened during the WS upgrade (peer_id / peer_name from
+    /// the query). This logical handshake returns the connected-peer
+    /// roster, optionally a history snapshot shaped by `historyPolicy`,
+    /// and re-issues any unresolved `session/request_permission` so the
+    /// new client can answer them.
+    fn handle_attach(&mut self, peer_id: &str, req: IncomingRequest) {
+        let params: AttachParams = req
+            .params
+            .as_ref()
+            .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
+            .unwrap_or_default();
+
+        let policy = params.history_policy.unwrap_or_default();
+        let effective_policy = match policy {
+            // amux doesn't implement message-id based delta sync yet
+            // (depends on the Message ID RFD); fall back to Full per the
+            // RFD #533 spec.
+            HistoryPolicy::AfterMessage => HistoryPolicy::Full,
+            other => other,
+        };
+
+        // sessionId: prefer cached ACP id; fall back to proxy id for
+        // clients that attach before session/new has succeeded. If the
+        // client passed an explicit sessionId and it mismatches the
+        // cached one, return -32001 (RFD: "Session not found").
+        let resolved_session_id = self
+            .acp_session_id()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.session_id.clone());
+        if let Some(requested) = params.session_id.as_deref()
+            && !requested.is_empty()
+            && requested != resolved_session_id
+            && requested != self.session_id
+        {
+            tracing::warn!(
+                session = %self.session_id,
+                %peer_id,
+                requested,
+                "session/attach with mismatched sessionId; returning -32001",
+            );
+            self.send_error_response(
+                peer_id,
+                req.id,
+                attach::ATTACH_ERR_NOT_FOUND,
+                "session not found",
+            );
+            return;
+        }
+
+        let echoed_client_id = params.client_id.unwrap_or_else(|| peer_id.to_string());
+
+        let connected_clients: Vec<ConnectedClient> = self
+            .subscribers
+            .values()
+            .map(|s| ConnectedClient {
+                client_id: s.peer_id.clone(),
+                name: s.peer_name.clone(),
+            })
+            .collect();
+
+        let history = match effective_policy {
+            HistoryPolicy::None => None,
+            HistoryPolicy::Full => Some(self.history_full()),
+            HistoryPolicy::PendingOnly => Some(self.history_pending_only()),
+            HistoryPolicy::AfterMessage => unreachable!("normalized above"),
+        };
+
+        let result = AttachResult {
+            session_id: resolved_session_id,
+            client_id: echoed_client_id,
+            history_policy: effective_policy,
+            connected_clients,
+            history,
+        };
+        let result_value = match serde_json::to_value(result) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to serialize attach result");
+                self.send_error_response(
+                    peer_id,
+                    req.id,
+                    attach::ATTACH_ERR_UNSUPPORTED,
+                    "attach result serialization failed",
+                );
+                return;
+            }
+        };
+        self.send_local_result(peer_id, req.id, result_value);
+
+        self.reissue_pending_permissions(peer_id);
+    }
+
+    /// Project the replay log into RFD-style `history` entries. Each
+    /// entry carries the broadcast frame's `method` and `params` verbatim
+    /// — clients interpret `session/update` and the `amux/*` namespace
+    /// using the standard ACP / amux shapes.
+    fn history_full(&self) -> Vec<HistoryEntry> {
+        let log = match self.replay_log.as_ref() {
+            Some(l) => l,
+            None => return Vec::new(),
+        };
+        log.iter()
+            .filter_map(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .filter_map(|v| {
+                let method = v.get("method")?.as_str()?.to_string();
+                let params = v.get("params").cloned().unwrap_or(Value::Null);
+                Some(HistoryEntry { method, params })
+            })
+            .collect()
+    }
+
+    /// `pending_only`: just the unresolved `session/request_permission`
+    /// frames we're still waiting on a reply for. Used by notification /
+    /// dashboard clients that only care about actionable items.
+    fn history_pending_only(&self) -> Vec<HistoryEntry> {
+        self.pending_permission_frames
+            .values()
+            .filter_map(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .filter_map(|v| {
+                let method = v.get("method")?.as_str()?.to_string();
+                let params = v.get("params").cloned().unwrap_or(Value::Null);
+                Some(HistoryEntry { method, params })
+            })
+            .collect()
+    }
+
+    /// Re-deliver every InFlight `session/request_permission` frame to
+    /// the just-attached subscriber. Same id as the original broadcast,
+    /// so the proxy's first-writer-wins gate handles the reply normally
+    /// (whichever client answers first is the winner; later replies for
+    /// the same id are dropped). Without this, a late joiner sees the
+    /// permission in `history` but has no actionable request to reply
+    /// to.
+    fn reissue_pending_permissions(&self, peer_id: &str) {
+        if self.pending_permission_frames.is_empty() {
+            return;
+        }
+        let Some(sub) = self.subscribers.get(peer_id) else {
+            return;
+        };
+        for frame in self.pending_permission_frames.values() {
+            if sub.outbound.send(OutMsg::Frame(frame.clone())).is_err() {
+                tracing::debug!(%peer_id, "newcomer dropped during pending-permission re-issue");
+                return;
+            }
+        }
+        tracing::info!(
+            session = %self.session_id,
+            %peer_id,
+            count = self.pending_permission_frames.len(),
+            "re-issued unresolved session/request_permission to attaching client",
+        );
+    }
+
+    /// RFD #533 `session/detach` handler. Acks the request, then triggers
+    /// a graceful WebSocket close. The amux session continues as long as
+    /// any subscriber remains attached; once the last one is gone the
+    /// usual TTL grace applies (and the agent subprocess is reused if a
+    /// new subscriber joins within the grace window).
+    fn handle_detach(&mut self, peer_id: &str, req: IncomingRequest) {
+        let _params: DetachParams = req
+            .params
+            .as_ref()
+            .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
+            .unwrap_or_default();
+
+        let resolved_session_id = self
+            .acp_session_id()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.session_id.clone());
+        let result = DetachResult {
+            session_id: resolved_session_id,
+            status: "detached",
+        };
+        let result_value = match serde_json::to_value(result) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to serialize detach result");
+                return;
+            }
+        };
+        self.send_local_result(peer_id, req.id, result_value);
+
+        // Signal the WS-out task to close the socket cleanly after the
+        // response above is flushed. Removing the subscriber from the map
+        // also drops the outbound sender, which independently ends the
+        // ws_out task; the explicit Close is for a structured close
+        // frame (1000 = normal closure).
+        if let Some(sub) = self.subscribers.get(peer_id) {
+            let _ = sub.outbound.send(OutMsg::Close {
+                code: 1000,
+                reason: "client requested detach".to_string(),
+            });
+        }
+        // Run the detach broadcast (peer_left + client_disconnected) and
+        // bookkeeping. The outer ws handler will also send Detach when
+        // the WS finally tears down; that second call is a no-op because
+        // the subscriber is already removed.
+        let _ = self.detach(peer_id);
+    }
+
     /// Process one stdout line from the agent. Returns true if every
     /// subscriber has dropped during fan-out and the session should end.
     fn handle_agent_line(&mut self, line: Vec<u8>) -> bool {
@@ -722,7 +1060,7 @@ impl SessionInner {
                 false
             }
             Incoming::Request(req) => {
-                self.route_agent_request(req.id, line);
+                self.route_agent_request(req.id, req.method, line);
                 false
             }
         }
@@ -733,7 +1071,7 @@ impl SessionInner {
     /// reply wins. Not broadcast-tier — not appended to the replay log
     /// (replies are per-subscriber, and rejoining peers shouldn't be
     /// asked to confirm something already resolved).
-    fn route_agent_request(&mut self, id: Id, line: Vec<u8>) {
+    fn route_agent_request(&mut self, id: Id, method: String, line: Vec<u8>) {
         if self.subscribers.is_empty() {
             tracing::warn!(
                 session = %self.session_id,
@@ -747,10 +1085,20 @@ impl SessionInner {
         tracing::debug!(
             session = %self.session_id,
             id = ?id,
+            %method,
             subscribers = self.subscribers.len(),
             "broadcasting agent-initiated request",
         );
         let frame = Bytes::from(line);
+        // Remember the original frame for `session/request_permission` so a
+        // client that calls `session/attach` after the broadcast can have
+        // it re-issued (see `reissue_pending_permissions`). Other
+        // agent-initiated methods aren't re-issued — only permissions are
+        // "actionable" per RFD #533.
+        if method == "session/request_permission" {
+            self.pending_permission_frames
+                .insert(id.clone(), frame.clone());
+        }
         self.subscribers.retain(|peer_id, sub| {
             match sub.outbound.send(OutMsg::Frame(frame.clone())) {
                 Ok(()) => true,
@@ -800,19 +1148,31 @@ impl SessionInner {
             }
         }
 
-        // First-success handshake response caching.
+        // First-success handshake response caching. For `initialize`, the
+        // proxy mutates the result to advertise its own multi-client
+        // capability (RFD #533 `sessionCapabilities.attach`) before
+        // caching and before sending to the originator — the upstream
+        // agent doesn't know it's being multiplexed, so the proxy
+        // synthesizes the capability on top of the agent's reply.
         if let Some(kind) = pr.handshake
-            && let Some(result) = &resp.result
+            && resp.result.is_some()
         {
             match kind {
                 HandshakeKind::Initialize => {
-                    if self.initialize_cache.is_none() {
+                    if let Some(result) = resp.result.as_mut() {
+                        inject_attach_capability(result);
+                    }
+                    if self.initialize_cache.is_none()
+                        && let Some(result) = resp.result.as_ref()
+                    {
                         tracing::info!(session = %self.session_id, "caching initialize result");
                         self.initialize_cache = Some(result.clone());
                     }
                 }
                 HandshakeKind::SessionNew => {
-                    if self.session_new_cache.is_none() {
+                    if self.session_new_cache.is_none()
+                        && let Some(result) = resp.result.as_ref()
+                    {
                         tracing::info!(session = %self.session_id, "caching session/new result");
                         self.session_new_cache = Some(result.clone());
                     }
@@ -865,6 +1225,31 @@ impl SessionInner {
         }
         false
     }
+}
+
+/// Mutate the agent's `initialize` result to advertise the proxy's RFD
+/// #533 multi-client attach capability. Idempotent. Drops silently if
+/// `result` is not a JSON object — the agent gave us something we can't
+/// extend, so we leave it alone.
+fn inject_attach_capability(result: &mut Value) {
+    let Some(root) = result.as_object_mut() else {
+        return;
+    };
+    let agent_caps = root
+        .entry("agentCapabilities")
+        .or_insert_with(|| Value::Object(Default::default()));
+    let Some(agent_caps_obj) = agent_caps.as_object_mut() else {
+        return;
+    };
+    let session_caps = agent_caps_obj
+        .entry("sessionCapabilities")
+        .or_insert_with(|| Value::Object(Default::default()));
+    let Some(session_caps_obj) = session_caps.as_object_mut() else {
+        return;
+    };
+    // The latest RFD revision removed role enumeration, so the value is
+    // a boolean flag. Keep the field shape consistent with the spec.
+    session_caps_obj.insert("attach".to_string(), Value::Bool(true));
 }
 
 pub fn spawn_session(

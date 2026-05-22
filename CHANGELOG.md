@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — RFD #533 alignment
+
+### Added
+
+- **`session/attach` and `session/detach` methods** ([RFD #533](https://github.com/agentclientprotocol/agent-client-protocol/pull/533)). Both are intercepted by the proxy and never forwarded to the agent. `session/attach` returns `{ sessionId, clientId, historyPolicy, connectedClients[], history? }` — the connected-peers roster plus an optional history snapshot. `session/detach` returns `{ sessionId, status: "detached" }` and gracefully closes the WebSocket (code 1000).
+- **`historyPolicy` parameter on attach.** Accepted values: `full` (default), `pending_only`, `none`, `after_message`. `after_message` falls back to `full` until the Message ID RFD is adopted. History entries carry the broadcast frame's `method` and `params` verbatim (amux stays envelope-only — no translation into the RFD's typed entry shape).
+- **Pending-permission re-issue on attach.** When a client calls `session/attach` while one or more `session/request_permission` requests are still InFlight, the proxy re-delivers each frame to that client only — same id, so the existing first-writer-wins gate handles the eventual reply normally. Without this, late joiners saw the permission in `history` but had no actionable request to answer.
+- **RFD-shape `session/update` siblings** emitted alongside the existing `amux/*` metadata frames whenever an ACP session id (from the cached `session/new` response) is known:
+  - `prompt_received` (sibling of `amux/turn_started`) — carries `prompt` and `sentBy: { clientId, name }`.
+  - `turn_complete` (sibling of `amux/turn_complete`) — carries `stopReason`.
+  - `permission_resolved` (sibling of `amux/agent_request_resolved`) — carries `requestId`, `resolvedBy`, `chosenOptionId` (lifted from `result.outcome.optionId` when present), and the verbatim `result`/`error`.
+  - `client_disconnected` (sibling of `amux/peer_left`) — carries `client: { clientId, name }`.
+  - Distinguished from agent-emitted `session/update` frames by `update.type` (proxy) vs `update.kind` (agent).
+- **`sessionCapabilities.attach` advertised in `initialize`.** The proxy mutates the upstream agent's initialize result to inject `agentCapabilities.sessionCapabilities.attach: true` before caching and before sending to the originator, so RFD-aware clients can detect multi-client support without knowing about amux.
+
+### Preserved beyond the RFD
+
+- All existing `amux/*` frames continue to be emitted (dual-emit). amux clients keep working unchanged; RFD-aware clients route off `session/update`.
+- Per-session id translation, handshake caching, turn serialization with `-32001`, driving-subscriber attribution, replay log, TTL reconnect grace, and the WS query attach (`?session=&peer_id=&peer_name=&role=`) are unchanged.
+
 ## v0.1.1 — 2026-05-21
 
 ### Changed

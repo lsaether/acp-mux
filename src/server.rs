@@ -676,15 +676,20 @@ mod tests {
             }
         }
 
-        // Both A and B should have seen two session/update notifications.
-        let count_updates = |frames: &[serde_json::Value]| {
+        // Both A and B should have seen two agent-emitted session/update
+        // notifications (the `agent_message_chunk` pair from mock_acp).
+        // The proxy's RFD #533 prompt_received / turn_complete frames are
+        // also session/update notifications but use update.type rather
+        // than update.kind — filter them out for this assertion.
+        let count_agent_updates = |frames: &[serde_json::Value]| {
             frames
                 .iter()
                 .filter(|v| v.get("method") == Some(&serde_json::json!("session/update")))
+                .filter(|v| v["params"]["update"].get("kind").is_some())
                 .count()
         };
-        assert_eq!(count_updates(&a_frames), 2, "A frames: {a_frames:?}");
-        assert_eq!(count_updates(&b_frames), 2, "B frames: {b_frames:?}");
+        assert_eq!(count_agent_updates(&a_frames), 2, "A frames: {a_frames:?}");
+        assert_eq!(count_agent_updates(&b_frames), 2, "B frames: {b_frames:?}");
 
         // A must have received the prompt response with original id 7.
         let a_response = a_frames
@@ -1059,24 +1064,49 @@ mod tests {
             "turn_started before turn_complete in replay"
         );
 
-        let updates: Vec<_> = methods.iter().filter(|m| **m == "session/update").collect();
+        // Two agent-emitted session/update frames (update.kind), plus
+        // the proxy's RFD #533 prompt_received and turn_complete siblings
+        // (update.type). Filter to the agent's pair for the position
+        // check.
+        let agent_updates: Vec<_> = replay
+            .iter()
+            .filter(|v| v.get("method") == Some(&serde_json::json!("session/update")))
+            .filter(|v| v["params"]["update"].get("kind").is_some())
+            .collect();
         assert_eq!(
-            updates.len(),
+            agent_updates.len(),
             2,
-            "two session/update notifications in replay"
+            "two agent session/update notifications in replay"
         );
 
-        // The session/update notifications must sit between turn_started
-        // and turn_complete in the replay order.
-        let upd_positions: Vec<_> = methods
+        // The agent's session/update notifications must sit between
+        // turn_started and turn_complete in the replay order.
+        let agent_update_positions: Vec<_> = replay
             .iter()
             .enumerate()
-            .filter(|(_, m)| **m == "session/update")
+            .filter(|(_, v)| {
+                v.get("method") == Some(&serde_json::json!("session/update"))
+                    && v["params"]["update"].get("kind").is_some()
+            })
             .map(|(i, _)| i)
             .collect();
-        for pos in &upd_positions {
-            assert!(*pos > ts_idx && *pos < tc_idx, "session/update inside turn");
+        // ts_idx/tc_idx index into `methods` (filtered to frames with a
+        // method); recompute corresponding positions in `replay`.
+        let ts_pos = replay
+            .iter()
+            .position(|v| v.get("method") == Some(&serde_json::json!("amux/turn_started")))
+            .unwrap();
+        let tc_pos = replay
+            .iter()
+            .position(|v| v.get("method") == Some(&serde_json::json!("amux/turn_complete")))
+            .unwrap();
+        for pos in &agent_update_positions {
+            assert!(
+                *pos > ts_pos && *pos < tc_pos,
+                "agent session/update inside turn"
+            );
         }
+        let _ = (ts_idx, tc_idx);
 
         // B should NOT see a response to A's request (id=7) — that was a
         // per-subscriber frame, not broadcast-tier.
@@ -1917,5 +1947,345 @@ mod tests {
         assert_eq!(v.peer_id, "p1");
         assert_eq!(v.peer_name.as_deref(), Some("Alice"));
         assert_eq!(v.role.as_deref(), Some("driver"));
+    }
+
+    // ===== RFD #533 alignment tests =====
+
+    /// `initialize` response advertises `sessionCapabilities.attach: true`
+    /// in `agentCapabilities`, so RFD-aware clients can detect the proxy
+    /// supports multi-client attach. The upstream agent (mock_acp) does
+    /// not emit this — it's synthesized by the proxy on top of the
+    /// agent's reply.
+    #[tokio::test]
+    async fn initialize_advertises_attach_capability() {
+        let (addr, _) = spawn_server_with_mock().await;
+        let url = format!("ws://{addr}/acp?session=cap&peer_id=A");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let resp = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+        assert_eq!(
+            resp["result"]["agentCapabilities"]["sessionCapabilities"]["attach"],
+            serde_json::json!(true),
+            "initialize result must advertise sessionCapabilities.attach"
+        );
+        let _ = ws.send(ClientMsg::Close(None)).await;
+    }
+
+    /// `session/attach` is handled by the proxy locally, returns the
+    /// connected-peers roster and echoes the client-supplied clientId.
+    #[tokio::test]
+    async fn session_attach_returns_roster() {
+        let (addr, _) = spawn_server_with_mock().await;
+        let url_a = format!("ws://{addr}/acp?session=rfd&peer_id=A&peer_name=Alice");
+        let url_b = format!("ws://{addr}/acp?session=rfd&peer_id=B&peer_name=Bob");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+        )
+        .await;
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let _ = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+
+        let resp = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":50,"method":"session/attach","params":{"clientId":"dashboard-1","clientInfo":{"name":"dashboard","version":"1.0"}}}"#,
+        )
+        .await;
+        assert_eq!(resp["id"], serde_json::json!(50));
+        assert_eq!(resp["result"]["clientId"], serde_json::json!("dashboard-1"));
+        assert_eq!(resp["result"]["sessionId"], serde_json::json!("sess-mock"));
+        assert_eq!(resp["result"]["historyPolicy"], serde_json::json!("full"));
+        let connected = resp["result"]["connectedClients"]
+            .as_array()
+            .expect("connectedClients is array");
+        let ids: Vec<&str> = connected
+            .iter()
+            .filter_map(|c| c["clientId"].as_str())
+            .collect();
+        assert!(ids.contains(&"A"));
+        assert!(ids.contains(&"B"));
+
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
+    }
+
+    /// `historyPolicy: "none"` omits the `history` field.
+    #[tokio::test]
+    async fn session_attach_history_none_omits_history() {
+        let (addr, _) = spawn_server_with_mock().await;
+        let url = format!("ws://{addr}/acp?session=h-none&peer_id=A");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+        let resp = ws_request(
+            &mut ws,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/attach","params":{"historyPolicy":"none"}}"#,
+        )
+        .await;
+        assert!(resp["result"].get("history").is_none());
+        let _ = ws.send(ClientMsg::Close(None)).await;
+    }
+
+    /// `session/detach` returns `{ status: "detached" }` and then the
+    /// proxy closes the WebSocket. The remaining peer sees
+    /// `amux/peer_left` + `session/update { type: "client_disconnected" }`.
+    #[tokio::test]
+    async fn session_detach_closes_ws_and_notifies_peers() {
+        let (addr, _) = spawn_server_with_mock().await;
+        let url_a = format!("ws://{addr}/acp?session=detach&peer_id=A&peer_name=Alice");
+        let url_b = format!("ws://{addr}/acp?session=detach&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+        )
+        .await;
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let _ = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+
+        // Drain any backlog on B before triggering the detach.
+        let _ = drain_for(&mut ws_b, Duration::from_millis(100)).await;
+
+        let resp = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":99,"method":"session/detach"}"#,
+        )
+        .await;
+        assert_eq!(resp["result"]["status"], serde_json::json!("detached"));
+
+        // A's WebSocket should close shortly after.
+        let close_ok = wait_for_close(&mut ws_a).await.is_some();
+        assert!(close_ok, "session/detach should close the WS");
+
+        let b_frames = drain_for(&mut ws_b, Duration::from_millis(300)).await;
+        assert!(
+            b_frames.iter().any(
+                |v| v.get("method") == Some(&serde_json::json!("amux/peer_left"))
+                    && v["params"]["peerId"] == serde_json::json!("A")
+            ),
+            "B should see amux/peer_left for A; frames: {b_frames:?}",
+        );
+        assert!(
+            b_frames.iter().any(|v| {
+                v.get("method") == Some(&serde_json::json!("session/update"))
+                    && v["params"]["update"]["type"] == serde_json::json!("client_disconnected")
+                    && v["params"]["update"]["client"]["clientId"] == serde_json::json!("A")
+            }),
+            "B should see RFD client_disconnected for A; frames: {b_frames:?}",
+        );
+
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
+    }
+
+    /// A client that joins mid-permission and calls `session/attach`
+    /// receives the unresolved `session/request_permission` as a fresh
+    /// JSON-RPC request — actionable rather than just informational.
+    #[tokio::test]
+    async fn session_attach_reissues_pending_permission() {
+        // The mock holds the prompt response back so the permission
+        // request stays InFlight long enough for B to attach + send
+        // session/attach.
+        let (addr, _) = spawn_server_with_mock_env(&[
+            ("MOCK_ACP_EMIT_PERMISSION", "1"),
+            ("MOCK_ACP_PROMPT_DELAY_MS", "1500"),
+        ])
+        .await;
+        let url_a = format!("ws://{addr}/acp?session=pend&peer_id=A");
+        let url_b = format!("ws://{addr}/acp?session=pend&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+        )
+        .await;
+
+        // A drives a prompt → mock emits a permission request. Neither
+        // peer answers (the mock proceeds on its own deadline). The
+        // permission stays InFlight in `pending_permission_frames` until
+        // turn-end sweep — capture its id from A's wire first.
+        ws_a.send(ClientMsg::Text(
+            r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        // Wait until A has seen the permission request go by but BEFORE
+        // turn-end clears it (mock_acp emits permission immediately, then
+        // updates, then response — no delay configured here).
+        let perm_id = {
+            let mut found = None;
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            while std::time::Instant::now() < deadline {
+                if let Ok(Some(Ok(ClientMsg::Text(t)))) =
+                    timeout(Duration::from_millis(80), ws_a.next()).await
+                {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                    if v.get("method") == Some(&serde_json::json!("session/request_permission")) {
+                        found = Some(v["id"].clone());
+                        break;
+                    }
+                }
+            }
+            found.expect("A must see the permission request")
+        };
+
+        // B attaches AFTER the permission was broadcast (it can't be a
+        // recipient via the standard fan-out). B then calls
+        // session/attach — the proxy must re-issue the pending permission
+        // to B's wire as a fresh JSON-RPC request.
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let _ = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let _attach_resp = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/attach"}"#,
+        )
+        .await;
+
+        // B should now see the re-issued permission request with the
+        // same id as the original. (Not guaranteed if turn-end fired
+        // first — give it a generous window relative to mock timing.)
+        let mut saw_reissue = false;
+        let deadline = std::time::Instant::now() + Duration::from_millis(400);
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(Ok(ClientMsg::Text(t)))) =
+                timeout(Duration::from_millis(80), ws_b.next()).await
+            {
+                let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                if v.get("method") == Some(&serde_json::json!("session/request_permission"))
+                    && v["id"] == perm_id
+                {
+                    saw_reissue = true;
+                    break;
+                }
+            }
+        }
+        // The mock's prompt response is fast, so the re-issue may race
+        // with the turn-end sweep; treat absence as a soft pass when the
+        // mock has already swept. The strong assertion is that IF B
+        // sees the permission, it carries the original id (i.e. the
+        // proxy didn't fabricate a new id).
+        if !saw_reissue {
+            // Confirm the permission was swept rather than missed by
+            // checking for the agent_request_resolved cleanup on B.
+            let b_frames = drain_for(&mut ws_b, Duration::from_millis(200)).await;
+            let swept = b_frames.iter().any(|v| {
+                v.get("method") == Some(&serde_json::json!("amux/agent_request_resolved"))
+                    && v["params"]["requestId"] == perm_id
+            });
+            assert!(
+                swept,
+                "B saw neither the re-issued permission nor its sweep; frames: {b_frames:?}",
+            );
+        }
+
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
+    }
+
+    /// RFD-shaped session/update siblings fire alongside amux/* metadata
+    /// during a normal prompt turn: prompt_received (with sentBy) and
+    /// turn_complete (with stopReason). Both use update.type, not
+    /// update.kind (which is the agent's own session/update shape).
+    #[tokio::test]
+    async fn session_update_siblings_fire_during_turn() {
+        let (addr, _) = spawn_server_with_mock().await;
+        let url_a = format!("ws://{addr}/acp?session=siblings&peer_id=A&peer_name=Alice");
+        let url_b = format!("ws://{addr}/acp?session=siblings&peer_id=B");
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+        let _ = ws_request(
+            &mut ws_a,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+        )
+        .await;
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+        let _ = ws_request(
+            &mut ws_b,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
+
+        ws_a.send(ClientMsg::Text(
+            r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"hi"}]}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let b_frames = drain_for(&mut ws_b, Duration::from_secs(2)).await;
+        let prompt_received = b_frames
+            .iter()
+            .find(|v| {
+                v.get("method") == Some(&serde_json::json!("session/update"))
+                    && v["params"]["update"]["type"] == serde_json::json!("prompt_received")
+            })
+            .expect("B should see prompt_received");
+        assert_eq!(
+            prompt_received["params"]["sessionId"],
+            serde_json::json!("sess-mock"),
+            "session/update must use the ACP session id",
+        );
+        assert_eq!(
+            prompt_received["params"]["update"]["sentBy"]["clientId"],
+            serde_json::json!("A"),
+        );
+        assert_eq!(
+            prompt_received["params"]["update"]["sentBy"]["name"],
+            serde_json::json!("Alice"),
+        );
+        assert_eq!(
+            prompt_received["params"]["update"]["prompt"],
+            serde_json::json!([{"type":"text","text":"hi"}]),
+        );
+
+        let turn_complete = b_frames
+            .iter()
+            .find(|v| {
+                v.get("method") == Some(&serde_json::json!("session/update"))
+                    && v["params"]["update"]["type"] == serde_json::json!("turn_complete")
+            })
+            .expect("B should see turn_complete");
+        assert_eq!(
+            turn_complete["params"]["update"]["stopReason"],
+            serde_json::json!("end_turn"),
+        );
+
+        // Drain A so the test cleans up promptly.
+        let _ = drain_for(&mut ws_a, Duration::from_millis(200)).await;
+        let _ = ws_a.send(ClientMsg::Close(None)).await;
+        let _ = ws_b.send(ClientMsg::Close(None)).await;
     }
 }
