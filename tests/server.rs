@@ -1552,3 +1552,359 @@ async fn http_get(url: &str) -> String {
     let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
     body.to_string()
 }
+
+// ===== Cancellation tests (issue #4 / $/cancel_request RFD) =====
+
+/// Subscriber-driven `$/cancel_request` for the subscriber's own
+/// in-flight `session/prompt` is translated by id and forwarded to the
+/// agent. `MOCK_ACP_ECHO_CANCELS=1` makes the mock emit
+/// `mock/cancel_echo` whenever it receives a cancellation, carrying
+/// the translated `requestId` — we assert that against the expected
+/// `mux_id`.
+#[tokio::test]
+async fn subscriber_cancels_own_prompt_translated_to_agent() {
+    // Long prompt delay so the cancel arrives while the turn is still
+    // in flight.
+    let (addr, _) = spawn_server_with_mock_env(&[
+        ("MOCK_ACP_ECHO_CANCELS", "1"),
+        ("MOCK_ACP_PROMPT_DELAY_MS", "1500"),
+    ])
+    .await;
+    let url = format!("ws://{addr}/acp?session=cancel&peer_id=A");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    // Send the prompt. id=42 is the subscriber's id; amux rewrites to a
+    // mux_id internally. Don't await its response — we want to cancel
+    // while it's in flight.
+    ws.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":42,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    // Give the proxy a moment to forward the prompt and register it in
+    // `pending` before we cancel.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    ws.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":42}}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    // Look for the mock's cancel echo. The agent should see the cancel
+    // with the *translated* mux_id (not the subscriber's 42).
+    let frames = drain_for(&mut ws, Duration::from_secs(3)).await;
+    let cancel_echo = frames
+        .iter()
+        .find(|v| v.get("method") == Some(&serde_json::json!("mock/cancel_echo")))
+        .unwrap_or_else(|| panic!("agent should have received the cancel; frames: {frames:?}"));
+    // mux_id allocation is sequential from 1; initialize=1, session/new=2,
+    // prompt=3. The cancel should carry requestId=3.
+    assert_eq!(
+        cancel_echo["params"]["requestId"],
+        serde_json::json!(3),
+        "cancel must carry the mux_id, not the subscriber's original id"
+    );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+/// A subscriber that sends `$/cancel_request` for a `requestId` that
+/// doesn't match any of its own pending requests gets the cancel
+/// dropped silently — no agent traffic.
+#[tokio::test]
+async fn subscriber_cancel_unknown_id_dropped() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_ECHO_CANCELS", "1")]).await;
+    let url = format!("ws://{addr}/acp?session=cu&peer_id=A");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+
+    ws.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":9999}}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let frames = drain_for(&mut ws, Duration::from_millis(400)).await;
+    let any_cancel_echo = frames
+        .iter()
+        .any(|v| v.get("method") == Some(&serde_json::json!("mock/cancel_echo")));
+    assert!(
+        !any_cancel_echo,
+        "cancel for unknown id must not reach the agent; frames: {frames:?}"
+    );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+/// Subscriber B sending `$/cancel_request` with subscriber A's
+/// original id finds no pending entry under (B, A's id) and is dropped
+/// silently. A's request continues uninterrupted. (B should use
+/// `amux/cancel_active_turn` for cross-peer cancel.)
+#[tokio::test]
+async fn subscriber_cannot_cancel_another_subscribers_request() {
+    let (addr, _) = spawn_server_with_mock_env(&[
+        ("MOCK_ACP_ECHO_CANCELS", "1"),
+        ("MOCK_ACP_PROMPT_DELAY_MS", "800"),
+    ])
+    .await;
+    let url_a = format!("ws://{addr}/acp?session=xpeer&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=xpeer&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+
+    // A drives a prompt with id=42.
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":42,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#
+            .into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // B tries to cancel using A's id. Should be dropped — B has no
+    // pending entry under that id.
+    ws_b.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":42}}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let a_frames = drain_for(&mut ws_a, Duration::from_secs(2)).await;
+    let b_frames = drain_for(&mut ws_b, Duration::from_secs(2)).await;
+
+    // No cancel echo on either side — the cancel never reached the
+    // agent.
+    let saw_cancel_echo = a_frames
+        .iter()
+        .chain(b_frames.iter())
+        .any(|v| v.get("method") == Some(&serde_json::json!("mock/cancel_echo")));
+    assert!(
+        !saw_cancel_echo,
+        "B should not have been able to cancel A's request"
+    );
+    // A's prompt should still have completed normally.
+    let saw_a_response = a_frames
+        .iter()
+        .any(|v| v.get("id") == Some(&serde_json::json!(42)) && v.get("result").is_some());
+    assert!(saw_a_response, "A's prompt should have completed normally");
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+/// Agent-emitted `$/cancel_request` for an in-flight agent-initiated
+/// request (e.g. `session/request_permission`) is forwarded to every
+/// subscriber AND mirrored by `amux/agent_request_resolved { resolvedBy:
+/// "agent:cancelled" }`. Subsequent subscriber replies for the same id
+/// are dropped via the first-writer-wins gate.
+#[tokio::test]
+async fn agent_cancels_permission_request_fans_out() {
+    let (addr, _) = spawn_server_with_mock_env(&[
+        ("MOCK_ACP_EMIT_PERMISSION", "1"),
+        ("MOCK_ACP_CANCEL_PERMISSION", "1"),
+        ("MOCK_ACP_PROMPT_DELAY_MS", "500"),
+    ])
+    .await;
+    let url_a = format!("ws://{addr}/acp?session=agcancel&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=agcancel&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let a_frames = drain_for(&mut ws_a, Duration::from_secs(2)).await;
+    let b_frames = drain_for(&mut ws_b, Duration::from_secs(2)).await;
+
+    for (label, frames) in [("A", &a_frames), ("B", &b_frames)] {
+        let perm = frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("session/request_permission")))
+            .unwrap_or_else(|| panic!("{label}: must see permission request; got {frames:?}"));
+        let perm_id = &perm["id"];
+
+        let cancel = frames
+            .iter()
+            .find(|v| {
+                v.get("method") == Some(&serde_json::json!("$/cancel_request"))
+                    && &v["params"]["requestId"] == perm_id
+            })
+            .unwrap_or_else(|| panic!("{label}: must see $/cancel_request for permission id"));
+        assert_eq!(cancel["params"]["requestId"], *perm_id);
+
+        let resolved = frames
+            .iter()
+            .find(|v| {
+                v.get("method") == Some(&serde_json::json!("amux/agent_request_resolved"))
+                    && &v["params"]["requestId"] == perm_id
+            })
+            .unwrap_or_else(|| panic!("{label}: must see amux/agent_request_resolved"));
+        assert_eq!(
+            resolved["params"]["resolvedBy"],
+            serde_json::json!("agent:cancelled")
+        );
+    }
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+/// `amux/cancel_active_turn` from a non-driver peer broadcasts
+/// `amux/turn_cancelled` to every peer AND synthesizes a
+/// `$/cancel_request` to the agent using the active turn's `mux_id`.
+#[tokio::test]
+async fn amux_cancel_active_turn_by_non_driver() {
+    let (addr, _) = spawn_server_with_mock_env(&[
+        ("MOCK_ACP_ECHO_CANCELS", "1"),
+        ("MOCK_ACP_PROMPT_DELAY_MS", "1500"),
+    ])
+    .await;
+    let url_a = format!("ws://{addr}/acp?session=cact&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=cact&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+
+    // A drives.
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":99,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#
+            .into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // B clicks stop.
+    ws_b.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","method":"amux/cancel_active_turn","params":{"reason":"user clicked stop"}}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let a_frames = drain_for(&mut ws_a, Duration::from_secs(3)).await;
+    let b_frames = drain_for(&mut ws_b, Duration::from_secs(3)).await;
+
+    for (label, frames) in [("A", &a_frames), ("B", &b_frames)] {
+        let cancelled = frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/turn_cancelled")))
+            .unwrap_or_else(|| panic!("{label}: must see amux/turn_cancelled; got {frames:?}"));
+        assert_eq!(cancelled["params"]["cancelledBy"], serde_json::json!("B"));
+        assert_eq!(
+            cancelled["params"]["originalDriver"],
+            serde_json::json!("A")
+        );
+        assert_eq!(
+            cancelled["params"]["reason"],
+            serde_json::json!("user clicked stop")
+        );
+    }
+
+    // The agent should have received a translated $/cancel_request for
+    // the prompt's mux_id (initialize=1, session/new=2, prompt=3).
+    let cancel_echo = a_frames
+        .iter()
+        .chain(b_frames.iter())
+        .find(|v| v.get("method") == Some(&serde_json::json!("mock/cancel_echo")))
+        .expect("agent should have received the synthesized cancel");
+    assert_eq!(cancel_echo["params"]["requestId"], serde_json::json!(3));
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+/// `amux/cancel_active_turn` with no active turn is dropped silently —
+/// no broadcast, no agent traffic.
+#[tokio::test]
+async fn amux_cancel_active_turn_with_no_active_turn_dropped() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_ECHO_CANCELS", "1")]).await;
+    let url = format!("ws://{addr}/acp?session=nt&peer_id=A");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+
+    ws.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","method":"amux/cancel_active_turn"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let frames = drain_for(&mut ws, Duration::from_millis(400)).await;
+    let saw_cancelled = frames
+        .iter()
+        .any(|v| v.get("method") == Some(&serde_json::json!("amux/turn_cancelled")));
+    let saw_cancel_echo = frames
+        .iter()
+        .any(|v| v.get("method") == Some(&serde_json::json!("mock/cancel_echo")));
+    assert!(
+        !saw_cancelled,
+        "should not broadcast turn_cancelled when no turn active"
+    );
+    assert!(
+        !saw_cancel_echo,
+        "should not forward cancel to agent when no turn active"
+    );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}

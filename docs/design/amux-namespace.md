@@ -110,6 +110,38 @@ response lands, or when the subprocess aborts the turn.
 (subprocess crash mid-turn, etc.) surface as a distinguished `stopReason`
 value rather than a separate event type.
 
+### `amux/turn_cancelled`
+
+Intent broadcast emitted when any attached peer triggers
+`amux/cancel_active_turn` (see "Cancellation" below). Distinct from
+`amux/turn_complete` — `turn_cancelled` fires immediately on the cancel
+request (announce intent), `turn_complete` fires later when the agent
+actually settles (turn finished, possibly with a partial response).
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "amux/turn_cancelled",
+  "params": {
+    "sessionId": "work",
+    "amuxTurnId": "at-42",
+    "cancelledBy": "phone-1",
+    "originalDriver": "desktop-1",
+    "reason": "user clicked stop"
+  }
+}
+```
+
+- `cancelledBy` is the peer that issued `amux/cancel_active_turn`.
+- `originalDriver` is the peer whose `session/prompt` started the turn.
+- `reason` mirrors the `reason` field on the inbound notification when
+  present; omitted otherwise.
+
+The pair (`cancelled_by`, `original_driver`) preserves cross-peer
+attribution that the JSON-RPC `$/cancel_request` method can't carry on
+its own — `$/cancel_request` has only a `requestId`, no information
+about who issued the cancel.
+
 ### `amux/peer_joined` / `amux/peer_left`
 
 ```json
@@ -255,6 +287,70 @@ switch:
 
 The bounded variant is wire-compatible with unbounded — clients see fewer
 historical events but the protocol shape is identical.
+
+## Cancellation
+
+amux implements the [request-cancellation
+RFD](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/request-cancellation.mdx)
+with strict per-peer semantics: a subscriber can `$/cancel_request`
+only its own in-flight requests. Cross-peer "stop the active turn" is
+handled by the amux extension `amux/cancel_active_turn`, which
+internally synthesizes a `$/cancel_request` toward the agent — so the
+agent only ever sees standard, RFD-compliant cancellation.
+
+### `$/cancel_request` — strict
+
+**Subscriber → agent.** amux finds the entry in its `pending` table
+matching `(peer_id, original_id)`, rewrites `requestId` to the
+corresponding `mux_id`, and forwards the notification to the agent.
+If no matching entry exists (the id was already resolved, or the
+subscriber is trying to cancel another subscriber's request), the
+cancel is dropped silently.
+
+**Agent → subscribers.** When the agent emits `$/cancel_request` for
+an in-flight agent-initiated request (in practice `session/request_permission`),
+amux marks the `agent_pending` entry `Consumed` so late subscriber
+replies are swallowed by the existing first-writer-wins gate. The
+cancellation is then broadcast to every subscriber, and an
+`amux/agent_request_resolved { resolvedBy: "agent:cancelled" }` is
+emitted alongside for amux-aware clients.
+
+### `amux/cancel_active_turn` — extension
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "amux/cancel_active_turn",
+  "params": { "reason": "user clicked stop" }
+}
+```
+
+Notification, no response. `reason` is optional. `sessionId` is
+implicit (the WS is session-scoped).
+
+When amux receives this from any attached peer (including the
+driver):
+
+1. If no active turn, drop silently.
+2. Look up `active_turn_mux_id` → `(driver_peer_id, mux_id)`.
+3. Broadcast `amux/turn_cancelled { cancelledBy, originalDriver, reason? }`.
+4. Synthesize and forward a `$/cancel_request { requestId: mux_id }` to the agent.
+5. The existing path takes over: agent eventually responds (cancelled
+   or partial), `route_agent_response` clears the active turn,
+   `amux/turn_complete` fires with whatever `stopReason` the agent
+   returned.
+
+`amux/turn_cancelled` is the *intent* event ("stop was clicked").
+`amux/turn_complete` is the *settlement* event ("turn finished").
+They are separate events because the agent may take some time
+between receiving cancellation and producing a final response.
+
+### Agent compliance
+
+Cancellation is optional per the RFD. amux forwards cancellations
+honestly; if the agent doesn't honor `$/cancel_request` and finishes
+normally, subscribers see the regular response. This is documented
+behavior, not a bug in amux — the proxy stays plumbing.
 
 ## Peer identity
 

@@ -95,6 +95,49 @@ const SESSION_BUSY_ERROR_CODE: i64 = -32001;
 /// subscribers are still attached. 1011 = "internal error" per RFC 6455.
 const WS_CLOSE_AGENT_DEAD: u16 = 1011;
 
+/// JSON-RPC method name for the cancellation notification (request-cancellation
+/// RFD; LSP-derived). Either direction may emit it.
+const CANCEL_REQUEST_METHOD: &str = "$/cancel_request";
+
+/// Extract a non-null `requestId` from a `$/cancel_request` params object.
+/// Per the RFD the field is `number | string`; we additionally treat
+/// `Id::Null` as invalid (cancellation of an id-less notification is
+/// meaningless).
+fn parse_cancel_request_id(params: Option<&Value>) -> Option<Id> {
+    let id_value = params.and_then(|v| v.get("requestId"))?.clone();
+    let id: Id = serde_json::from_value(id_value).ok()?;
+    match id {
+        Id::Null => None,
+        other => Some(other),
+    }
+}
+
+/// Build a `$/cancel_request` notification frame as NDJSON bytes (no
+/// trailing newline; the writer adds framing). Used both for forwarding
+/// a subscriber-originated cancel with a translated id and for
+/// synthesizing one on behalf of `amux/cancel_active_turn`.
+fn build_cancel_request(request_id: Id) -> Vec<u8> {
+    #[derive(serde::Serialize)]
+    struct CancelParams<'a> {
+        #[serde(rename = "requestId")]
+        request_id: &'a Id,
+    }
+    #[derive(serde::Serialize)]
+    struct CancelFrame<'a> {
+        jsonrpc: &'static str,
+        method: &'static str,
+        params: CancelParams<'a>,
+    }
+    serde_json::to_vec(&CancelFrame {
+        jsonrpc: "2.0",
+        method: CANCEL_REQUEST_METHOD,
+        params: CancelParams {
+            request_id: &request_id,
+        },
+    })
+    .expect("cancel_request frame is always serializable")
+}
+
 pub enum SessionMsg {
     Attach {
         subscriber: Subscriber,
@@ -377,10 +420,229 @@ impl SessionInner {
             }
         };
         match frame {
-            Incoming::Notification(_) => Some(bytes),
+            Incoming::Notification(notif) => {
+                self.handle_subscriber_notification(peer_id, notif, bytes)
+            }
             Incoming::Response(resp) => self.gate_subscriber_response(peer_id, resp, bytes),
             Incoming::Request(req) => self.translate_outbound_request(peer_id, req),
         }
+    }
+
+    /// Intercept proxy-handled subscriber-emitted notifications
+    /// (`$/cancel_request`, `amux/cancel_active_turn`) before forwarding
+    /// the bytes verbatim. Returns Ok(Some(bytes)) when the frame should
+    /// be written to the agent stdin, Ok(None) when it was handled
+    /// entirely in the proxy.
+    fn handle_subscriber_notification(
+        &mut self,
+        peer_id: &str,
+        notif: crate::protocol::jsonrpc::IncomingNotification,
+        bytes: Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        match notif.method.as_str() {
+            CANCEL_REQUEST_METHOD => self.handle_subscriber_cancel(peer_id, notif),
+            amux::METHOD_CANCEL_ACTIVE_TURN => self.handle_amux_cancel_active_turn(peer_id, notif),
+            _ => Some(bytes),
+        }
+    }
+
+    /// Strict `$/cancel_request` from a subscriber: cancel the
+    /// subscriber's *own* in-flight request. Find `(peer_id,
+    /// original_id)` in `pending`, rewrite the notification's
+    /// `requestId` to the corresponding `mux_id`, forward to the agent.
+    /// Subscribers cannot cancel other subscribers' requests — the
+    /// JSON-RPC id space is per-connection — they'd use
+    /// `amux/cancel_active_turn` for cross-peer "stop this turn"
+    /// instead.
+    fn handle_subscriber_cancel(
+        &mut self,
+        peer_id: &str,
+        notif: crate::protocol::jsonrpc::IncomingNotification,
+    ) -> Option<Vec<u8>> {
+        let original_id = match parse_cancel_request_id(notif.params.as_ref()) {
+            Some(id) => id,
+            None => {
+                tracing::debug!(
+                    session = %self.session_id,
+                    %peer_id,
+                    "subscriber $/cancel_request with invalid/null requestId; dropping",
+                );
+                return None;
+            }
+        };
+
+        let Some(mux_id) = self.find_pending_mux_id(peer_id, &original_id) else {
+            tracing::debug!(
+                session = %self.session_id,
+                %peer_id,
+                id = ?original_id,
+                "subscriber $/cancel_request for unknown id; dropping",
+            );
+            return None;
+        };
+
+        tracing::info!(
+            session = %self.session_id,
+            %peer_id,
+            ?original_id,
+            mux_id,
+            "forwarding subscriber-initiated $/cancel_request to agent",
+        );
+        Some(build_cancel_request(Id::Number(mux_id as i64)))
+    }
+
+    /// `amux/cancel_active_turn`: any attached peer can cancel the
+    /// in-flight turn. Resolves to a synthesized `$/cancel_request`
+    /// toward the agent using the active-turn `mux_id`. Broadcasts
+    /// `amux/turn_cancelled` to all peers immediately (intent), while
+    /// `amux/turn_complete` follows later when the agent settles.
+    fn handle_amux_cancel_active_turn(
+        &mut self,
+        peer_id: &str,
+        notif: crate::protocol::jsonrpc::IncomingNotification,
+    ) -> Option<Vec<u8>> {
+        let Some(active_mux_id) = self.active_turn_mux_id else {
+            tracing::debug!(
+                session = %self.session_id,
+                %peer_id,
+                "amux/cancel_active_turn with no active turn; dropping",
+            );
+            return None;
+        };
+        let Some(amux_turn_id) = self.active_amux_turn_id else {
+            tracing::warn!(
+                session = %self.session_id,
+                %peer_id,
+                "active_turn_mux_id set but active_amux_turn_id missing; dropping cancel",
+            );
+            return None;
+        };
+        let Some(pending) = self.pending.get(&active_mux_id) else {
+            tracing::warn!(
+                session = %self.session_id,
+                %peer_id,
+                active_mux_id,
+                "active turn has no pending entry; dropping cancel",
+            );
+            return None;
+        };
+        let original_driver = pending.peer_id.clone();
+        let reason = notif
+            .params
+            .as_ref()
+            .and_then(|v| v.get("reason"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        tracing::info!(
+            session = %self.session_id,
+            cancelled_by = %peer_id,
+            %original_driver,
+            active_mux_id,
+            reason = ?reason,
+            "amux/cancel_active_turn synthesizing $/cancel_request to agent",
+        );
+
+        let frame = amux::turn_cancelled(
+            &self.session_id,
+            amux_turn_id,
+            peer_id,
+            &original_driver,
+            reason.as_deref(),
+        );
+        self.broadcast(frame);
+
+        Some(build_cancel_request(Id::Number(active_mux_id as i64)))
+    }
+
+    /// Agent-emitted `$/cancel_request`: cancels an agent-initiated
+    /// request that's still InFlight in `agent_pending` (in practice
+    /// always `session/request_permission`, the only agent-initiated
+    /// request the spec defines today). Forward the cancellation to
+    /// every subscriber so their UIs dismiss, mark the entry Consumed
+    /// to swallow late replies, and emit the
+    /// `amux/agent_request_resolved` sibling for amux clients.
+    fn handle_agent_cancel(
+        &mut self,
+        notif: crate::protocol::jsonrpc::IncomingNotification,
+        line: Vec<u8>,
+    ) -> bool {
+        let request_id = match parse_cancel_request_id(notif.params.as_ref()) {
+            Some(id) => id,
+            None => {
+                tracing::debug!(
+                    session = %self.session_id,
+                    "agent $/cancel_request with invalid/null requestId; dropping",
+                );
+                return false;
+            }
+        };
+        match self.agent_pending.get_mut(&request_id) {
+            Some(state @ AgentReqState::InFlight) => {
+                *state = AgentReqState::Consumed;
+                tracing::info!(
+                    session = %self.session_id,
+                    id = ?request_id,
+                    "agent cancelled in-flight agent-initiated request; broadcasting",
+                );
+            }
+            Some(AgentReqState::Consumed) => {
+                tracing::debug!(
+                    session = %self.session_id,
+                    id = ?request_id,
+                    "agent $/cancel_request for already-consumed id; broadcasting anyway so late UIs dismiss",
+                );
+            }
+            None => {
+                tracing::debug!(
+                    session = %self.session_id,
+                    id = ?request_id,
+                    "agent $/cancel_request for unknown id; broadcasting anyway",
+                );
+            }
+        }
+
+        // Forward the raw cancellation notification to every subscriber
+        // so RFD-aware clients see the standard JSON-RPC form. Capture
+        // the empty-after-fanout signal so the caller can wind down the
+        // session if this drained the last subscriber.
+        let mut session_empty = self.broadcast(line);
+
+        // Emit the amux-namespace sibling so amux-aware clients
+        // dismiss without needing to recognize $/cancel_request.
+        // (The second broadcast is harmless if the map is already
+        // empty — it appends to the replay log either way.)
+        let request_id_value = match serde_json::to_value(&request_id) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    error = %err,
+                    "failed to serialize cancelled request id; skipping amux/agent_request_resolved",
+                );
+                return session_empty;
+            }
+        };
+        let frame = amux::agent_request_resolved(
+            &self.session_id,
+            &request_id_value,
+            amux::RESOLVED_BY_AGENT_CANCELLED,
+            None,
+            None,
+        );
+        session_empty |= self.broadcast(frame);
+        session_empty
+    }
+
+    /// Linear search through `pending` for the entry matching
+    /// `(peer_id, original_id)`. N is bounded by concurrent in-flight
+    /// requests per session — small in practice. Returns the `mux_id`
+    /// key.
+    fn find_pending_mux_id(&self, peer_id: &str, original_id: &Id) -> Option<u64> {
+        self.pending
+            .iter()
+            .find(|(_, pr)| pr.peer_id == peer_id && &pr.original_id == original_id)
+            .map(|(mux_id, _)| *mux_id)
     }
 
     /// First-reply-wins gate for subscriber-originated responses. If the
@@ -716,7 +978,7 @@ impl SessionInner {
             }
         };
         match frame {
-            Incoming::Notification(_) => self.broadcast(line),
+            Incoming::Notification(notif) => self.handle_agent_notification(notif, line),
             Incoming::Response(resp) => {
                 self.route_agent_response(resp);
                 false
@@ -726,6 +988,24 @@ impl SessionInner {
                 false
             }
         }
+    }
+
+    /// Agent-emitted notifications: most are broadcast-tier (forwarded to
+    /// every subscriber and appended to the replay log). `$/cancel_request`
+    /// is special — it cancels an *agent-initiated* request that's still
+    /// InFlight in `agent_pending`. We translate by id, forward the
+    /// cancellation to every subscriber, mark the entry Consumed, and emit
+    /// `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }` so
+    /// peer UIs dismiss.
+    fn handle_agent_notification(
+        &mut self,
+        notif: crate::protocol::jsonrpc::IncomingNotification,
+        line: Vec<u8>,
+    ) -> bool {
+        if notif.method == CANCEL_REQUEST_METHOD {
+            return self.handle_agent_cancel(notif, line);
+        }
+        self.broadcast(line)
     }
 
     /// Fan out an agent-initiated request to every attached subscriber and

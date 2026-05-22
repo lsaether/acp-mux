@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased — cancellation
+
+### Added
+
+- **`$/cancel_request` support, both directions.** Implements the [request-cancellation RFD](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/request-cancellation.mdx).
+  - **Subscriber → agent**: strict per-peer semantics. A subscriber can cancel only its own in-flight requests. amux looks up `(peer_id, original_id)` in the pending table, rewrites `requestId` to the corresponding `mux_id`, and forwards to the agent. Cross-peer cancels (B cancelling A's id) are dropped silently — that's what `amux/cancel_active_turn` is for.
+  - **Agent → subscribers**: when the agent emits `$/cancel_request` for an agent-initiated request still InFlight (in practice `session/request_permission`), amux marks the `agent_pending` entry Consumed (so late subscriber replies are dropped), forwards the cancellation to every subscriber, and emits `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`.
+- **`amux/cancel_active_turn` extension.** Any attached peer can cancel the in-flight turn (not just the driver). amux looks up `active_turn_mux_id`, broadcasts `amux/turn_cancelled { sessionId, amuxTurnId, cancelledBy, originalDriver, reason? }` to every peer (intent), and synthesizes a `$/cancel_request` to the agent using the active-turn `mux_id`. Strict `$/cancel_request` semantics still apply on the southbound side — the agent never sees the amux extension.
+- **`amux/turn_cancelled` notification.** Intent broadcast emitted on `amux/cancel_active_turn`. Distinct from `amux/turn_complete` (which fires later when the agent actually settles).
+
+### Notes
+
+- Cancellation is optional per the RFD. amux forwards cancellations honestly; if the agent doesn't honor them and finishes normally, subscribers see the regular response. Documented limitation, not amux's job.
+- The synthesized `$/cancel_request` from `amux/cancel_active_turn` is indistinguishable to the agent from a cancel sent by the original driver — same wire shape, same `mux_id`.
+
 ## v0.1.1 — 2026-05-21
 
 ### Changed
