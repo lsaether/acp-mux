@@ -37,6 +37,11 @@
 //!   request the mock immediately emits a `$/cancel_request` for that
 //!   permission's id (simulating an agent that gave up on the
 //!   permission). Used to test agent → subscribers cancellation.
+//! - `MOCK_ACP_SESSION_LIST=1` — advertise `sessionCapabilities.list`
+//!   in the `initialize` response and respond to `session/list` with
+//!   a small canned set of sessions (the current `sess-mock` plus two
+//!   historical entries). Used to test session/list end-to-end
+//!   passthrough through amux.
 //!
 //! Per-line behavior is logged to stderr at info level so tests can grep
 //! the output if needed. The process exits when stdin closes.
@@ -69,6 +74,9 @@ fn main() {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let cancel_permission = env::var("MOCK_ACP_CANCEL_PERMISSION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let session_list = env::var("MOCK_ACP_SESSION_LIST")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
@@ -156,14 +164,69 @@ fn main() {
         match method {
             "initialize" => {
                 initialize_count += 1;
+                let mut result = json!({
+                    "protocolVersion": 1,
+                    "agentInfo": { "name": "mock-acp", "version": "0.0.1" },
+                    "_invocation": initialize_count,
+                });
+                if session_list {
+                    result["agentCapabilities"] = json!({
+                        "sessionCapabilities": { "list": {} },
+                    });
+                }
                 let resp = json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "result": {
-                        "protocolVersion": 1,
-                        "agentInfo": { "name": "mock-acp", "version": "0.0.1" },
-                        "_invocation": initialize_count,
-                    },
+                    "result": result,
+                });
+                writeln!(stdout, "{resp}").ok();
+                stdout.flush().ok();
+            }
+            "session/list" => {
+                let result = if session_list {
+                    let requested_cwd = frame
+                        .get("params")
+                        .and_then(|p| p.get("cwd"))
+                        .and_then(|v| v.as_str());
+                    let sessions = vec![
+                        json!({
+                            "sessionId": session_id,
+                            "cwd": "/tmp/mock",
+                            "title": "Current mock session",
+                            "updatedAt": "2026-05-22T12:00:00Z",
+                        }),
+                        json!({
+                            "sessionId": "sess-archive-001",
+                            "cwd": "/tmp/mock",
+                            "title": "Previous run",
+                            "updatedAt": "2026-05-21T18:00:00Z",
+                        }),
+                        json!({
+                            "sessionId": "sess-archive-002",
+                            "cwd": "/tmp/other",
+                            "title": "Different cwd",
+                            "updatedAt": "2026-05-20T09:00:00Z",
+                        }),
+                    ];
+                    let filtered: Vec<Value> = sessions
+                        .into_iter()
+                        .filter(|s| {
+                            requested_cwd.is_none_or(|cwd| {
+                                s.get("cwd").and_then(|c| c.as_str()) == Some(cwd)
+                            })
+                        })
+                        .collect();
+                    json!({ "sessions": filtered })
+                } else {
+                    // Capability not advertised; the agent should not have
+                    // been called. Returning an error so any accidental
+                    // call surfaces clearly in tests.
+                    json!({ "sessions": [] })
+                };
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
                 });
                 writeln!(stdout, "{resp}").ok();
                 stdout.flush().ok();

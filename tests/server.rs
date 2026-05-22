@@ -1908,3 +1908,100 @@ async fn amux_cancel_active_turn_with_no_active_turn_dropped() {
 
     let _ = ws.send(ClientMsg::Close(None)).await;
 }
+
+// ===== session/list tests (issue #5 / session-list RFD) =====
+
+/// When the agent advertises `sessionCapabilities.list` in its
+/// `initialize` response, amux passes the capability through to the
+/// client verbatim. No injection by amux — the agent owns this
+/// capability.
+#[tokio::test]
+async fn session_list_capability_propagates_from_agent() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_SESSION_LIST", "1")]).await;
+    let url = format!("ws://{addr}/acp?session=cap&peer_id=A");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let resp = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+    assert_eq!(
+        resp["result"]["agentCapabilities"]["sessionCapabilities"]["list"],
+        serde_json::json!({}),
+        "agent's sessionCapabilities.list must reach the client unchanged"
+    );
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+/// When the agent does *not* advertise the capability, amux must not
+/// fabricate it — clients that probe see nothing.
+#[tokio::test]
+async fn session_list_capability_absent_when_agent_doesnt_advertise() {
+    let (addr, _) = spawn_server_with_mock().await;
+    let url = format!("ws://{addr}/acp?session=nocap&peer_id=A");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let resp = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+    assert!(
+        resp["result"]["agentCapabilities"]["sessionCapabilities"]
+            .get("list")
+            .is_none(),
+        "amux must not synthesize sessionCapabilities.list when the agent doesn't advertise it",
+    );
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+/// End-to-end: client sends `session/list`, amux forwards to the
+/// agent via the normal request path (id translation), agent
+/// responds, amux returns the response with the client's original id
+/// restored. The session list flows through unmodified.
+#[tokio::test]
+async fn session_list_request_forwards_through_amux() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_SESSION_LIST", "1")]).await;
+    let url = format!("ws://{addr}/acp?session=list&peer_id=A");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+
+    // Use a string id to also confirm amux's id translation round-trip
+    // works for non-numeric ids on this path.
+    let resp = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":"list-1","method":"session/list","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], serde_json::json!("list-1"));
+    let sessions = resp["result"]["sessions"]
+        .as_array()
+        .expect("sessions array");
+    assert_eq!(sessions.len(), 3, "all three canned sessions should arrive");
+    let ids: Vec<&str> = sessions
+        .iter()
+        .filter_map(|s| s["sessionId"].as_str())
+        .collect();
+    assert!(ids.contains(&"sess-mock"));
+    assert!(ids.contains(&"sess-archive-001"));
+    assert!(ids.contains(&"sess-archive-002"));
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+/// `session/list` with a `cwd` filter is forwarded with the filter
+/// intact — amux doesn't interpret the params, the agent does. The
+/// mock filters by exact match on `cwd`.
+#[tokio::test]
+async fn session_list_with_cwd_filter_forwarded_unmodified() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_SESSION_LIST", "1")]).await;
+    let url = format!("ws://{addr}/acp?session=lfilter&peer_id=A");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+
+    let resp = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/list","params":{"cwd":"/tmp/other"}}"#,
+    )
+    .await;
+    let sessions = resp["result"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "filter should narrow to one session");
+    assert_eq!(
+        sessions[0]["sessionId"],
+        serde_json::json!("sess-archive-002")
+    );
+    assert_eq!(sessions[0]["cwd"], serde_json::json!("/tmp/other"));
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}
