@@ -2005,3 +2005,187 @@ async fn session_list_with_cwd_filter_forwarded_unmodified() {
 
     let _ = ws.send(ClientMsg::Close(None)).await;
 }
+
+// ===== session/load canonical rebinding (issue #12) =====
+
+/// A successful `session/load` rebinds the room's cached session id
+/// so that late joiners' `session/new` returns the loaded session
+/// rather than the originally-created one.
+#[tokio::test]
+async fn session_load_rebinds_canonical_session_for_late_joiners() {
+    let (addr, _) = spawn_server_with_mock().await;
+    let url_a = format!("ws://{addr}/acp?session=load&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=load&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let r_new = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    assert_eq!(r_new["result"]["sessionId"], serde_json::json!("sess-mock"));
+
+    // A loads a different session id. Mock_acp echoes the requested
+    // id back as the loaded session id with `_loaded: true`.
+    let r_load = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":3,"method":"session/load","params":{"sessionId":"sess-loaded-xyz","cwd":"/tmp"}}"#,
+    )
+    .await;
+    assert_eq!(
+        r_load["result"]["sessionId"],
+        serde_json::json!("sess-loaded-xyz")
+    );
+
+    // Late joiner attaches. Their session/new should see the loaded
+    // session id, not the original `sess-mock`.
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let r_b_new = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    assert_eq!(
+        r_b_new["result"]["sessionId"],
+        serde_json::json!("sess-loaded-xyz"),
+        "late joiner must see the loaded session, not the original",
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+/// `session/load` issued *without* a prior `session/new` populates
+/// the room's canonical session cache from scratch. Late joiners get
+/// a synthesized session/new response carrying just the loaded id.
+#[tokio::test]
+async fn session_load_without_prior_new_populates_cache() {
+    let (addr, _) = spawn_server_with_mock().await;
+    let url_a = format!("ws://{addr}/acp?session=loadfirst&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=loadfirst&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"sess-from-load","cwd":"/tmp"}}"#,
+    )
+    .await;
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let r_b_new = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    assert_eq!(
+        r_b_new["result"]["sessionId"],
+        serde_json::json!("sess-from-load"),
+        "late joiner must see the loaded session even though there was never a session/new",
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+/// A **failed** `session/load` (error response from agent) must not
+/// touch the existing canonical session cache. Late joiners still see
+/// the original session.
+#[tokio::test]
+async fn failed_session_load_leaves_cache_untouched() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_FAIL_LOAD", "1")]).await;
+    let url_a = format!("ws://{addr}/acp?session=loadfail&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=loadfail&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    let r_load = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":3,"method":"session/load","params":{"sessionId":"nope","cwd":"/tmp"}}"#,
+    )
+    .await;
+    assert!(
+        r_load.get("error").is_some(),
+        "load should have failed: {r_load:?}"
+    );
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let r_b_new = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    assert_eq!(
+        r_b_new["result"]["sessionId"],
+        serde_json::json!("sess-mock"),
+        "failed load must not rebind the cache",
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+/// `/debug/sessions` reflects the loaded session id after a
+/// successful `session/load`, so operators can verify the rebinding.
+#[tokio::test]
+async fn debug_sessions_shows_loaded_session_id() {
+    let (addr, _) = spawn_server_with_mock().await;
+    let url = format!("ws://{addr}/acp?session=debugload&peer_id=A");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":3,"method":"session/load","params":{"sessionId":"loaded-debug","cwd":"/tmp"}}"#,
+    )
+    .await;
+
+    let body = http_get(&format!("http://{addr}/debug/sessions")).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let s = &v["sessions"][0];
+    assert_eq!(
+        s["cachedSessionId"],
+        serde_json::json!("loaded-debug"),
+        "cached session id should reflect the loaded session"
+    );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}

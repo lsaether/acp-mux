@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased — session/load canonical rebinding
+
+### Fixed
+
+- **Multi-client + `session/load` desync.** After a peer issued a successful `session/load` to switch the room to a different session, amux's cached canonical session id was still the original one from `session/new`. Late joiners that called `session/new` got the stale id back and silently desynced from the agent's actual current session. Now amux rebinds the room's canonical session id on every successful `session/load`:
+  - When `session_new_cache` already exists, its `sessionId` field is replaced in place; other fields the agent returned are preserved.
+  - When no prior `session/new` happened (client called `initialize` → `session/load` directly), amux synthesizes a minimal `{sessionId: "..."}` cache value.
+  - Failed `session/load` (error response from the agent) leaves the existing cache untouched.
+- `/debug/sessions` `cachedSessionId` reflects the loaded session id after a successful load, so operators can verify the rebinding without inspecting the wire.
+
+### Notes
+
+- Hermes 0.14.0 advertises `agentCapabilities.loadSession = true`, so this scenario is reachable on the canonical agent today.
+- `mock_acp` knob: `MOCK_ACP_FAIL_LOAD=1` returns an error to `session/load` (for testing that failures don't rebind).
+
 ## Unreleased — session/list
 
 ### Added
