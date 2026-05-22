@@ -566,7 +566,7 @@ impl SessionInner {
         &mut self,
         notif: crate::protocol::jsonrpc::IncomingNotification,
         line: Vec<u8>,
-    ) {
+    ) -> bool {
         let request_id = match parse_cancel_request_id(notif.params.as_ref()) {
             Some(id) => id,
             None => {
@@ -574,7 +574,7 @@ impl SessionInner {
                     session = %self.session_id,
                     "agent $/cancel_request with invalid/null requestId; dropping",
                 );
-                return;
+                return false;
             }
         };
         match self.agent_pending.get_mut(&request_id) {
@@ -603,11 +603,15 @@ impl SessionInner {
         }
 
         // Forward the raw cancellation notification to every subscriber
-        // so RFD-aware clients see the standard JSON-RPC form.
-        self.broadcast(line);
+        // so RFD-aware clients see the standard JSON-RPC form. Capture
+        // the empty-after-fanout signal so the caller can wind down the
+        // session if this drained the last subscriber.
+        let mut session_empty = self.broadcast(line);
 
         // Emit the amux-namespace sibling so amux-aware clients
         // dismiss without needing to recognize $/cancel_request.
+        // (The second broadcast is harmless if the map is already
+        // empty — it appends to the replay log either way.)
         let request_id_value = match serde_json::to_value(&request_id) {
             Ok(v) => v,
             Err(err) => {
@@ -616,7 +620,7 @@ impl SessionInner {
                     error = %err,
                     "failed to serialize cancelled request id; skipping amux/agent_request_resolved",
                 );
-                return;
+                return session_empty;
             }
         };
         let frame = amux::agent_request_resolved(
@@ -626,7 +630,8 @@ impl SessionInner {
             None,
             None,
         );
-        self.broadcast(frame);
+        session_empty |= self.broadcast(frame);
+        session_empty
     }
 
     /// Linear search through `pending` for the entry matching
@@ -998,8 +1003,7 @@ impl SessionInner {
         line: Vec<u8>,
     ) -> bool {
         if notif.method == CANCEL_REQUEST_METHOD {
-            self.handle_agent_cancel(notif, line);
-            return false;
+            return self.handle_agent_cancel(notif, line);
         }
         self.broadcast(line)
     }
