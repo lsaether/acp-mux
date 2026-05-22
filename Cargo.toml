@@ -5,6 +5,12 @@ edition = "2024"
 
 # The crate (and GitHub repo) is "acp-mux" but the installed binary is
 # the shorter "amux". `src/bin/mock_acp.rs` is still auto-detected.
+# The library exists so integration tests under `tests/` can use the
+# server/registry/protocol modules without spawning the binary.
+[lib]
+name = "acp_mux"
+path = "src/lib.rs"
+
 [[bin]]
 name = "amux"
 path = "src/main.rs"

@@ -211,7 +211,11 @@ impl SessionRegistry {
         out
     }
 
-    #[cfg(test)]
+    /// Count of sessions whose actors are still alive. Used by the
+    /// integration tests and exposed publicly because they live in
+    /// `tests/` (the lib is built without `cfg(test)` when consumed
+    /// from an integration test). Safe to expose — it's already
+    /// visible via `/debug/sessions` over HTTP.
     pub async fn live_session_count(&self) -> usize {
         let sessions = self.sessions.lock().await;
         sessions.values().filter(|h| h.is_alive()).count()
