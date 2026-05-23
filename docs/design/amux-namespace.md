@@ -17,9 +17,11 @@ Concretely, the multiplexer MUST NOT fabricate frames in the ACP namespace.
 Any out-of-band signal it needs to publish — peer presence, turn boundaries,
 busy state, late-join history — goes under `amux/*` with explicit payload.
 
-ACP frames flow byte-for-byte from agent to clients; multiplex facts flow
-through their own namespace. Clients receive two distinguishable channels and
-demultiplex them.
+ACP frames flow byte-for-byte from agent to live clients; multiplex facts flow
+through their own namespace. Late-join replay is the one mux-owned provenance
+exception: replayed frames may gain `params._meta.amux` fields that describe
+when the mux originally recorded the frame. Clients receive distinguishable
+signals and demultiplex them.
 
 Implementation rule: **the multiplexer parses JSON-RPC envelopes only.**
 Everything past `{id, method, params, result, error}` is `serde_json::Value`.
@@ -262,7 +264,29 @@ are NOT logged; they're directed by definition.
 When a new subscriber attaches:
 
 1. The multiplexer replays the entire log to the newcomer in original
-   order, verbatim. Frame contents are unchanged from when first sent.
+   order. Live frame payloads are stored unchanged, then replay delivery
+   augments JSON-RPC frames with mux-owned provenance under
+   `params._meta.amux`:
+
+   ```json
+   {
+     "jsonrpc": "2.0",
+     "method": "session/update",
+     "params": {
+       "sessionId": "work",
+       "update": {"kind": "..."},
+       "_meta": {
+         "amux": {
+           "recordedAt": "2026-05-23T20:15:42.123456789Z",
+           "replaySeq": 17
+         }
+       }
+     }
+   }
+   ```
+
+   Existing `params._meta` keys are preserved; `amux` is the mux-owned
+   subnamespace. Non-JSON/raw frames replay unchanged.
 2. Live events that arrive during replay are queued for the newcomer and
    flushed after replay completes, preserving global ordering.
 3. Only then does the newcomer enter the live broadcast set.

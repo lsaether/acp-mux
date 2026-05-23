@@ -64,10 +64,10 @@
 //! server).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -98,6 +98,110 @@ const WS_CLOSE_AGENT_DEAD: u16 = 1011;
 /// JSON-RPC method name for the cancellation notification (request-cancellation
 /// RFD; LSP-derived). Either direction may emit it.
 const CANCEL_REQUEST_METHOD: &str = "$/cancel_request";
+
+#[derive(Debug, Clone)]
+struct ReplayEntry {
+    frame: Bytes,
+    recorded_at: String,
+    seq: u64,
+}
+
+impl ReplayEntry {
+    fn new(seq: u64, frame: Bytes) -> Self {
+        Self {
+            frame,
+            recorded_at: utc_rfc3339_now(),
+            seq,
+        }
+    }
+
+    fn frame_for_replay(&self) -> Bytes {
+        inject_replay_metadata(&self.frame, &self.recorded_at, self.seq)
+    }
+}
+
+fn inject_replay_metadata(frame: &Bytes, recorded_at: &str, replay_seq: u64) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<Value>(frame) else {
+        return frame.clone();
+    };
+    let Value::Object(root) = &mut value else {
+        return frame.clone();
+    };
+
+    let Some(params) = object_field(root, "params") else {
+        return frame.clone();
+    };
+    let Some(meta) = object_field(params, "_meta") else {
+        return frame.clone();
+    };
+    let Some(amux) = object_field(meta, "amux") else {
+        return frame.clone();
+    };
+    amux.insert(
+        "recordedAt".to_string(),
+        Value::String(recorded_at.to_string()),
+    );
+    amux.insert(
+        "replaySeq".to_string(),
+        Value::Number(serde_json::Number::from(replay_seq)),
+    );
+
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "failed to serialize replay metadata frame; replaying original");
+            frame.clone()
+        })
+}
+
+fn object_field<'a>(
+    object: &'a mut Map<String, Value>,
+    key: &str,
+) -> Option<&'a mut Map<String, Value>> {
+    let value = object
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    match value {
+        Value::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
+fn utc_rfc3339_now() -> String {
+    system_time_to_rfc3339_utc(SystemTime::now())
+}
+
+fn system_time_to_rfc3339_utc(time: SystemTime) -> String {
+    let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let total_secs = duration.as_secs() as i64;
+    let days = total_secs.div_euclid(86_400);
+    let secs_of_day = total_secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = secs_of_day / 3_600;
+    let minute = (secs_of_day % 3_600) / 60;
+    let second = secs_of_day % 60;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos:09}Z",
+        nanos = duration.subsec_nanos(),
+    )
+}
+
+// Howard Hinnant's civil-from-days algorithm, with day 0 = 1970-01-01.
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month as u32, day as u32)
+}
 
 /// Extract a non-null `requestId` from a `$/cancel_request` params object.
 /// Per the RFD the field is `number | string`; we additionally treat
@@ -138,10 +242,13 @@ fn build_cancel_request(request_id: Id) -> Vec<u8> {
     .expect("cancel_request frame is always serializable")
 }
 
-fn replay_log_update_counts_by_acp_session_id(log: &VecDeque<Bytes>) -> BTreeMap<String, usize> {
+/// Extract session/update counts from replay entries for debug snapshots.
+fn replay_log_update_counts_by_acp_session_id(
+    log: &VecDeque<ReplayEntry>,
+) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
-    for frame in log {
-        let Ok(value) = serde_json::from_slice::<Value>(frame) else {
+    for entry in log {
+        let Ok(value) = serde_json::from_slice::<Value>(&entry.frame) else {
             continue;
         };
         if value.get("method").and_then(Value::as_str) != Some("session/update") {
@@ -289,8 +396,11 @@ struct SessionInner {
     next_amux_turn_id: u64,
     /// Replay log. `None` when policy is `Disabled` (saves memory).
     /// Otherwise, every broadcast-tier frame (amux/* + agent notifications)
-    /// is appended; new subscribers receive a snapshot at attach time.
-    replay_log: Option<VecDeque<Bytes>>,
+    /// is appended with mux-recorded provenance; new subscribers receive a
+    /// metadata-augmented snapshot at attach time.
+    replay_log: Option<VecDeque<ReplayEntry>>,
+    /// Monotonic per-session counter for replay provenance metadata.
+    next_replay_seq: u64,
     /// Incremented whenever a successful `session/load` establishes a new
     /// canonical upstream ACP session and the replay log is segmented.
     replay_generation: u64,
@@ -330,6 +440,7 @@ impl SessionInner {
             active_amux_turn_id: None,
             next_amux_turn_id: 1,
             replay_log,
+            next_replay_seq: 1,
             replay_generation: 0,
             last_replay_reset: None,
             agent_pending: HashMap::new(),
@@ -352,7 +463,7 @@ impl SessionInner {
         if self.subscribers.contains_key(&subscriber.peer_id) {
             return Err(AttachError::PeerIdInUse);
         }
-        let snapshot: Vec<Bytes> = self
+        let snapshot: Vec<ReplayEntry> = self
             .replay_log
             .as_ref()
             .map(|log| log.iter().cloned().collect())
@@ -376,7 +487,8 @@ impl SessionInner {
         self.subscribers.insert(peer_id.clone(), subscriber);
 
         if let Some(sub) = self.subscribers.get(&peer_id) {
-            for frame in snapshot {
+            for entry in snapshot {
+                let frame = entry.frame_for_replay();
                 if sub.outbound.send(OutMsg::Frame(frame)).is_err() {
                     tracing::debug!(%peer_id, "newcomer dropped during replay");
                     break;
@@ -1026,19 +1138,26 @@ impl SessionInner {
         let mut dropped_frame_count = 0;
         let mut retained_frame_count = 0;
 
+        let mut retained_entries = None;
         if let Some(log) = self.replay_log.as_mut() {
             dropped_frame_count = replay_start_len.min(log.len());
             if dropped_frame_count > 0 {
                 log.drain(..dropped_frame_count);
             }
+            retained_entries = Some(std::mem::take(log));
+        }
 
-            let mut segmented = VecDeque::with_capacity(presence_frames.len() + log.len());
+        if let Some(mut retained_entries) = retained_entries {
+            let mut segmented =
+                VecDeque::with_capacity(presence_frames.len() + retained_entries.len());
             for frame in presence_frames {
-                segmented.push_back(Bytes::from(frame));
+                let entry = ReplayEntry::new(self.next_replay_seq, Bytes::from(frame));
+                self.next_replay_seq += 1;
+                segmented.push_back(entry);
             }
-            segmented.append(log);
+            segmented.append(&mut retained_entries);
             retained_frame_count = segmented.len();
-            *log = segmented;
+            self.replay_log = Some(segmented);
         }
 
         self.last_replay_reset = Some(ReplayResetSnapshot {
@@ -1307,7 +1426,9 @@ impl SessionInner {
     fn broadcast(&mut self, frame: impl Into<Bytes>) -> bool {
         let frame: Bytes = frame.into();
         if let Some(log) = self.replay_log.as_mut() {
-            log.push_back(frame.clone());
+            let entry = ReplayEntry::new(self.next_replay_seq, frame.clone());
+            self.next_replay_seq += 1;
+            log.push_back(entry);
         }
         let pre_fanout = self.subscribers.len();
         self.subscribers.retain(|peer_id, sub| {
