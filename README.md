@@ -24,6 +24,7 @@ Then connect WebSocket clients to `ws://127.0.0.1:8765/acp?session=<id>&peer_id=
 Health and debug endpoints:
 
 - `GET /healthz` — `200 ok`
+- `GET /acp/sessions?cwd=<optional>` — cold-start session discovery. Spawns a transient `--agent-cmd`, initializes it, sends `session/list`, returns the agent's `result` JSON, then tears the subprocess down without creating a live mux session.
 - `GET /debug/sessions` — JSON snapshot of every live session (subscribers, cache state, active turn, replay log length)
 
 ### CLI flags
@@ -47,6 +48,7 @@ Health and debug endpoints:
 - **Broadcast agent-initiated requests.** Agent-initiated requests (e.g. `session/request_permission`) are fanned out to every attached subscriber; any peer can reply. The first reply for a given id is forwarded to the agent and later replies for the same id are dropped, so the agent always sees exactly one response.
 - **Turn serialization.** Concurrent `session/prompt` while a turn is in flight is rejected with JSON-RPC `-32001`. The last subscriber to issue a substantive request is still surfaced as the "driving subscriber" in `/debug/sessions` and `amux/turn_started` for UI attribution.
 - **Opt-in request trace metadata.** With `--meta-propagate`, outbound subscriber → agent requests get mux-owned `params._meta.amux` fields (`peerId`, `peerName`, `role`, `muxId`, and `amuxTurnId` for prompts) for cross-client debugging. Default mode leaves request payload metadata unchanged.
+- **Cold-start session discovery.** `GET /acp/sessions` runs a transient agent-side `session/list` query before any WebSocket attach, useful for dashboards that need to browse persisted sessions before choosing one to resume.
 - **Live `session/list` decoration.** Returned `sessions[]` entries that match a live muxed upstream session get `sessions[i]._meta.amux` fields (`proxySessionId`, `subscriberCount`, optional `drivingSubscriber`), preserving existing `_meta` keys and leaving non-live entries unchanged.
 - **`amux/*` notification namespace.** The mux publishes its own metadata out-of-band: `amux/peer_joined`, `amux/peer_left`, `amux/turn_started`, `amux/turn_complete`, `amux/turn_cancelled`, `amux/session_busy`, `amux/agent_request_resolved`. ACP frames stay clean; clients see two distinguishable channels and demultiplex by method prefix.
 - **Cancellation.** `$/cancel_request` (request-cancellation RFD) works both directions: subscribers can cancel their own in-flight requests; agents can cancel agent-initiated requests (broadcast to peers + `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`). The amux extension `amux/cancel_active_turn` lets *any* attached peer cancel the in-flight turn (not just the driver) — internally it synthesizes a `$/cancel_request` toward the agent and emits `amux/turn_cancelled` to peers.
@@ -82,7 +84,7 @@ amux parses only JSON-RPC envelopes (`id`, `method`, `params`, `result`, `error`
 | `session/set_mode` | ✅ (envelope passthrough) | Core | Not specifically handled. |
 | `$/cancel_request` | ✅ | Draft RFD (optional per spec) | Strict per-peer semantics; cancels own in-flight requests only. |
 | `session/attach`, `session/detach` | ⏳ | Open RFD ([#533](https://github.com/agentclientprotocol/agent-client-protocol/pull/533)) | Implemented on branch [`rfd-533-alignment`](https://github.com/lsaether/acp-mux/pull/3), shelved pending RFD ratification. |
-| `session/list` | ✅ | Draft RFD | Forwarded to the agent like any other request; capability advertisement (`sessionCapabilities.list`) propagates from the agent. The outbound request can carry `params._meta.amux` trace fields when `--meta-propagate` is enabled. Returned `sessions[]` entries that match live mux state are decorated under `sessions[i]._meta.amux`; non-live entries and existing agent-owned metadata are preserved. |
+| `session/list` | ✅ | Draft RFD | Over WS, forwarded to the agent like any other request; capability advertisement (`sessionCapabilities.list`) propagates from the agent. The outbound request can carry `params._meta.amux` trace fields when `--meta-propagate` is enabled. Returned `sessions[]` entries that match live mux state are decorated under `sessions[i]._meta.amux`; non-live entries and existing agent-owned metadata are preserved. For cold-start UIs, `GET /acp/sessions?cwd=...` performs a transient agent-side `session/list` before any WS attach. |
 
 ### Agent-initiated (agent → subscriber)
 

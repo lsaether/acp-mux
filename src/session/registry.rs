@@ -10,16 +10,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::{Mutex, oneshot};
+use tokio::time::timeout;
 
 use crate::agent::process::AgentProcess;
 use crate::cli::ReplayTurns;
 use crate::multiplex::subscriber::Subscriber;
+use crate::protocol::jsonrpc::{Id, Incoming, JsonRpcError, ParseError};
 use crate::session::state::{
     AttachError, SessionHandle, SessionListMetadataIndex, SessionMsg, SessionOptions,
     SessionSnapshot, spawn_session,
 };
+
+const CONTROL_PLANE_AGENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct AgentCmd {
@@ -37,6 +42,92 @@ pub enum RegistryError {
     AgentSpawn(#[from] anyhow::Error),
     #[error("session actor not reachable")]
     ActorUnreachable,
+}
+
+#[derive(Debug, Error)]
+pub enum ControlPlaneSessionListError {
+    #[error("agent command not configured")]
+    AgentCmdMissing,
+    #[error("agent process failed: {0}")]
+    AgentProcess(#[from] anyhow::Error),
+    #[error("json encode/decode failed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("agent protocol parse failed: {0}")]
+    Protocol(#[from] ParseError),
+    #[error("agent returned JSON-RPC error {code}: {message}")]
+    AgentJsonRpc {
+        code: i64,
+        message: String,
+        data: Option<Value>,
+    },
+    #[error("agent did not respond to {method} before timeout")]
+    AgentTimeout { method: &'static str },
+    #[error("agent exited before responding to {method}")]
+    AgentEof { method: &'static str },
+}
+
+impl From<JsonRpcError> for ControlPlaneSessionListError {
+    fn from(err: JsonRpcError) -> Self {
+        Self::AgentJsonRpc {
+            code: err.code,
+            message: err.message,
+            data: err.data,
+        }
+    }
+}
+
+async fn query_transient_session_list(
+    agent: &mut AgentProcess,
+    cwd: Option<String>,
+) -> Result<Value, ControlPlaneSessionListError> {
+    let _initialize = request_transient_agent(
+        agent,
+        1,
+        "initialize",
+        Some(json!({ "protocolVersion": 1 })),
+    )
+    .await?;
+
+    let params = cwd.map(|cwd| json!({ "cwd": cwd }));
+    request_transient_agent(agent, 2, "session/list", params).await
+}
+
+async fn request_transient_agent(
+    agent: &mut AgentProcess,
+    id: i64,
+    method: &'static str,
+    params: Option<Value>,
+) -> Result<Value, ControlPlaneSessionListError> {
+    let mut request = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+    });
+    if let Some(params) = params {
+        request["params"] = params;
+    }
+    let bytes = serde_json::to_vec(&request)?;
+    agent.send(&bytes).await?;
+
+    for _ in 0..128 {
+        let line = timeout(CONTROL_PLANE_AGENT_TIMEOUT, agent.recv_line())
+            .await
+            .map_err(|_| ControlPlaneSessionListError::AgentTimeout { method })?
+            .ok_or(ControlPlaneSessionListError::AgentEof { method })?;
+        let incoming = Incoming::parse(&line)?;
+        let Incoming::Response(response) = incoming else {
+            continue;
+        };
+        if response.id != Id::Number(id) {
+            continue;
+        }
+        if let Some(error) = response.error {
+            return Err(error.into());
+        }
+        return Ok(response.result.unwrap_or(Value::Null));
+    }
+
+    Err(ControlPlaneSessionListError::AgentTimeout { method })
 }
 
 pub struct SessionRegistry {
@@ -71,6 +162,25 @@ impl SessionRegistry {
             session_list_index: Arc::new(SessionListMetadataIndex::new()),
             sessions: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Cold-start session discovery: spawn a transient agent subprocess,
+    /// initialize it, send `session/list`, return the agent's result, and
+    /// tear the subprocess down without registering a live mux session.
+    pub async fn list_sessions_control_plane(
+        &self,
+        cwd: Option<String>,
+    ) -> Result<Value, ControlPlaneSessionListError> {
+        let cmd = self
+            .agent_cmd
+            .clone()
+            .ok_or(ControlPlaneSessionListError::AgentCmdMissing)?;
+        let mut agent = AgentProcess::spawn(&cmd.program, &cmd.args).await?;
+        let result = query_transient_session_list(&mut agent, cwd).await;
+        if let Err(err) = agent.shutdown(CONTROL_PLANE_AGENT_TIMEOUT).await {
+            tracing::warn!(error = %err, "transient session/list agent shutdown failed");
+        }
+        result
     }
 
     /// Attach a subscriber to `session_id`. Two paths:
