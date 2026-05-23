@@ -2260,6 +2260,80 @@ async fn session_list_request_forwards_through_amux() {
     let _ = ws.send(ClientMsg::Close(None)).await;
 }
 
+/// Once a room has established its upstream ACP session id via
+/// `session/new`, `session/list` decorates only the matching live entry
+/// under `_meta.amux`, preserving agent-owned `_meta` keys.
+#[tokio::test]
+async fn session_list_decorates_live_entry_with_amux_metadata() {
+    let (addr, _) = spawn_server_with_mock_env(&[
+        ("MOCK_ACP_SESSION_LIST", "1"),
+        ("MOCK_ACP_SESSION_LIST_META", "1"),
+    ])
+    .await;
+    let url_a = format!("ws://{addr}/acp?session=live-room&peer_id=A&peer_name=Alice&role=driver");
+    let url_b = format!("ws://{addr}/acp?session=live-room&peer_id=B&peer_name=Bob&role=observer");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let r_new = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    assert_eq!(r_new["result"]["sessionId"], serde_json::json!("sess-mock"));
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    let resp = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":"list-live","method":"session/list","params":{}}"#,
+    )
+    .await;
+    let sessions = resp["result"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 3, "all canned sessions should arrive");
+
+    let current = sessions
+        .iter()
+        .find(|s| s["sessionId"] == serde_json::json!("sess-mock"))
+        .expect("current session entry");
+    assert_eq!(current["_meta"]["agentKey"], serde_json::json!("preserved"));
+    assert_eq!(
+        current["_meta"]["amux"]["agentAmuxKey"],
+        serde_json::json!("preserved")
+    );
+    assert_eq!(
+        current["_meta"]["amux"]["proxySessionId"],
+        serde_json::json!("live-room")
+    );
+    assert_eq!(
+        current["_meta"]["amux"]["subscriberCount"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        current["_meta"]["amux"]["drivingSubscriber"],
+        serde_json::json!("A")
+    );
+
+    for archive_id in ["sess-archive-001", "sess-archive-002"] {
+        let archived = sessions
+            .iter()
+            .find(|s| s["sessionId"] == serde_json::json!(archive_id))
+            .expect("archive session entry");
+        assert!(
+            archived.get("_meta").and_then(|m| m.get("amux")).is_none(),
+            "non-live session {archive_id} must not receive amux metadata"
+        );
+    }
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
 /// `session/list` with a `cwd` filter is forwarded with the filter
 /// intact — amux doesn't interpret the params, the agent does. The
 /// mock filters by exact match on `cwd`.
