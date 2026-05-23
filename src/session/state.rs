@@ -63,7 +63,7 @@
 //! subscriber → agent direction (we will not feed garbage to a real ACP
 //! server).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -138,6 +138,27 @@ fn build_cancel_request(request_id: Id) -> Vec<u8> {
     .expect("cancel_request frame is always serializable")
 }
 
+fn replay_log_update_counts_by_acp_session_id(log: &VecDeque<Bytes>) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for frame in log {
+        let Ok(value) = serde_json::from_slice::<Value>(frame) else {
+            continue;
+        };
+        if value.get("method").and_then(Value::as_str) != Some("session/update") {
+            continue;
+        }
+        let Some(session_id) = value
+            .get("params")
+            .and_then(|params| params.get("sessionId"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        *counts.entry(session_id.to_string()).or_insert(0) += 1;
+    }
+    counts
+}
+
 pub enum SessionMsg {
     Attach {
         subscriber: Subscriber,
@@ -160,6 +181,15 @@ pub enum SessionMsg {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReplayResetSnapshot {
+    pub loaded_session_id: String,
+    pub replay_generation: u64,
+    pub dropped_frame_count: usize,
+    pub retained_frame_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionSnapshot {
     pub session_id: String,
     pub subscribers: Vec<SubscriberSnapshot>,
@@ -172,6 +202,9 @@ pub struct SessionSnapshot {
     pub subprocess_dead: bool,
     pub ttl_pending: bool,
     pub replay_log_len: Option<usize>,
+    pub replay_generation: u64,
+    pub replay_log_update_frames_by_acp_session_id: Option<BTreeMap<String, usize>>,
+    pub last_replay_reset: Option<ReplayResetSnapshot>,
     pub next_mux_id: u64,
     pub next_amux_turn_id: u64,
 }
@@ -214,6 +247,7 @@ enum HandshakeKind {
     /// every agent echoes the loaded id back.
     SessionLoad {
         loaded_session_id: String,
+        replay_start_len: usize,
     },
 }
 
@@ -257,6 +291,12 @@ struct SessionInner {
     /// Otherwise, every broadcast-tier frame (amux/* + agent notifications)
     /// is appended; new subscribers receive a snapshot at attach time.
     replay_log: Option<VecDeque<Bytes>>,
+    /// Incremented whenever a successful `session/load` establishes a new
+    /// canonical upstream ACP session and the replay log is segmented.
+    replay_generation: u64,
+    /// Last successful replay segmentation event, exposed through
+    /// `/debug/sessions` for operator diagnostics.
+    last_replay_reset: Option<ReplayResetSnapshot>,
     /// State for every agent-initiated request id we have ever broadcast
     /// in this session. `InFlight` until the first subscriber reply
     /// arrives; `Consumed` thereafter. We keep `Consumed` ids around for
@@ -290,6 +330,8 @@ impl SessionInner {
             active_amux_turn_id: None,
             next_amux_turn_id: 1,
             replay_log,
+            replay_generation: 0,
+            last_replay_reset: None,
             agent_pending: HashMap::new(),
         }
     }
@@ -373,6 +415,12 @@ impl SessionInner {
             subprocess_dead: false,
             ttl_pending,
             replay_log_len: self.replay_log.as_ref().map(|l| l.len()),
+            replay_generation: self.replay_generation,
+            replay_log_update_frames_by_acp_session_id: self
+                .replay_log
+                .as_ref()
+                .map(replay_log_update_counts_by_acp_session_id),
+            last_replay_reset: self.last_replay_reset.clone(),
             next_mux_id: self.next_mux_id,
             next_amux_turn_id: self.next_amux_turn_id,
         }
@@ -847,14 +895,17 @@ impl SessionInner {
         let handshake = match req.method.as_str() {
             "initialize" => Some(HandshakeKind::Initialize),
             "session/new" => Some(HandshakeKind::SessionNew),
-            "session/load" => req
-                .params
-                .as_ref()
-                .and_then(|p| p.get("sessionId"))
-                .and_then(|s| s.as_str())
-                .map(|s| HandshakeKind::SessionLoad {
-                    loaded_session_id: s.to_string(),
-                }),
+            "session/load" => {
+                let replay_start_len = self.replay_log.as_ref().map(|log| log.len()).unwrap_or(0);
+                req.params
+                    .as_ref()
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(|s| s.as_str())
+                    .map(|s| HandshakeKind::SessionLoad {
+                        loaded_session_id: s.to_string(),
+                        replay_start_len,
+                    })
+            }
             _ => None,
         };
 
@@ -967,6 +1018,59 @@ impl SessionInner {
                 );
             }
         }
+    }
+
+    fn reset_replay_generation_after_load(&mut self, loaded: &str, replay_start_len: usize) {
+        self.replay_generation += 1;
+        let presence_frames = self.current_peer_joined_replay_frames();
+        let mut dropped_frame_count = 0;
+        let mut retained_frame_count = 0;
+
+        if let Some(log) = self.replay_log.as_mut() {
+            dropped_frame_count = replay_start_len.min(log.len());
+            if dropped_frame_count > 0 {
+                log.drain(..dropped_frame_count);
+            }
+
+            let mut segmented = VecDeque::with_capacity(presence_frames.len() + log.len());
+            for frame in presence_frames {
+                segmented.push_back(Bytes::from(frame));
+            }
+            segmented.append(log);
+            retained_frame_count = segmented.len();
+            *log = segmented;
+        }
+
+        self.last_replay_reset = Some(ReplayResetSnapshot {
+            loaded_session_id: loaded.to_string(),
+            replay_generation: self.replay_generation,
+            dropped_frame_count,
+            retained_frame_count,
+        });
+        tracing::info!(
+            session = %self.session_id,
+            loaded,
+            replay_generation = self.replay_generation,
+            dropped_frame_count,
+            retained_frame_count,
+            "session/load: segmented replay generation",
+        );
+    }
+
+    fn current_peer_joined_replay_frames(&self) -> Vec<Vec<u8>> {
+        let mut peers: Vec<_> = self.subscribers.values().collect();
+        peers.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+        peers
+            .into_iter()
+            .map(|subscriber| {
+                amux::peer_joined(
+                    &self.session_id,
+                    &subscriber.peer_id,
+                    subscriber.peer_name.as_deref(),
+                    subscriber.role.as_deref(),
+                )
+            })
+            .collect()
     }
 
     fn note_driving_subscriber(&mut self, peer_id: &str) {
@@ -1160,8 +1264,12 @@ impl SessionInner {
                         self.session_new_cache = Some(result.clone());
                     }
                 }
-                HandshakeKind::SessionLoad { loaded_session_id } => {
+                HandshakeKind::SessionLoad {
+                    loaded_session_id,
+                    replay_start_len,
+                } => {
                     self.rebind_canonical_session(&loaded_session_id);
+                    self.reset_replay_generation_after_load(&loaded_session_id, replay_start_len);
                 }
             }
         }

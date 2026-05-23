@@ -45,6 +45,10 @@
 //! - `MOCK_ACP_FAIL_LOAD=1` — return an error response to
 //!   `session/load` instead of succeeding. Used to test that failed
 //!   loads don't rebind the room's canonical session.
+//! - `MOCK_ACP_EMIT_LOAD_HISTORY=1` — on successful `session/load`, emit
+//!   two `session/update` history chunks for the requested session before
+//!   returning the load response. Used to verify mux replay generation
+//!   boundaries retain load-time replay frames.
 //!
 //! Per-line behavior is logged to stderr at info level so tests can grep
 //! the output if needed. The process exits when stdin closes.
@@ -83,6 +87,9 @@ fn main() {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let fail_load = env::var("MOCK_ACP_FAIL_LOAD")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let emit_load_history = env::var("MOCK_ACP_EMIT_LOAD_HISTORY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
@@ -268,6 +275,22 @@ fn main() {
                         },
                     })
                 } else {
+                    if emit_load_history {
+                        for chunk in ["loaded ", "history"] {
+                            let upd = json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {
+                                    "sessionId": requested,
+                                    "update": {
+                                        "kind": "agent_message_chunk",
+                                        "content": { "type": "text", "text": chunk },
+                                    },
+                                },
+                            });
+                            writeln!(stdout, "{upd}").ok();
+                        }
+                    }
                     json!({
                         "jsonrpc": "2.0",
                         "id": id,
