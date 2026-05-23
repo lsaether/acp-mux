@@ -2065,6 +2065,147 @@ async fn session_load_rebinds_canonical_session_for_late_joiners() {
     let _ = ws_b.send(ClientMsg::Close(None)).await;
 }
 
+/// A successful `session/load` starts a new replay generation. Late
+/// joiners should receive coherent replay for the loaded ACP session,
+/// not stale `session/update` frames from the previous upstream session.
+#[tokio::test]
+async fn session_load_replay_generation_excludes_previous_session_updates_for_late_joiners() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_EMIT_LOAD_HISTORY", "1")]).await;
+    let url_a = format!("ws://{addr}/acp?session=load-replay&peer_id=A&peer_name=Alice");
+    let url_b = format!("ws://{addr}/acp?session=load-replay&peer_id=B&peer_name=Bob");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    // Seed the replay log with old-session turn history.
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"old"}]}}"#,
+    )
+    .await;
+
+    // Loading emits two load-time history chunks for the new session before
+    // the response. Those chunks should survive the replay reset.
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":8,"method":"session/load","params":{"sessionId":"sess-loaded-xyz","cwd":"/tmp"}}"#,
+    )
+    .await;
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let replay = drain_for(&mut ws_b, Duration::from_millis(400)).await;
+    let update_session_ids: Vec<_> = replay
+        .iter()
+        .filter(|v| v.get("method") == Some(&serde_json::json!("session/update")))
+        .filter_map(|v| v["params"]["sessionId"].as_str())
+        .collect();
+
+    assert!(
+        update_session_ids.contains(&"sess-loaded-xyz"),
+        "late replay should retain load-time history for loaded session, got {replay:?}",
+    );
+    assert!(
+        !update_session_ids.contains(&"sess-mock"),
+        "late replay must not contain stale updates from prior ACP session, got {replay:?}",
+    );
+    assert!(
+        replay.iter().any(|v| {
+            v.get("method") == Some(&serde_json::json!("amux/peer_joined"))
+                && v["params"]["peerId"] == serde_json::json!("A")
+        }),
+        "replay reset should still teach late joiners about existing peers, got {replay:?}",
+    );
+
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let r_b_new = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    assert_eq!(
+        r_b_new["result"]["sessionId"],
+        serde_json::json!("sess-loaded-xyz")
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+/// `/debug/sessions` exposes enough replay-generation metadata to see
+/// which ACP session ids are present in the late-join replay snapshot.
+#[tokio::test]
+async fn session_load_debug_sessions_exposes_replay_generation_and_acp_update_counts() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_EMIT_LOAD_HISTORY", "1")]).await;
+    let url = format!("ws://{addr}/acp?session=load-debug&peer_id=A");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"old"}]}}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":4,"method":"session/load","params":{"sessionId":"loaded-debug","cwd":"/tmp"}}"#,
+    )
+    .await;
+
+    let body = http_get(&format!("http://{addr}/debug/sessions")).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let s = &v["sessions"][0];
+    assert_eq!(s["cachedSessionId"], serde_json::json!("loaded-debug"));
+    assert_eq!(s["replayGeneration"], serde_json::json!(1));
+    assert_eq!(
+        s["lastReplayReset"]["loadedSessionId"],
+        serde_json::json!("loaded-debug")
+    );
+    assert!(
+        s["lastReplayReset"]["droppedFrameCount"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "debug metadata should report truncated old-generation frames: {s:?}",
+    );
+    assert!(
+        s["lastReplayReset"]["retainedFrameCount"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 2,
+        "debug metadata should report retained load-history frames: {s:?}",
+    );
+    assert_eq!(
+        s["replayLogUpdateFramesByAcpSessionId"]["loaded-debug"],
+        serde_json::json!(2),
+    );
+    assert!(
+        s["replayLogUpdateFramesByAcpSessionId"]
+            .get("sess-mock")
+            .is_none(),
+        "debug counts should not include old-session updates after replay reset: {s:?}",
+    );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
 /// `session/load` issued *without* a prior `session/new` populates
 /// the room's canonical session cache from scratch. Late joiners get
 /// a synthesized session/new response carrying just the loaded id.
