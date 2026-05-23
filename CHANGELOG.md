@@ -2,9 +2,24 @@
 
 ## Unreleased
 
+## v0.1.2 — 2026-05-23
+
 ### Added
 
-- **HTTP control-plane session discovery.** `GET /acp/sessions?cwd=<optional>` spawns a transient `--agent-cmd`, initializes it, sends `session/list`, returns the agent's result JSON, and tears the subprocess down without creating a live mux session. This covers the cold-start dashboard workflow tracked in [#10](https://github.com/lsaether/acp-mux/issues/10).
+- **HTTP control-plane session discovery.** `GET /acp/sessions?cwd=<optional>` runs a transient agent-side `session/list` before any WebSocket attach, returns the agent's result JSON directly, and tears the subprocess down without creating live mux session state. Covers the cold-start dashboard workflow tracked in [#10](https://github.com/lsaether/acp-mux/issues/10) / [#24](https://github.com/lsaether/acp-mux/pull/24).
+- **Opt-in mux trace metadata propagation.** `--meta-propagate` injects mux-owned trace fields into subscriber → agent requests at `params._meta.amux` after id translation, preserving existing `_meta` and unknown `amux` keys. This gives debugging clients `peerId`, `peerName`, `role`, `muxId`, and prompt `amuxTurnId` without changing the default payload contract. Closes [#6](https://github.com/lsaether/acp-mux/issues/6) via [#21](https://github.com/lsaether/acp-mux/pull/21).
+- **Live `session/list` response decoration.** `session/list` responses now annotate entries that match live muxed upstream sessions under `sessions[i]._meta.amux` with `proxySessionId`, `subscriberCount`, and optional `drivingSubscriber`, while preserving agent-owned metadata and leaving non-live entries unchanged. Closes [#22](https://github.com/lsaether/acp-mux/issues/22) via [#23](https://github.com/lsaether/acp-mux/pull/23).
+- **Replay provenance metadata.** Late-join replay frames now carry mux provenance under `params._meta.amux`, including the original `recordedAt` timestamp and monotonic `replaySeq`, without altering live fan-out frames. Closes [#18](https://github.com/lsaether/acp-mux/issues/18) via [#20](https://github.com/lsaether/acp-mux/pull/20).
+
+### Fixed
+
+- **Mixed-session replay after `session/load`.** Successful `session/load` now establishes a replay-generation boundary so late joiners do not receive stale replay frames from the previous upstream ACP session. amux preserves load-time history for the loaded session, rebuilds current peer presence for the new generation, and exposes replay-generation observability through `/debug/sessions`. Fixes [#17](https://github.com/lsaether/acp-mux/issues/17) via [#19](https://github.com/lsaether/acp-mux/pull/19).
+
+### Notes
+
+- `--meta-propagate` is still opt-in; default subscriber → agent request payloads remain unchanged.
+- `session/list` decoration is additive and scoped to `_meta.amux`; existing agent-owned `_meta` keys are preserved.
+- Open follow-ups after this release: [#2](https://github.com/lsaether/acp-mux/issues/2) remains the high-priority non-Hermes fs/terminal delegation bug, [#7](https://github.com/lsaether/acp-mux/issues/7) remains upstream RFD tracking, and [PR #3](https://github.com/lsaether/acp-mux/pull/3) remains a conflicting/shelved RFD #533 alignment branch.
 
 ## v0.1.1 — 2026-05-22
 
