@@ -3,6 +3,8 @@
 //! Routes:
 //! - `GET /healthz` → `200 ok`
 //! - `GET /acp`     → WebSocket upgrade
+//! - `GET /acp/sessions?cwd=...` → cold-start `session/list` query
+//! - `GET /debug/sessions` → live mux session snapshot
 //!
 //! Subscriber attach query: `session`, `peer_id`, `peer_name?`, `role?`.
 //! `session` is validated against `^[A-Za-z0-9_-]{1,128}$`. Missing required
@@ -19,7 +21,8 @@ use axum::{
         Query, State, WebSocketUpgrade,
         ws::{CloseFrame, Message, Utf8Bytes, WebSocket},
     },
-    response::IntoResponse,
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use futures::stream::{SplitSink, SplitStream};
@@ -29,7 +32,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::multiplex::subscriber::{OutMsg, Subscriber};
-use crate::session::registry::{RegistryError, SessionRegistry};
+use crate::session::registry::{ControlPlaneSessionListError, RegistryError, SessionRegistry};
 use crate::session::state::{SessionMsg, SessionSnapshot};
 
 const SESSION_ID_MAX_LEN: usize = 128;
@@ -60,10 +63,16 @@ pub struct AttachQuery {
     pub role: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SessionDiscoveryQuery {
+    pub cwd: Option<String>,
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/acp", get(acp_attach))
+        .route("/acp/sessions", get(acp_sessions))
         .route("/debug/sessions", get(debug_sessions))
         .with_state(state)
 }
@@ -86,6 +95,39 @@ async fn debug_sessions(State(state): State<AppState>) -> impl IntoResponse {
         sessions,
         session_count: count,
     })
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
+}
+
+async fn acp_sessions(
+    State(state): State<AppState>,
+    Query(q): Query<SessionDiscoveryQuery>,
+) -> Response {
+    match state.registry.list_sessions_control_plane(q.cwd).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(err) => control_plane_error_response(err),
+    }
+}
+
+fn control_plane_error_response(err: ControlPlaneSessionListError) -> Response {
+    let (status, error, details) = match err {
+        ControlPlaneSessionListError::AgentCmdMissing => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent command not configured",
+            None,
+        ),
+        other => (
+            StatusCode::BAD_GATEWAY,
+            "agent session/list failed",
+            Some(other.to_string()),
+        ),
+    };
+    (status, Json(ErrorResponse { error, details })).into_response()
 }
 
 async fn acp_attach(

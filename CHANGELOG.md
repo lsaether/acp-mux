@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **HTTP control-plane session discovery.** `GET /acp/sessions?cwd=<optional>` spawns a transient `--agent-cmd`, initializes it, sends `session/list`, returns the agent's result JSON, and tears the subprocess down without creating a live mux session. This covers the cold-start dashboard workflow tracked in [#10](https://github.com/lsaether/acp-mux/issues/10).
+
 ## v0.1.1 — 2026-05-22
 
 ### Added

@@ -1814,23 +1814,38 @@ where
 }
 
 async fn http_get(url: &str) -> String {
+    http_get_response(url).await.1
+}
+
+async fn http_get_response(url: &str) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let parsed = url::Url::parse(url).unwrap();
     let host = parsed.host_str().unwrap();
     let port = parsed.port().unwrap();
-    let path = if parsed.path().is_empty() {
+    let mut path = if parsed.path().is_empty() {
         "/"
     } else {
         parsed.path()
-    };
+    }
+    .to_string();
+    if let Some(query) = parsed.query() {
+        path.push('?');
+        path.push_str(query);
+    }
     let mut stream = tokio::net::TcpStream::connect((host, port)).await.unwrap();
     let req = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.unwrap();
     let text = String::from_utf8_lossy(&buf);
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .expect("HTTP response status");
     let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
-    body.to_string()
+    (status, body.to_string())
 }
 
 // ===== Cancellation tests (issue #4 / $/cancel_request RFD) =====
@@ -2358,6 +2373,71 @@ async fn session_list_with_cwd_filter_forwarded_unmodified() {
     assert_eq!(sessions[0]["cwd"], serde_json::json!("/tmp/other"));
 
     let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+/// Cold-start discovery: clients can list the upstream agent's persisted
+/// sessions before committing to any `?session=` WebSocket room. The
+/// query spawns a transient agent process, asks for `session/list`, then
+/// tears it down without adding live mux state.
+#[tokio::test]
+async fn control_plane_sessions_lists_without_ws_attach() {
+    let (addr, registry) = spawn_server_with_mock_env(&[("MOCK_ACP_SESSION_LIST", "1")]).await;
+
+    let (status, body) = http_get_response(&format!("http://{addr}/acp/sessions")).await;
+
+    assert_eq!(status, 200, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let sessions = v["sessions"].as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 3, "all canned sessions should arrive");
+    let ids: Vec<&str> = sessions
+        .iter()
+        .filter_map(|s| s["sessionId"].as_str())
+        .collect();
+    assert!(ids.contains(&"sess-mock"));
+    assert!(ids.contains(&"sess-archive-001"));
+    assert!(ids.contains(&"sess-archive-002"));
+    assert_eq!(
+        registry.live_session_count().await,
+        0,
+        "control-plane listing must not create a live mux session"
+    );
+}
+
+/// The HTTP control-plane surface mirrors the `session/list` params that
+/// make sense for a GET endpoint. `cwd` is forwarded to the transient
+/// agent query, so clients can cold-start directly into a filtered view.
+#[tokio::test]
+async fn control_plane_sessions_forwards_cwd_filter() {
+    let (addr, registry) = spawn_server_with_mock_env(&[("MOCK_ACP_SESSION_LIST", "1")]).await;
+
+    let (status, body) =
+        http_get_response(&format!("http://{addr}/acp/sessions?cwd=%2Ftmp%2Fother")).await;
+
+    assert_eq!(status, 200, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let sessions = v["sessions"].as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1, "filter should narrow to one session");
+    assert_eq!(
+        sessions[0]["sessionId"],
+        serde_json::json!("sess-archive-002")
+    );
+    assert_eq!(sessions[0]["cwd"], serde_json::json!("/tmp/other"));
+    assert_eq!(registry.live_session_count().await, 0);
+}
+
+#[tokio::test]
+async fn control_plane_sessions_without_agent_cmd_returns_503() {
+    let (addr, registry) = spawn_server(None).await;
+
+    let (status, body) = http_get_response(&format!("http://{addr}/acp/sessions")).await;
+
+    assert_eq!(status, 503, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["error"],
+        serde_json::json!("agent command not configured")
+    );
+    assert_eq!(registry.live_session_count().await, 0);
 }
 
 // ===== session/load canonical rebinding (issue #12) =====

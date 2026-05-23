@@ -333,6 +333,27 @@ Entries with no live mux match are left unchanged. Existing `sessions[i]._meta`
 keys and unknown `sessions[i]._meta.amux` keys are preserved; amux-owned fields
 above are refreshed with current live state.
 
+## HTTP control-plane session discovery
+
+`GET /acp/sessions?cwd=<optional>` is the cold-start complement to the
+WebSocket `session/list` path. It is intended for dashboards that need to show
+persisted upstream ACP sessions before the user chooses a mux room to attach or
+resume.
+
+Handling:
+
+1. amux spawns a transient `--agent-cmd` subprocess.
+2. amux sends `initialize` to put the agent in a normal ACP-ready state.
+3. amux sends `session/list`, forwarding the optional `cwd` query parameter as
+   JSON-RPC params `{ "cwd": "..." }`.
+4. amux returns the agent's `result` JSON as the HTTP response body, e.g.
+   `{ "sessions": [...], "nextCursor": "..." }` if the agent includes a cursor.
+5. amux tears down the transient subprocess and does **not** register a live mux
+   session or attach any peer.
+
+The endpoint returns `503` when `--agent-cmd` is not configured. Agent spawn,
+protocol, timeout, or JSON-RPC errors return `502` with a small JSON error body.
+
 ## Late-join / replay log
 
 The multiplexer maintains a per-session event log: every broadcast-tier
