@@ -35,6 +35,7 @@ Health and debug endpoints:
 | `--agent-cmd`              | _(none)_      | Command + args (whitespace-split). Without this, subscriber attaches close with WS code 1011. |
 | `--session-ttl-seconds`    | `60`          | Grace window after last subscriber leaves — a reconnect within this window keeps the same subprocess. |
 | `--replay-turns`           | `unbounded`   | `unbounded` keeps the full broadcast log; `0` disables it; `N > 0` is accepted and warned (bounded eviction lands in v0.2). |
+| `--meta-propagate`         | `false`       | Opt into injecting mux trace fields into subscriber → agent requests at `params._meta.amux`. |
 | `--log-level`              | `info`        | `trace`/`debug`/`info`/`warn`/`error`. `RUST_LOG` wins when set. |
 
 ## How it works
@@ -45,6 +46,7 @@ Health and debug endpoints:
 - **`initialize` / `session/new` caching.** First response is cached; later joiners are answered locally without re-sending to the agent.
 - **Broadcast agent-initiated requests.** Agent-initiated requests (e.g. `session/request_permission`) are fanned out to every attached subscriber; any peer can reply. The first reply for a given id is forwarded to the agent and later replies for the same id are dropped, so the agent always sees exactly one response.
 - **Turn serialization.** Concurrent `session/prompt` while a turn is in flight is rejected with JSON-RPC `-32001`. The last subscriber to issue a substantive request is still surfaced as the "driving subscriber" in `/debug/sessions` and `amux/turn_started` for UI attribution.
+- **Opt-in request trace metadata.** With `--meta-propagate`, outbound subscriber → agent requests get mux-owned `params._meta.amux` fields (`peerId`, `peerName`, `role`, `muxId`, and `amuxTurnId` for prompts) for cross-client debugging. Default mode leaves request payload metadata unchanged.
 - **`amux/*` notification namespace.** The mux publishes its own metadata out-of-band: `amux/peer_joined`, `amux/peer_left`, `amux/turn_started`, `amux/turn_complete`, `amux/turn_cancelled`, `amux/session_busy`, `amux/agent_request_resolved`. ACP frames stay clean; clients see two distinguishable channels and demultiplex by method prefix.
 - **Cancellation.** `$/cancel_request` (request-cancellation RFD) works both directions: subscribers can cancel their own in-flight requests; agents can cancel agent-initiated requests (broadcast to peers + `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`). The amux extension `amux/cancel_active_turn` lets *any* attached peer cancel the in-flight turn (not just the driver) — internally it synthesizes a `$/cancel_request` toward the agent and emits `amux/turn_cancelled` to peers.
 - **Replay log.** Every broadcast-tier frame (`amux/*` + agent notifications) is appended; a late joiner receives the full history before any live event.
@@ -79,7 +81,7 @@ amux parses only JSON-RPC envelopes (`id`, `method`, `params`, `result`, `error`
 | `session/set_mode` | ✅ (envelope passthrough) | Core | Not specifically handled. |
 | `$/cancel_request` | ✅ | Draft RFD (optional per spec) | Strict per-peer semantics; cancels own in-flight requests only. |
 | `session/attach`, `session/detach` | ⏳ | Open RFD ([#533](https://github.com/agentclientprotocol/agent-client-protocol/pull/533)) | Implemented on branch [`rfd-533-alignment`](https://github.com/lsaether/acp-mux/pull/3), shelved pending RFD ratification. |
-| `session/list` | ✅ (envelope passthrough) | Draft RFD | Forwarded to the agent like any other request; agent's response (with the `sessions[]` array) flows back unmodified. Capability advertisement (`sessionCapabilities.list`) propagates from the agent. Decorating the response with amux-known fields (`_meta.amuxSubscriberCount`, etc.) is tracked in [#6](https://github.com/lsaether/acp-mux/issues/6). |
+| `session/list` | ✅ (envelope passthrough) | Draft RFD | Forwarded to the agent like any other request; agent's response (with the `sessions[]` array) flows back unmodified. Capability advertisement (`sessionCapabilities.list`) propagates from the agent. With `--meta-propagate`, the outbound request can carry `params._meta.amux` trace fields. Decorating the returned `sessions[]` entries with live amux state (subscriber count, mux/proxy session id, etc.) remains follow-up work. |
 
 ### Agent-initiated (agent → subscriber)
 
