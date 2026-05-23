@@ -39,6 +39,15 @@ Health and debug endpoints:
 | `--meta-propagate`         | `false`       | Opt into injecting mux trace fields into subscriber → agent requests at `params._meta.amux`. |
 | `--log-level`              | `info`        | `trace`/`debug`/`info`/`warn`/`error`. `RUST_LOG` wins when set. |
 
+## Agent compatibility
+
+`acp-mux` is currently developed and directly tested against the Hermes ACP harness. Other ACP agents may work for the generic conversation, permission, cancellation, and replay paths, but Hermes is the only directly supported harness at the moment.
+
+| Agent / harness | Status | Notes |
+|---|---|---|
+| **[hermes-agent](https://github.com/hermes-agent/hermes)** | ✅ Directly supported | Hermes self-handles fs/terminal/tool execution inside its own process and never delegates those calls over ACP, so [#2](https://github.com/lsaether/acp-mux/issues/2) does not apply to the Hermes path. |
+| **Codex (Zed-bundled)**, **claude-code-acp**, **copilot-acp** | ⚠️ Best-effort / partial | Basic ACP envelope routing should work, but these are not directly harnessed right now. Agents that delegate `fs/*` or `terminal/*` to the client will misbehave until [#2](https://github.com/lsaether/acp-mux/issues/2) lands. |
+
 ## How it works
 
 - **One subprocess per session.** Each `?session=` value spawns a fresh `--agent-cmd` subprocess. Multiple subscribers on the same session share that subprocess.
@@ -95,11 +104,6 @@ amux parses only JSON-RPC envelopes (`id`, `method`, `params`, `result`, `error`
 | `$/cancel_request` | ✅ | Draft RFD (optional per spec) | Marks `agent_pending` Consumed; broadcasts to all peers; emits `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`. |
 | `fs/read_text_file`, `fs/write_text_file` | ❌ | Core | Tracked in [#2](https://github.com/lsaether/acp-mux/issues/2). amux currently broadcasts these to subscribers, which is broken for any agent that delegates fs to the client (Codex, claude-code-acp, copilot-acp). Self-handling design agreed; implementation deferred. |
 | `terminal/create`, `terminal/output`, `terminal/wait_for_exit`, `terminal/kill`, `terminal/release` | ❌ | Core | Same as `fs/*` — tracked in [#2](https://github.com/lsaether/acp-mux/issues/2). |
-
-### Agent compatibility
-
-- **[hermes-agent](https://github.com/hermes-agent/hermes)** — fully supported. hermes self-handles fs/terminal in its own process and never delegates over ACP, so issue #2 doesn't apply.
-- **Codex (Zed-bundled)**, **claude-code-acp**, **copilot-acp** — partially supported. Conversation, permissions, and cancellation work; fs/terminal delegation will misbehave until [#2](https://github.com/lsaether/acp-mux/issues/2) lands.
 
 ### amux extensions (not part of ACP)
 
