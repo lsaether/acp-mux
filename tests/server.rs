@@ -779,6 +779,144 @@ async fn replay_log_delivers_history_to_late_joiner() {
     let _ = ws_b.send(ClientMsg::Close(None)).await;
 }
 
+#[tokio::test]
+async fn replay_log_adds_mux_record_metadata_to_late_join_frames() {
+    let (addr, _) = spawn_server_with_mock().await;
+    let url_a = format!("ws://{addr}/acp?session=replay-meta&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=replay-meta&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"hi"}]}}"#.into(),
+    )).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(200), ws_a.next()).await {
+            Ok(Some(Ok(ClientMsg::Text(t)))) => {
+                let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                if v.get("id") == Some(&serde_json::json!(7)) && v.get("result").is_some() {
+                    break;
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let replay = drain_for(&mut ws_b, Duration::from_millis(400)).await;
+    let session_updates: Vec<_> = replay
+        .iter()
+        .filter(|v| v.get("method") == Some(&serde_json::json!("session/update")))
+        .collect();
+    assert_eq!(
+        session_updates.len(),
+        2,
+        "expected two replayed updates: {replay:?}"
+    );
+
+    let mut seqs = Vec::new();
+    let mut recorded_ats = Vec::new();
+    for update in &session_updates {
+        // Original ACP payload remains where clients expect it.
+        assert_eq!(
+            update["params"]["sessionId"],
+            serde_json::json!("sess-mock")
+        );
+        assert!(
+            update["params"]["update"].get("kind").is_some(),
+            "session/update payload should stay intact: {update:?}"
+        );
+
+        let amux = &update["params"]["_meta"]["amux"];
+        let recorded_at = amux["recordedAt"]
+            .as_str()
+            .expect("replay metadata should include recordedAt");
+        assert!(
+            recorded_at.ends_with('Z') && recorded_at.contains('T'),
+            "recordedAt should be an RFC3339-ish UTC timestamp, got {recorded_at:?}"
+        );
+        let seq = amux["replaySeq"]
+            .as_u64()
+            .expect("replay metadata should include numeric replaySeq");
+        recorded_ats.push(recorded_at.to_string());
+        seqs.push(seq);
+    }
+
+    assert!(seqs[0] < seqs[1], "replaySeq should be monotonic: {seqs:?}");
+    assert_eq!(
+        recorded_ats.len(),
+        2,
+        "each replayed update should carry its original record timestamp"
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn replay_log_merges_amux_metadata_without_clobbering_existing_meta() {
+    let (addr, _) = spawn_server_with_cat().await;
+    let url_a = format!("ws://{addr}/acp?session=replay-meta-merge&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=replay-meta-merge&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let payload = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-meta","update":{"kind":"tool_call","toolCallId":"tool-1"},"_meta":{"traceparent":"00-abc","zed.dev/debugMode":true}}}"#;
+    ws_a.send(ClientMsg::Text(payload.into())).await.unwrap();
+
+    let live = drain_for(&mut ws_a, Duration::from_millis(200)).await;
+    let live_update = live
+        .iter()
+        .find(|v| v.get("method") == Some(&serde_json::json!("session/update")))
+        .expect("A should see the live echoed session/update");
+    assert_eq!(
+        live_update["params"]
+            .get("_meta")
+            .and_then(|m| m.get("amux")),
+        None,
+        "live fan-out should not gain replay-only amux metadata"
+    );
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let replay = drain_for(&mut ws_b, Duration::from_millis(300)).await;
+    let replay_update = replay
+        .iter()
+        .find(|v| v.get("method") == Some(&serde_json::json!("session/update")))
+        .expect("B should see replayed session/update");
+
+    assert_eq!(
+        replay_update["params"]["_meta"]["traceparent"],
+        serde_json::json!("00-abc"),
+        "replay metadata injection should preserve existing _meta keys"
+    );
+    assert_eq!(
+        replay_update["params"]["_meta"]["zed.dev/debugMode"],
+        serde_json::json!(true),
+        "replay metadata injection should preserve implementation-specific keys"
+    );
+    assert!(
+        replay_update["params"]["_meta"]["amux"]["recordedAt"].is_string(),
+        "replay metadata should add _meta.amux.recordedAt"
+    );
+    assert!(
+        replay_update["params"]["_meta"]["amux"]["replaySeq"].is_u64(),
+        "replay metadata should add _meta.amux.replaySeq"
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
 /// Chunk 8: --replay-turns 0 disables the log; B sees no history.
 #[tokio::test]
 async fn replay_turns_disabled_emits_no_history() {
