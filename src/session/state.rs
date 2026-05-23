@@ -154,6 +154,52 @@ fn inject_replay_metadata(frame: &Bytes, recorded_at: &str, replay_seq: u64) -> 
         })
 }
 
+struct RequestTrace<'a> {
+    peer_id: &'a str,
+    peer_name: Option<&'a str>,
+    role: Option<&'a str>,
+    mux_id: u64,
+    amux_turn_id: Option<AmuxTurnId>,
+}
+
+fn inject_request_trace_metadata(req: &mut IncomingRequest, trace: RequestTrace<'_>) {
+    let Some(params) = object_params(req) else {
+        return;
+    };
+    let Some(meta) = object_field(params, "_meta") else {
+        return;
+    };
+    let Some(amux) = object_field(meta, "amux") else {
+        return;
+    };
+
+    amux.insert(
+        "peerId".to_string(),
+        Value::String(trace.peer_id.to_string()),
+    );
+    if let Some(peer_name) = trace.peer_name {
+        amux.insert("peerName".to_string(), Value::String(peer_name.to_string()));
+    }
+    if let Some(role) = trace.role {
+        amux.insert("role".to_string(), Value::String(role.to_string()));
+    }
+    amux.insert(
+        "muxId".to_string(),
+        Value::Number(serde_json::Number::from(trace.mux_id)),
+    );
+    if let Some(turn_id) = trace.amux_turn_id {
+        amux.insert("amuxTurnId".to_string(), Value::String(turn_id.formatted()));
+    }
+}
+
+fn object_params(req: &mut IncomingRequest) -> Option<&mut Map<String, Value>> {
+    let params = req.params.get_or_insert_with(|| Value::Object(Map::new()));
+    match params {
+        Value::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
 fn object_field<'a>(
     object: &'a mut Map<String, Value>,
     key: &str,
@@ -407,6 +453,9 @@ struct SessionInner {
     /// Last successful replay segmentation event, exposed through
     /// `/debug/sessions` for operator diagnostics.
     last_replay_reset: Option<ReplayResetSnapshot>,
+    /// Opt-in propagation of mux-owned trace metadata into outbound
+    /// subscriber → agent requests under `params._meta.amux`.
+    meta_propagate: bool,
     /// State for every agent-initiated request id we have ever broadcast
     /// in this session. `InFlight` until the first subscriber reply
     /// arrives; `Consumed` thereafter. We keep `Consumed` ids around for
@@ -416,7 +465,7 @@ struct SessionInner {
 }
 
 impl SessionInner {
-    fn new(session_id: String, replay_policy: ReplayTurns) -> Self {
+    fn new(session_id: String, replay_policy: ReplayTurns, meta_propagate: bool) -> Self {
         let replay_log = match replay_policy {
             ReplayTurns::Disabled => None,
             ReplayTurns::Unbounded => Some(VecDeque::new()),
@@ -443,6 +492,7 @@ impl SessionInner {
             next_replay_seq: 1,
             replay_generation: 0,
             last_replay_reset: None,
+            meta_propagate,
             agent_pending: HashMap::new(),
         }
     }
@@ -1025,6 +1075,13 @@ impl SessionInner {
         self.next_mux_id += 1;
         let original_id = req.id.clone();
         let is_prompt = req.method == "session/prompt";
+        let amux_turn_id = if is_prompt {
+            let turn_id = AmuxTurnId(self.next_amux_turn_id);
+            self.next_amux_turn_id += 1;
+            Some(turn_id)
+        } else {
+            None
+        };
         self.pending.insert(
             mux_id,
             PendingRequest {
@@ -1035,12 +1092,28 @@ impl SessionInner {
         );
         req.id = Id::Number(mux_id as i64);
 
+        if self.meta_propagate {
+            let (peer_name, role) = self
+                .subscribers
+                .get(peer_id)
+                .map(|s| (s.peer_name.as_deref(), s.role.as_deref()))
+                .unwrap_or((None, None));
+            inject_request_trace_metadata(
+                &mut req,
+                RequestTrace {
+                    peer_id,
+                    peer_name,
+                    role,
+                    mux_id,
+                    amux_turn_id,
+                },
+            );
+        }
+
         match serde_json::to_vec(&req) {
             Ok(out) => {
-                if is_prompt {
+                if let Some(turn_id) = amux_turn_id {
                     self.active_turn_mux_id = Some(mux_id);
-                    let turn_id = AmuxTurnId(self.next_amux_turn_id);
-                    self.next_amux_turn_id += 1;
                     self.active_amux_turn_id = Some(turn_id);
                     tracing::info!(
                         session = %self.session_id,
@@ -1448,12 +1521,18 @@ impl SessionInner {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SessionOptions {
+    pub replay_policy: ReplayTurns,
+    pub session_ttl: Duration,
+    pub meta_propagate: bool,
+}
+
 pub fn spawn_session(
     initial_subscriber: Subscriber,
     mut agent: AgentProcess,
     session_id: String,
-    replay_policy: ReplayTurns,
-    session_ttl: Duration,
+    options: SessionOptions,
 ) -> (SessionHandle, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<SessionMsg>(SESSION_QUEUE_CAPACITY);
     let stdout_rx = agent
@@ -1483,8 +1562,7 @@ pub fn spawn_session(
         initial_subscriber,
         pump,
         session_id,
-        replay_policy,
-        session_ttl,
+        options,
     ));
     (SessionHandle { tx }, actor)
 }
@@ -1505,10 +1583,13 @@ async fn run_session(
     initial_subscriber: Subscriber,
     pump: JoinHandle<()>,
     session_id: String,
-    replay_policy: ReplayTurns,
-    session_ttl: Duration,
+    options: SessionOptions,
 ) {
-    let mut inner = SessionInner::new(session_id.clone(), replay_policy);
+    let mut inner = SessionInner::new(
+        session_id.clone(),
+        options.replay_policy,
+        options.meta_propagate,
+    );
     inner
         .attach(initial_subscriber)
         .expect("initial subscriber cannot collide on an empty map");
@@ -1540,10 +1621,10 @@ async fn run_session(
                         if now_empty {
                             tracing::info!(
                                 session = %session_id,
-                                ttl_secs = session_ttl.as_secs_f64(),
+                                ttl_secs = options.session_ttl.as_secs_f64(),
                                 "last subscriber gone; starting TTL grace",
                             );
-                            ttl_sleep = Some(Box::pin(tokio::time::sleep(session_ttl)));
+                            ttl_sleep = Some(Box::pin(tokio::time::sleep(options.session_ttl)));
                         }
                         None
                     }

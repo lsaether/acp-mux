@@ -56,6 +56,26 @@ async fn spawn_server_with_ttl(
     (addr, registry)
 }
 
+async fn spawn_server_with_meta_propagation(
+    agent_cmd: Option<AgentCmd>,
+    enabled: bool,
+) -> (SocketAddr, Arc<SessionRegistry>) {
+    let registry = SessionRegistry::new_with_meta_propagation(
+        agent_cmd,
+        ReplayTurns::Unbounded,
+        TEST_DEFAULT_TTL,
+        enabled,
+    );
+    let app = router(AppState::new(registry.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (addr, registry)
+}
+
 #[tokio::test]
 async fn healthz_returns_ok() {
     let (addr, _) = spawn_server_with_cat().await;
@@ -217,6 +237,128 @@ async fn ws_request(
             return v;
         }
     }
+}
+
+async fn ws_next_method<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    method: &str,
+) -> serde_json::Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let Ok(Some(Ok(ClientMsg::Text(t)))) = timeout(Duration::from_millis(100), ws.next()).await
+        else {
+            continue;
+        };
+        let v: serde_json::Value = serde_json::from_str(t.as_str()).expect("frame is JSON");
+        if v.get("method") == Some(&serde_json::json!(method)) {
+            return v;
+        }
+    }
+    panic!("timed out waiting for method {method}");
+}
+
+// ===== _meta.amux request trace propagation (issue #6) =====
+
+#[tokio::test]
+async fn meta_propagate_default_off_leaves_outbound_request_meta_unchanged() {
+    let (addr, _) = spawn_server_with_cat().await;
+    let url = format!("ws://{addr}/acp?session=meta-default&peer_id=A&peer_name=Alice&role=driver");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    ws.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":77,"method":"session/list","params":{"cwd":"/tmp","_meta":{"traceparent":"00-abc"}}}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let echoed = ws_next_method(&mut ws, "session/list").await;
+    assert_eq!(echoed["id"], serde_json::json!(1));
+    assert_eq!(
+        echoed["params"]["_meta"]["traceparent"],
+        serde_json::json!("00-abc")
+    );
+    assert!(
+        echoed["params"]["_meta"].get("amux").is_none(),
+        "default-off meta propagation must not add _meta.amux: {echoed:?}",
+    );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn meta_propagate_opt_in_adds_peer_trace_to_outbound_requests() {
+    let (addr, _) = spawn_server_with_meta_propagation(
+        Some(AgentCmd {
+            program: "cat".into(),
+            args: vec![],
+        }),
+        true,
+    )
+    .await;
+    let url = format!("ws://{addr}/acp?session=meta-on&peer_id=A&peer_name=Alice&role=driver");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    ws.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":77,"method":"session/list","params":{"cwd":"/tmp","_meta":{"traceparent":"00-abc","client.example/debug":true,"amux":{"clientTrace":"keep"}}}}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let echoed = ws_next_method(&mut ws, "session/list").await;
+    assert_eq!(echoed["id"], serde_json::json!(1));
+    assert_eq!(
+        echoed["params"]["_meta"]["traceparent"],
+        serde_json::json!("00-abc")
+    );
+    assert_eq!(
+        echoed["params"]["_meta"]["client.example/debug"],
+        serde_json::json!(true),
+        "existing non-amux metadata must be preserved",
+    );
+
+    let amux = &echoed["params"]["_meta"]["amux"];
+    assert_eq!(amux["peerId"], serde_json::json!("A"));
+    assert_eq!(amux["peerName"], serde_json::json!("Alice"));
+    assert_eq!(amux["role"], serde_json::json!("driver"));
+    assert_eq!(amux["muxId"], serde_json::json!(1));
+    assert_eq!(amux["clientTrace"], serde_json::json!("keep"));
+    assert!(
+        amux.get("amuxTurnId").is_none(),
+        "non-prompt requests should not carry a turn id: {echoed:?}",
+    );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn meta_propagate_prompt_includes_amux_turn_id() {
+    let (addr, _) = spawn_server_with_meta_propagation(
+        Some(AgentCmd {
+            program: "cat".into(),
+            args: vec![],
+        }),
+        true,
+    )
+    .await;
+    let url = format!("ws://{addr}/acp?session=meta-prompt&peer_id=A&peer_name=Alice&role=driver");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    ws.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":42,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"hi"}]}}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let echoed = ws_next_method(&mut ws, "session/prompt").await;
+    let amux = &echoed["params"]["_meta"]["amux"];
+    assert_eq!(amux["peerId"], serde_json::json!("A"));
+    assert_eq!(amux["muxId"], serde_json::json!(1));
+    assert_eq!(amux["amuxTurnId"], serde_json::json!("at-1"));
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
 }
 
 #[tokio::test]

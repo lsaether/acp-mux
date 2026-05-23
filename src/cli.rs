@@ -34,6 +34,11 @@ pub struct Cli {
     #[arg(long, default_value = "unbounded")]
     pub replay_turns: ReplayTurns,
 
+    /// Opt into injecting mux-owned trace metadata into subscriber → agent
+    /// requests under params._meta.amux.
+    #[arg(long, default_value_t = false)]
+    pub meta_propagate: bool,
+
     /// Logging verbosity. Overridden by RUST_LOG when that variable is set.
     #[arg(long, value_enum, default_value_t = LogLevel::Info)]
     pub log_level: LogLevel,
@@ -136,5 +141,17 @@ mod tests {
             ))
         );
         assert_eq!(split_agent_cmd("   "), None);
+    }
+
+    #[test]
+    fn meta_propagate_defaults_off() {
+        let cli = Cli::try_parse_from(["amux"]).unwrap();
+        assert!(!cli.meta_propagate);
+    }
+
+    #[test]
+    fn meta_propagate_flag_enables_trace_injection() {
+        let cli = Cli::try_parse_from(["amux", "--meta-propagate"]).unwrap();
+        assert!(cli.meta_propagate);
     }
 }

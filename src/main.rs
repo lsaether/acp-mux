@@ -26,10 +26,11 @@ async fn main() -> Result<()> {
         );
     }
 
-    let registry = SessionRegistry::new(
+    let registry = SessionRegistry::new_with_meta_propagation(
         agent_cmd,
         cli.replay_turns,
         std::time::Duration::from_secs(cli.session_ttl_seconds),
+        cli.meta_propagate,
     );
     let app = server::router(server::AppState::new(registry));
 

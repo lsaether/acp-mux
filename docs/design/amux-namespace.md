@@ -253,6 +253,57 @@ sweep the mux drops any late subscriber reply for the same id at the
 first-reply-wins gate, so the agent never sees a duplicate or stale
 answer.
 
+## `_meta.amux` request trace metadata
+
+amux can optionally use ACP `_meta` passthrough to carry mux-owned trace
+fields on subscriber → agent requests. This is disabled by default to
+preserve byte-passthrough behavior for request payloads; start amux with
+`--meta-propagate` to enable it.
+
+When enabled, amux merges fields into `params._meta.amux` after request id
+translation and before forwarding the request to the agent:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 17,
+  "method": "session/prompt",
+  "params": {
+    "sessionId": "sess-mock",
+    "prompt": [{"type": "text", "text": "hi"}],
+    "_meta": {
+      "amux": {
+        "peerId": "phone-1",
+        "peerName": "phone",
+        "role": "driver",
+        "muxId": 17,
+        "amuxTurnId": "at-42"
+      }
+    }
+  }
+}
+```
+
+Fields:
+
+- `peerId` — subscriber identity from the WebSocket query or mux fallback.
+- `peerName` — optional display name when known.
+- `role` — optional subscriber role when known.
+- `muxId` — the translated JSON-RPC request id visible to the agent.
+- `amuxTurnId` — only present on forwarded `session/prompt` requests, and
+  matches the accompanying `amux/turn_started` bookend.
+
+Existing `params._meta` keys and unrelated namespaces are preserved. If
+`_meta.amux` already exists as an object, amux merges into it and leaves
+unknown keys intact. Agent → subscriber frames are not rewritten by this
+feature; any `_meta` emitted by the agent flows back untouched.
+
+Follow-up work: decorating `session/list` **responses** with live mux state
+(such as subscriber count and mux/proxy session id for returned
+`sessions[]` entries) is intentionally not part of request trace propagation.
+That requires registry-wide lookup across every returned session id and
+should land as a separate change.
+
 ## Late-join / replay log
 
 The multiplexer maintains a per-session event log: every broadcast-tier
@@ -452,6 +503,11 @@ explicit boundaries.
   retained turns (e.g., drop intermediate `tool_call_update` frames when
   a later frame supersedes them). Always a byte-level operation on raw
   frames — no ACP semantic introspection.
+- **`session/list` response decoration.** Request-side `_meta.amux` trace
+  propagation is opt-in and local to the request path. A separate change
+  can decorate returned `sessions[]` entries with live mux state (for
+  example subscriber count and mux/proxy session id) once the response path
+  has registry-wide session lookup.
 - **Persistent log on disk.** v0.1 logs live in process memory and die
   with the session. A future revision could persist the log to disk for
   crash recovery or for resume after multiplexer restart.
