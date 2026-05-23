@@ -42,6 +42,9 @@
 //!   a small canned set of sessions (the current `sess-mock` plus two
 //!   historical entries). Used to test session/list end-to-end
 //!   passthrough through amux.
+//! - `MOCK_ACP_SESSION_LIST_META=1` — add agent-owned `_meta` and
+//!   `_meta.amux` fields to the current session/list entry so tests can
+//!   verify mux decoration merges instead of replacing upstream metadata.
 //! - `MOCK_ACP_FAIL_LOAD=1` — return an error response to
 //!   `session/load` instead of succeeding. Used to test that failed
 //!   loads don't rebind the room's canonical session.
@@ -84,6 +87,9 @@ fn main() {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let session_list = env::var("MOCK_ACP_SESSION_LIST")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let session_list_meta = env::var("MOCK_ACP_SESSION_LIST_META")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let fail_load = env::var("MOCK_ACP_FAIL_LOAD")
@@ -201,13 +207,30 @@ fn main() {
                         .get("params")
                         .and_then(|p| p.get("cwd"))
                         .and_then(|v| v.as_str());
-                    let sessions = vec![
+                    let current_session = if session_list_meta {
                         json!({
                             "sessionId": session_id,
                             "cwd": "/tmp/mock",
                             "title": "Current mock session",
                             "updatedAt": "2026-05-22T12:00:00Z",
-                        }),
+                            "_meta": {
+                                "agentKey": "preserved",
+                                "amux": {
+                                    "agentAmuxKey": "preserved",
+                                    "proxySessionId": "agent-owned-placeholder"
+                                }
+                            }
+                        })
+                    } else {
+                        json!({
+                            "sessionId": session_id,
+                            "cwd": "/tmp/mock",
+                            "title": "Current mock session",
+                            "updatedAt": "2026-05-22T12:00:00Z",
+                        })
+                    };
+                    let sessions = vec![
+                        current_session,
                         json!({
                             "sessionId": "sess-archive-001",
                             "cwd": "/tmp/mock",

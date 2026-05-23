@@ -64,6 +64,7 @@
 //! server).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -78,6 +79,52 @@ use crate::protocol::amux::{self, AmuxTurnId};
 use crate::protocol::jsonrpc::{
     Id, Incoming, IncomingRequest, IncomingResponse, JsonRpcError, JsonRpcVersion,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionListAmuxMetadata {
+    pub proxy_session_id: String,
+    pub subscriber_count: usize,
+    pub driving_subscriber: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct SessionListMetadataIndex {
+    by_acp_session_id: RwLock<HashMap<String, SessionListAmuxMetadata>>,
+}
+
+impl SessionListMetadataIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, acp_session_id: &str) -> Option<SessionListAmuxMetadata> {
+        self.by_acp_session_id
+            .read()
+            .expect("session list metadata index poisoned")
+            .get(acp_session_id)
+            .cloned()
+    }
+
+    fn upsert(&self, acp_session_id: &str, metadata: SessionListAmuxMetadata) {
+        self.by_acp_session_id
+            .write()
+            .expect("session list metadata index poisoned")
+            .insert(acp_session_id.to_string(), metadata);
+    }
+
+    fn remove_if_proxy(&self, acp_session_id: &str, proxy_session_id: &str) {
+        let mut index = self
+            .by_acp_session_id
+            .write()
+            .expect("session list metadata index poisoned");
+        if index
+            .get(acp_session_id)
+            .is_some_and(|meta| meta.proxy_session_id == proxy_session_id)
+        {
+            index.remove(acp_session_id);
+        }
+    }
+}
 
 const SESSION_QUEUE_CAPACITY: usize = 256;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -189,6 +236,35 @@ fn inject_request_trace_metadata(req: &mut IncomingRequest, trace: RequestTrace<
     );
     if let Some(turn_id) = trace.amux_turn_id {
         amux.insert("amuxTurnId".to_string(), Value::String(turn_id.formatted()));
+    }
+}
+
+fn inject_session_list_amux_metadata(session: &mut Value, metadata: &SessionListAmuxMetadata) {
+    let Value::Object(session) = session else {
+        return;
+    };
+    let Some(meta) = object_field(session, "_meta") else {
+        return;
+    };
+    let Some(amux) = object_field(meta, "amux") else {
+        return;
+    };
+
+    amux.insert(
+        "proxySessionId".to_string(),
+        Value::String(metadata.proxy_session_id.clone()),
+    );
+    amux.insert(
+        "subscriberCount".to_string(),
+        Value::Number(serde_json::Number::from(metadata.subscriber_count)),
+    );
+    if let Some(driving_subscriber) = metadata.driving_subscriber.as_ref() {
+        amux.insert(
+            "drivingSubscriber".to_string(),
+            Value::String(driving_subscriber.clone()),
+        );
+    } else {
+        amux.remove("drivingSubscriber");
     }
 }
 
@@ -409,6 +485,7 @@ struct PendingRequest {
     peer_id: String,
     original_id: Id,
     handshake: Option<HandshakeKind>,
+    decorate_session_list: bool,
 }
 
 /// Lifecycle of an agent-initiated request id while we wait for the first
@@ -423,6 +500,8 @@ enum AgentReqState {
 
 struct SessionInner {
     session_id: String,
+    session_list_index: Arc<SessionListMetadataIndex>,
+    canonical_session_id: Option<String>,
     subscribers: HashMap<String, Subscriber>,
     next_mux_id: u64,
     pending: HashMap<u64, PendingRequest>,
@@ -465,7 +544,12 @@ struct SessionInner {
 }
 
 impl SessionInner {
-    fn new(session_id: String, replay_policy: ReplayTurns, meta_propagate: bool) -> Self {
+    fn new(
+        session_id: String,
+        replay_policy: ReplayTurns,
+        meta_propagate: bool,
+        session_list_index: Arc<SessionListMetadataIndex>,
+    ) -> Self {
         let replay_log = match replay_policy {
             ReplayTurns::Disabled => None,
             ReplayTurns::Unbounded => Some(VecDeque::new()),
@@ -479,6 +563,8 @@ impl SessionInner {
         };
         Self {
             session_id,
+            session_list_index,
+            canonical_session_id: None,
             subscribers: HashMap::new(),
             next_mux_id: FIRST_MUX_ID,
             pending: HashMap::new(),
@@ -494,6 +580,69 @@ impl SessionInner {
             last_replay_reset: None,
             meta_propagate,
             agent_pending: HashMap::new(),
+        }
+    }
+
+    fn set_canonical_session_id(&mut self, acp_session_id: &str) {
+        if self.canonical_session_id.as_deref() == Some(acp_session_id) {
+            self.publish_session_list_metadata();
+            return;
+        }
+        if let Some(previous) = self
+            .canonical_session_id
+            .replace(acp_session_id.to_string())
+        {
+            self.session_list_index
+                .remove_if_proxy(&previous, &self.session_id);
+        }
+        self.publish_session_list_metadata();
+    }
+
+    fn publish_session_list_metadata(&self) {
+        let Some(acp_session_id) = self.canonical_session_id.as_deref() else {
+            return;
+        };
+        if self.subscribers.is_empty() {
+            self.session_list_index
+                .remove_if_proxy(acp_session_id, &self.session_id);
+            return;
+        }
+        self.session_list_index.upsert(
+            acp_session_id,
+            SessionListAmuxMetadata {
+                proxy_session_id: self.session_id.clone(),
+                subscriber_count: self.subscribers.len(),
+                driving_subscriber: self.driving_subscriber_peer_id.clone(),
+            },
+        );
+    }
+
+    fn clear_session_list_metadata(&self) {
+        if let Some(acp_session_id) = self.canonical_session_id.as_deref() {
+            self.session_list_index
+                .remove_if_proxy(acp_session_id, &self.session_id);
+        }
+    }
+
+    fn decorate_session_list_response(&self, resp: &mut IncomingResponse) {
+        let Some(result) = resp.result.as_mut() else {
+            return;
+        };
+        let Some(sessions) = result.get_mut("sessions").and_then(Value::as_array_mut) else {
+            return;
+        };
+        for session in sessions {
+            let Some(acp_session_id) = session
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let Some(metadata) = self.session_list_index.get(&acp_session_id) else {
+                continue;
+            };
+            inject_session_list_amux_metadata(session, &metadata);
         }
     }
 
@@ -535,6 +684,7 @@ impl SessionInner {
             "subscriber joined session",
         );
         self.subscribers.insert(peer_id.clone(), subscriber);
+        self.publish_session_list_metadata();
 
         if let Some(sub) = self.subscribers.get(&peer_id) {
             for entry in snapshot {
@@ -616,9 +766,11 @@ impl SessionInner {
             self.driving_subscriber_peer_id = None;
         }
         if self.subscribers.is_empty() {
+            self.clear_session_list_metadata();
             tracing::info!(session = %self.session_id, "last subscriber gone; ending session");
             return true;
         }
+        self.publish_session_list_metadata();
         false
     }
 
@@ -1075,6 +1227,7 @@ impl SessionInner {
         self.next_mux_id += 1;
         let original_id = req.id.clone();
         let is_prompt = req.method == "session/prompt";
+        let decorate_session_list = req.method == "session/list";
         let amux_turn_id = if is_prompt {
             let turn_id = AmuxTurnId(self.next_amux_turn_id);
             self.next_amux_turn_id += 1;
@@ -1088,6 +1241,7 @@ impl SessionInner {
                 peer_id: peer_id.to_string(),
                 original_id,
                 handshake,
+                decorate_session_list,
             },
         );
         req.id = Id::Number(mux_id as i64);
@@ -1269,6 +1423,7 @@ impl SessionInner {
         if self.driving_subscriber_peer_id.as_deref() != Some(peer_id) {
             tracing::debug!(session = %self.session_id, %peer_id, "driving subscriber updated");
             self.driving_subscriber_peer_id = Some(peer_id.to_string());
+            self.publish_session_list_metadata();
         }
     }
 
@@ -1455,15 +1610,23 @@ impl SessionInner {
                         tracing::info!(session = %self.session_id, "caching session/new result");
                         self.session_new_cache = Some(result.clone());
                     }
+                    if let Some(acp_session_id) = result.get("sessionId").and_then(Value::as_str) {
+                        self.set_canonical_session_id(acp_session_id);
+                    }
                 }
                 HandshakeKind::SessionLoad {
                     loaded_session_id,
                     replay_start_len,
                 } => {
                     self.rebind_canonical_session(&loaded_session_id);
+                    self.set_canonical_session_id(&loaded_session_id);
                     self.reset_replay_generation_after_load(&loaded_session_id, replay_start_len);
                 }
             }
+        }
+
+        if pr.decorate_session_list {
+            self.decorate_session_list_response(&mut resp);
         }
 
         resp.id = pr.original_id;
@@ -1521,11 +1684,12 @@ impl SessionInner {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SessionOptions {
     pub replay_policy: ReplayTurns,
     pub session_ttl: Duration,
     pub meta_propagate: bool,
+    pub session_list_index: Arc<SessionListMetadataIndex>,
 }
 
 pub fn spawn_session(
@@ -1589,6 +1753,7 @@ async fn run_session(
         session_id.clone(),
         options.replay_policy,
         options.meta_propagate,
+        options.session_list_index.clone(),
     );
     inner
         .attach(initial_subscriber)
@@ -1696,6 +1861,7 @@ async fn run_session(
         }
     }
 
+    inner.clear_session_list_metadata();
     inner.subscribers.clear();
     if let Err(err) = agent.shutdown(SHUTDOWN_TIMEOUT).await {
         tracing::warn!(session = %session_id, error = %err, "agent shutdown error");

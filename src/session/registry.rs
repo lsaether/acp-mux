@@ -17,7 +17,8 @@ use crate::agent::process::AgentProcess;
 use crate::cli::ReplayTurns;
 use crate::multiplex::subscriber::Subscriber;
 use crate::session::state::{
-    AttachError, SessionHandle, SessionMsg, SessionOptions, SessionSnapshot, spawn_session,
+    AttachError, SessionHandle, SessionListMetadataIndex, SessionMsg, SessionOptions,
+    SessionSnapshot, spawn_session,
 };
 
 #[derive(Debug, Clone)]
@@ -43,6 +44,7 @@ pub struct SessionRegistry {
     replay_policy: ReplayTurns,
     session_ttl: Duration,
     meta_propagate: bool,
+    session_list_index: Arc<SessionListMetadataIndex>,
     sessions: Mutex<HashMap<String, SessionHandle>>,
 }
 
@@ -66,6 +68,7 @@ impl SessionRegistry {
             replay_policy,
             session_ttl,
             meta_propagate,
+            session_list_index: Arc::new(SessionListMetadataIndex::new()),
             sessions: Mutex::new(HashMap::new()),
         })
     }
@@ -148,6 +151,7 @@ impl SessionRegistry {
                 replay_policy: self.replay_policy,
                 session_ttl: self.session_ttl,
                 meta_propagate: self.meta_propagate,
+                session_list_index: self.session_list_index.clone(),
             },
         );
         sessions.insert(session_id.to_string(), handle.clone());

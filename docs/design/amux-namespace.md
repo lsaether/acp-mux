@@ -295,14 +295,43 @@ Fields:
 
 Existing `params._meta` keys and unrelated namespaces are preserved. If
 `_meta.amux` already exists as an object, amux merges into it and leaves
-unknown keys intact. Agent → subscriber frames are not rewritten by this
-feature; any `_meta` emitted by the agent flows back untouched.
+unknown keys intact. The `--meta-propagate` request-trace feature does not
+rewrite arbitrary agent → subscriber frames.
 
-Follow-up work: decorating `session/list` **responses** with live mux state
-(such as subscriber count and mux/proxy session id for returned
-`sessions[]` entries) is intentionally not part of request trace propagation.
-That requires registry-wide lookup across every returned session id and
-should land as a separate change.
+## `_meta.amux` `session/list` response decoration
+
+Independently of `--meta-propagate`, amux decorates `session/list` responses
+when an upstream entry corresponds to a live mux room. The mux learns that
+mapping from successful `session/new` and `session/load` responses: the
+upstream ACP `sessionId` becomes the lookup key, while the WebSocket
+`?session=` value remains the mux/proxy room id.
+
+For each `result.sessions[]` entry whose `sessionId` matches live mux state,
+amux merges fields under `sessions[i]._meta.amux`:
+
+```json
+{
+  "sessionId": "sess-mock",
+  "_meta": {
+    "amux": {
+      "proxySessionId": "work",
+      "subscriberCount": 2,
+      "drivingSubscriber": "desktop-1"
+    }
+  }
+}
+```
+
+Fields:
+
+- `proxySessionId` — mux room/session id from the attach URL.
+- `subscriberCount` — number of currently attached subscribers.
+- `drivingSubscriber` — optional peer id that last sent a substantive
+  non-`initialize` request.
+
+Entries with no live mux match are left unchanged. Existing `sessions[i]._meta`
+keys and unknown `sessions[i]._meta.amux` keys are preserved; amux-owned fields
+above are refreshed with current live state.
 
 ## Late-join / replay log
 
