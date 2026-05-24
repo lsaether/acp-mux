@@ -54,14 +54,14 @@ Health and debug endpoints:
 - **JSON-RPC envelope routing.** The mux parses only the envelope (`id`, `method`, `params`, `result`, `error`). Payloads are forwarded byte-for-byte. Policy keys off the `method` string.
 - **Per-session id translation.** Each subscriber's request `id` is rewritten to a per-session `mux_id` before forwarding; the response is rewritten back and sent only to the originator.
 - **`initialize` / `session/new` caching.** First response is cached; later joiners are answered locally without re-sending to the agent.
-- **Broadcast agent-initiated requests.** Agent-initiated requests (e.g. `session/request_permission`) are fanned out to every attached subscriber; any peer can reply. The first reply for a given id is forwarded to the agent and later replies for the same id are dropped, so the agent always sees exactly one response.
+- **Broadcast agent-initiated requests.** Agent-initiated requests (e.g. `session/request_permission`) are fanned out live to every attached subscriber; any peer can reply. The mux also emits inert `amux/agent_request_opened` lifecycle metadata for replay/audit context. The first reply for a given id is forwarded to the agent and later replies for the same id are dropped, so the agent always sees exactly one response.
 - **Turn serialization.** Concurrent `session/prompt` while a turn is in flight is rejected with JSON-RPC `-32001`. The last subscriber to issue a substantive request is still surfaced as the "driving subscriber" in `/debug/sessions` and `amux/turn_started` for UI attribution.
 - **Opt-in request trace metadata.** With `--meta-propagate`, outbound subscriber → agent requests get mux-owned `params._meta.amux` fields (`peerId`, `peerName`, `role`, `muxId`, and `amuxTurnId` for prompts) for cross-client debugging. Default mode leaves request payload metadata unchanged.
 - **Cold-start session discovery.** `GET /acp/sessions` runs a transient agent-side `session/list` query before any WebSocket attach, useful for dashboards that need to browse persisted sessions before choosing one to resume.
 - **Live `session/list` decoration.** Returned `sessions[]` entries that match a live muxed upstream session get `sessions[i]._meta.amux` fields (`proxySessionId`, `subscriberCount`, optional `drivingSubscriber`), preserving existing `_meta` keys and leaving non-live entries unchanged.
-- **`amux/*` notification namespace.** The mux publishes its own metadata out-of-band: `amux/peer_joined`, `amux/peer_left`, `amux/turn_started`, `amux/turn_complete`, `amux/turn_cancelled`, `amux/session_busy`, `amux/agent_request_resolved`. ACP frames stay clean; clients see two distinguishable channels and demultiplex by method prefix.
+- **`amux/*` notification namespace.** The mux publishes its own metadata out-of-band: `amux/peer_joined`, `amux/peer_left`, `amux/turn_started`, `amux/turn_complete`, `amux/turn_cancelled`, `amux/session_busy`, `amux/agent_request_opened`, `amux/agent_request_resolved`. ACP frames stay clean; clients see two distinguishable channels and demultiplex by method prefix.
 - **Cancellation.** `$/cancel_request` (request-cancellation RFD) works both directions: subscribers can cancel their own in-flight requests; agents can cancel agent-initiated requests (broadcast to peers + `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`). The amux extension `amux/cancel_active_turn` lets *any* attached peer cancel the in-flight turn (not just the driver) — internally it sends ACP-native `session/cancel { sessionId }` toward the agent and emits `amux/turn_cancelled` to peers.
-- **Replay log.** Every broadcast-tier frame (`amux/*` + agent notifications) is appended; a late joiner receives the full history before any live event.
+- **Replay log.** Every broadcast-tier frame (`amux/*` + agent notifications) is appended; a late joiner receives the full history before any live event. Raw actionable agent-initiated requests are live-only and are not replayed; late joiners see the inert `amux/agent_request_opened` + `amux/agent_request_resolved` lifecycle pair instead.
 - **TTL grace.** Last subscriber leaving starts a countdown; a reconnect within `--session-ttl-seconds` reuses the same subprocess with all of its caches intact.
 
 ## Client contract
@@ -70,6 +70,7 @@ Clients SHOULD:
 
 - Treat `amux/peer_joined` (with `peerId == self.peer_id`) as the empty-roster signal — used only by replay log late joiners.
 - Treat `amux/turn_started` / `amux/turn_complete` as turn bookends; the `peerId` field attributes the turn.
+- Treat `amux/agent_request_opened` / `amux/agent_request_resolved` as the non-actionable lifecycle for agent-initiated requests. Only raw live `session/request_permission` requests should create a reply affordance; replayed `amux/agent_request_opened` is context, not a request to answer.
 - Filter `amux/*` frames out of the conversation render and use them for presence / turn UI.
 - Allow the mux to rewrite request `id` fields freely (preserve client-side correlation by tracking your own original ids).
 
@@ -100,7 +101,7 @@ amux parses only JSON-RPC envelopes (`id`, `method`, `params`, `result`, `error`
 | Method | amux | Spec status | Notes |
 |---|---|---|---|
 | `session/update` | ✅ | Core | Broadcast to every attached subscriber; appended to replay log. |
-| `session/request_permission` | ✅ | Core | Broadcast with first-writer-wins reply; `amux/agent_request_resolved` fires when consumed; turn-end sweep cleans up abandoned requests. |
+| `session/request_permission` | ✅ | Core | Broadcast live with first-writer-wins reply; `amux/agent_request_opened` records inert replay context; `amux/agent_request_resolved` fires when consumed; turn-end sweep cleans up abandoned requests. |
 | `$/cancel_request` | ✅ | Draft RFD (optional per spec) | Marks `agent_pending` Consumed; broadcasts to all peers; emits `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`. |
 | `fs/read_text_file`, `fs/write_text_file` | ❌ | Core | Tracked in [#2](https://github.com/lsaether/acp-mux/issues/2). amux currently broadcasts these to subscribers, which is broken for any agent that delegates fs to the client (Codex, claude-code-acp, copilot-acp). Self-handling design agreed; implementation deferred. |
 | `terminal/create`, `terminal/output`, `terminal/wait_for_exit`, `terminal/kill`, `terminal/release` | ❌ | Core | Same as `fs/*` — tracked in [#2](https://github.com/lsaether/acp-mux/issues/2). |
@@ -113,6 +114,7 @@ amux parses only JSON-RPC envelopes (`id`, `method`, `params`, `result`, `error`
 | `amux/turn_started`, `amux/turn_complete` | proxy → subscribers | Turn bookends with `amuxTurnId`. |
 | `amux/turn_cancelled` | proxy → subscribers | Intent broadcast when any peer triggers cancellation. |
 | `amux/session_busy` | proxy → subscribers | Companion to `-32001` rejection on concurrent prompts. |
+| `amux/agent_request_opened` | proxy → subscribers | Non-actionable context for agent-initiated requests; replay-safe companion to the live raw request. |
 | `amux/agent_request_resolved` | proxy → subscribers | Dismissal signal for agent-initiated requests (`request_permission`, etc.). |
 | `amux/cancel_active_turn` | subscriber → proxy | Any peer can cancel the active turn; resolves to ACP-native `session/cancel` toward the agent. |
 

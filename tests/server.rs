@@ -127,15 +127,41 @@ async fn ws_loopback_roundtrip_via_cat() {
     let payload = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
     ws.send(ClientMsg::Text(payload.into())).await.unwrap();
 
-    let received = timeout(Duration::from_secs(2), ws.next())
-        .await
-        .expect("ws recv timeout")
-        .expect("stream ended")
-        .expect("recv err");
-    match received {
-        ClientMsg::Text(t) => assert_eq!(t.as_str(), payload),
-        other => panic!("expected text echo, got {other:?}"),
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_opened = false;
+    let mut saw_echo = false;
+    while std::time::Instant::now() < deadline {
+        let received = timeout(Duration::from_millis(100), ws.next())
+            .await
+            .expect("ws recv timeout")
+            .expect("stream ended")
+            .expect("recv err");
+        let ClientMsg::Text(t) = received else {
+            continue;
+        };
+        if t.as_str() == payload {
+            assert!(
+                saw_opened,
+                "agent request echoes should be preceded by inert amux/agent_request_opened metadata"
+            );
+            saw_echo = true;
+            break;
+        }
+        let v: serde_json::Value = serde_json::from_str(t.as_str()).expect("frame is JSON");
+        if v.get("method") == Some(&serde_json::json!("amux/agent_request_opened")) {
+            saw_opened = true;
+            continue;
+        }
+        panic!("expected text echo or amux/agent_request_opened, got {v:?}");
     }
+    assert!(
+        saw_opened,
+        "expected amux/agent_request_opened before raw echo"
+    );
+    assert!(
+        saw_echo,
+        "expected raw text echo after amux/agent_request_opened"
+    );
 
     ws.send(ClientMsg::Close(None)).await.unwrap();
     drain_until_close(&mut ws).await;
@@ -1515,9 +1541,21 @@ async fn agent_request_resolved_on_turn_end_when_no_reply() {
             .expect("B must have seen the permission/request"),
     );
 
+    // Both peers must see the inert, replayable
+    // amux/agent_request_opened before the cleanup resolution. The raw
+    // session/request_permission stays live-only; the opened sibling is
+    // the durable audit context for replay clients.
+    fn find_opened(frames: &[serde_json::Value], req_id: &serde_json::Value) -> Option<usize> {
+        frames.iter().position(|v| {
+            v.get("method") == Some(&serde_json::json!("amux/agent_request_opened"))
+                && &v["params"]["requestId"] == req_id
+        })
+    }
+
     // Both peers must see exactly one cleanup
     // amux/agent_request_resolved with resolvedBy=mux:turn-ended
-    // for that id, and it must appear before amux/turn_complete.
+    // for that id, and it must appear after opened but before
+    // amux/turn_complete.
     fn find_resolved(frames: &[serde_json::Value], req_id: &serde_json::Value) -> Option<usize> {
         frames.iter().position(|v| {
             v.get("method") == Some(&serde_json::json!("amux/agent_request_resolved"))
@@ -1532,14 +1570,36 @@ async fn agent_request_resolved_on_turn_end_when_no_reply() {
     }
 
     for (label, frames) in [("A", &a_frames), ("B", &b_frames)] {
+        let opened_idx = find_opened(frames, &perm_id_a).unwrap_or_else(|| {
+            panic!("{label}: missing amux/agent_request_opened; frames: {frames:?}")
+        });
         let resolved_idx = find_resolved(frames, &perm_id_a).unwrap_or_else(|| {
             panic!("{label}: missing mux:turn-ended cleanup; frames: {frames:?}")
         });
         let turn_complete_idx = find_turn_complete(frames)
             .unwrap_or_else(|| panic!("{label}: missing amux/turn_complete; frames: {frames:?}"));
         assert!(
+            opened_idx < resolved_idx,
+            "{label}: opened must precede cleanup; opened@{opened_idx} resolved@{resolved_idx}",
+        );
+        assert!(
             resolved_idx < turn_complete_idx,
             "{label}: cleanup must precede turn_complete; resolved@{resolved_idx} turn_complete@{turn_complete_idx}",
+        );
+        let opened = &frames[opened_idx];
+        assert_eq!(
+            opened["params"]["requestMethod"],
+            serde_json::json!("session/request_permission"),
+            "{label}: opened should name the original agent request method"
+        );
+        assert_eq!(
+            opened["params"]["requestParams"]["options"][0]["optionId"],
+            serde_json::json!("allow_once"),
+            "{label}: opened should carry enough original request context for replay UI"
+        );
+        assert!(
+            opened["params"].get("amuxTurnId").is_some(),
+            "{label}: opened should be associated with the active amux turn"
         );
         // result and error are both absent on the cleanup broadcast.
         let resolved = &frames[resolved_idx];
@@ -1552,6 +1612,121 @@ async fn agent_request_resolved_on_turn_end_when_no_reply() {
             "{label}: cleanup must not carry an error; got {resolved:?}",
         );
     }
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+/// Resolved agent-initiated requests should replay as an inert
+/// amux/agent_request_opened + amux/agent_request_resolved lifecycle pair,
+/// not as a stale actionable JSON-RPC request. Live subscribers still see
+/// and answer the raw session/request_permission exactly once.
+#[tokio::test]
+async fn agent_request_opened_replayed_to_late_joiner_without_actionable_request() {
+    let (addr, _) = spawn_server_with_mock_env(&[
+        ("MOCK_ACP_EMIT_PERMISSION", "1"),
+        ("MOCK_ACP_ECHO_RESPONSES", "1"),
+        ("MOCK_ACP_PROMPT_DELAY_MS", "200"),
+    ])
+    .await;
+    let url_a = format!("ws://{addr}/acp?session=agent-request-opened-replay&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=agent-request-opened-replay&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut live_frames = vec![];
+    let perm_id = loop {
+        let msg = timeout(Duration::from_secs(3), ws_a.next())
+            .await
+            .expect("permission wait timed out")
+            .expect("A stream ended")
+            .expect("A recv error");
+        if let ClientMsg::Text(t) = msg {
+            let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+            let is_perm = v.get("method") == Some(&serde_json::json!("session/request_permission"));
+            live_frames.push(v.clone());
+            if is_perm {
+                break v["id"].clone();
+            }
+        }
+    };
+
+    let reply = format!(
+        r#"{{"jsonrpc":"2.0","id":{perm_id},"result":{{"outcome":{{"outcome":"selected","optionId":"allow_once"}}}}}}"#,
+    );
+    ws_a.send(ClientMsg::Text(reply.into())).await.unwrap();
+    live_frames.extend(drain_for(&mut ws_a, Duration::from_secs(2)).await);
+
+    assert!(
+        live_frames.iter().any(|v| {
+            v.get("method") == Some(&serde_json::json!("mock/response_echo"))
+                && v["params"]["id"] == perm_id
+        }),
+        "agent must receive the live subscriber permission reply; frames: {live_frames:?}"
+    );
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let replay_frames = drain_for(&mut ws_b, Duration::from_millis(500)).await;
+
+    let opened_idx = replay_frames
+        .iter()
+        .position(|v| {
+            v.get("method") == Some(&serde_json::json!("amux/agent_request_opened"))
+                && v["params"]["requestId"] == perm_id
+        })
+        .unwrap_or_else(|| {
+            panic!("late joiner must replay amux/agent_request_opened; frames: {replay_frames:?}")
+        });
+    let resolved_idx = replay_frames
+        .iter()
+        .position(|v| {
+            v.get("method") == Some(&serde_json::json!("amux/agent_request_resolved"))
+                && v["params"]["requestId"] == perm_id
+        })
+        .unwrap_or_else(|| {
+            panic!("late joiner must replay amux/agent_request_resolved; frames: {replay_frames:?}")
+        });
+    assert!(
+        opened_idx < resolved_idx,
+        "late replay must present opened before resolved; opened@{opened_idx} resolved@{resolved_idx}"
+    );
+    let opened = &replay_frames[opened_idx];
+    assert_eq!(
+        opened["params"]["requestMethod"],
+        serde_json::json!("session/request_permission")
+    );
+    assert_eq!(opened["params"]["requestId"], perm_id);
+    let expected_tool_call_id = format!(
+        "mock-tool-{}",
+        perm_id.as_u64().expect("numeric request id")
+    );
+    assert_eq!(
+        opened["params"]["requestParams"]["toolCall"]["toolCallId"],
+        serde_json::json!(expected_tool_call_id)
+    );
+    assert!(
+        replay_frames
+            .iter()
+            .all(|v| v.get("method") != Some(&serde_json::json!("session/request_permission"))),
+        "late replay must not include the stale actionable request; frames: {replay_frames:?}"
+    );
 
     let _ = ws_a.send(ClientMsg::Close(None)).await;
     let _ = ws_b.send(ClientMsg::Close(None)).await;

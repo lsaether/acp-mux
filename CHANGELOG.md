@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- **Replay-safe agent request lifecycle openings.** Agent-initiated requests now emit inert `amux/agent_request_opened` notifications before the live raw request, preserving request context for late-join replay without replaying actionable ACP requests. Late joiners see `amux/agent_request_opened` followed by `amux/agent_request_resolved`; live subscribers still answer only the original `session/request_permission`. Fixes [#31](https://github.com/lsaether/acp-mux/issues/31).
+
 ### Fixed
 
 - **Active-turn cancellation for Hermes-backed sessions.** `amux/cancel_active_turn` now forwards ACP-native `session/cancel { sessionId }` for the active prompt while preserving the immediate `amux/turn_cancelled` intent broadcast and later `amux/turn_complete` settlement event. Fixes [#29](https://github.com/lsaether/acp-mux/issues/29).

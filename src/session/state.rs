@@ -35,17 +35,19 @@
 //!   originator only. If the original request was the first `initialize`
 //!   or `session/new`, cache the `result` for later joiners. If it matches
 //!   `active_turn_mux_id`, clear the active turn.
-//! - `request` → broadcast to every attached subscriber and record the
-//!   agent's request id as `InFlight`. Whichever subscriber replies first
-//!   gets its response forwarded to the agent; the id transitions to
-//!   `Consumed` and any later responses with the same id are dropped with
-//!   a debug log. On the InFlight → Consumed transition the mux also
-//!   broadcasts `amux/agent_request_resolved { requestId, resolvedBy,
-//!   result | error }` so peers that lost the race (or never replied)
-//!   can dismiss the request from their UI. This lets any attached peer
-//!   (not just the driver) confirm an agent-initiated request while
-//!   preserving the JSON-RPC contract that the agent sees exactly one
-//!   reply per id.
+//! - `request` → emit inert `amux/agent_request_opened` metadata,
+//!   broadcast the raw request to every live attached subscriber, and
+//!   record the agent's request id as `InFlight`. Whichever subscriber
+//!   replies first gets its response forwarded to the agent; the id
+//!   transitions to `Consumed` and any later responses with the same id
+//!   are dropped with a debug log. On the InFlight → Consumed transition
+//!   the mux also broadcasts `amux/agent_request_resolved { requestId,
+//!   resolvedBy, result | error }` so peers that lost the race (or never
+//!   replied) can dismiss the request from their UI. Replay clients see
+//!   the non-actionable opened/resolved lifecycle, not the stale raw ACP
+//!   request. This lets any attached peer (not just the driver) confirm
+//!   an agent-initiated request while preserving the JSON-RPC contract
+//!   that the agent sees exactly one reply per id.
 //!
 //! Turn-end cleanup: when the session/prompt response arrives and
 //! `active_turn_mux_id` clears, the mux sweeps every `agent_pending`
@@ -1548,7 +1550,7 @@ impl SessionInner {
                 false
             }
             Incoming::Request(req) => {
-                self.route_agent_request(req.id, line);
+                self.route_agent_request(req, line);
                 false
             }
         }
@@ -1574,24 +1576,52 @@ impl SessionInner {
 
     /// Fan out an agent-initiated request to every attached subscriber and
     /// record the request id in `agent_pending` so the first subscriber
-    /// reply wins. Not broadcast-tier — not appended to the replay log
-    /// (replies are per-subscriber, and rejoining peers shouldn't be
-    /// asked to confirm something already resolved).
-    fn route_agent_request(&mut self, id: Id, line: Vec<u8>) {
+    /// reply wins. The raw request is not replayed — replies are
+    /// per-subscriber, and rejoining peers shouldn't be asked to confirm
+    /// something already resolved. Instead, emit an inert
+    /// `amux/agent_request_opened` sibling through `broadcast` first so
+    /// the request context is durable for late joiners and ordered before
+    /// the matching `amux/agent_request_resolved` lifecycle event.
+    fn route_agent_request(&mut self, req: IncomingRequest, line: Vec<u8>) {
+        let id = req.id.clone();
         if self.subscribers.is_empty() {
             tracing::warn!(
                 session = %self.session_id,
                 id = ?id,
+                method = %req.method,
                 "agent-initiated request with no attached subscribers; dropping",
             );
             return;
         }
         self.agent_pending
             .insert(id.clone(), AgentReqState::InFlight);
+        let request_id_value = match serde_json::to_value(&id) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    error = %err,
+                    id = ?id,
+                    method = %req.method,
+                    "failed to serialize agent-request id; skipping opened lifecycle broadcast",
+                );
+                Value::Null
+            }
+        };
+        let opened = amux::agent_request_opened(
+            &self.session_id,
+            &request_id_value,
+            &req.method,
+            req.params.as_ref(),
+            self.active_amux_turn_id,
+        );
+        self.broadcast(opened);
         tracing::debug!(
             session = %self.session_id,
             id = ?id,
+            method = %req.method,
             subscribers = self.subscribers.len(),
+            amux_turn_id = ?self.active_amux_turn_id.map(|t| t.formatted()),
             "broadcasting agent-initiated request",
         );
         let frame = Bytes::from(line);
@@ -1711,9 +1741,10 @@ impl SessionInner {
     /// since no subscribers were lost.
     ///
     /// Only broadcast-tier frames flow through here: amux/* notifications
-    /// and the agent's session/update (and other notification-shaped)
-    /// frames. Per-subscriber frames (responses, agent-initiated requests)
-    /// do NOT go through `broadcast` and are NOT logged.
+    /// (including inert agent-request lifecycle metadata) and the agent's
+    /// session/update (and other notification-shaped) frames.
+    /// Per-subscriber frames (responses, raw actionable agent-initiated
+    /// requests) do NOT go through `broadcast` and are NOT logged.
     fn broadcast(&mut self, frame: impl Into<Bytes>) -> bool {
         let frame: Bytes = frame.into();
         if let Some(log) = self.replay_log.as_mut() {

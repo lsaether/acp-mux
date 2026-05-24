@@ -15,6 +15,7 @@ const METHOD_PEER_LEFT: &str = "amux/peer_left";
 const METHOD_TURN_STARTED: &str = "amux/turn_started";
 const METHOD_TURN_COMPLETE: &str = "amux/turn_complete";
 const METHOD_SESSION_BUSY: &str = "amux/session_busy";
+const METHOD_AGENT_REQUEST_OPENED: &str = "amux/agent_request_opened";
 const METHOD_AGENT_REQUEST_RESOLVED: &str = "amux/agent_request_resolved";
 const METHOD_TURN_CANCELLED: &str = "amux/turn_cancelled";
 
@@ -92,6 +93,23 @@ struct SessionBusyParams<'a> {
     busy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     held_by: Option<&'a str>,
+}
+
+/// Inert, mux-owned lifecycle sibling for an agent-initiated JSON-RPC
+/// request. The raw request remains the only actionable ACP frame and is
+/// forwarded live to attached subscribers only; this notification carries
+/// the request context that is safe to retain in replay logs for late
+/// joiners and audit UIs.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRequestOpenedParams<'a> {
+    session_id: &'a str,
+    request_id: &'a serde_json::Value,
+    request_method: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_params: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amux_turn_id: Option<&'a str>,
 }
 
 /// Sibling of an agent-initiated request that the multiplexer broadcast
@@ -235,6 +253,26 @@ pub fn turn_cancelled(
     )
 }
 
+pub fn agent_request_opened(
+    session_id: &str,
+    request_id: &serde_json::Value,
+    request_method: &str,
+    request_params: Option<&serde_json::Value>,
+    amux_turn_id: Option<AmuxTurnId>,
+) -> Vec<u8> {
+    let id = amux_turn_id.map(AmuxTurnId::formatted);
+    encode(
+        METHOD_AGENT_REQUEST_OPENED,
+        AgentRequestOpenedParams {
+            session_id,
+            request_id,
+            request_method,
+            request_params,
+            amux_turn_id: id.as_deref(),
+        },
+    )
+}
+
 pub fn agent_request_resolved(
     session_id: &str,
     request_id: &serde_json::Value,
@@ -336,6 +374,47 @@ mod tests {
 
         let v = parse(&session_busy("work", false, None));
         assert!(v["params"].get("heldBy").is_none());
+    }
+
+    #[test]
+    fn agent_request_opened_shape() {
+        let req_id = json!(10001);
+        let params = json!({
+            "sessionId": "sess-mock",
+            "options": [{"optionId": "allow_once"}],
+        });
+        let v = parse(&agent_request_opened(
+            "work",
+            &req_id,
+            "session/request_permission",
+            Some(&params),
+            Some(AmuxTurnId(7)),
+        ));
+        assert_eq!(v["method"], json!("amux/agent_request_opened"));
+        assert!(v.get("id").is_none());
+        assert_eq!(v["params"]["sessionId"], json!("work"));
+        assert_eq!(v["params"]["requestId"], req_id);
+        assert_eq!(
+            v["params"]["requestMethod"],
+            json!("session/request_permission")
+        );
+        assert_eq!(v["params"]["requestParams"], params);
+        assert_eq!(v["params"]["amuxTurnId"], json!("at-7"));
+    }
+
+    #[test]
+    fn agent_request_opened_omits_missing_optionals() {
+        let req_id = json!("perm-7");
+        let v = parse(&agent_request_opened(
+            "work",
+            &req_id,
+            "session/request_permission",
+            None,
+            None,
+        ));
+        assert_eq!(v["params"]["requestId"], req_id);
+        assert!(v["params"].get("requestParams").is_none());
+        assert!(v["params"].get("amuxTurnId").is_none());
     }
 
     #[test]
