@@ -250,6 +250,12 @@ impl SessionRegistry {
             .agent_cmd
             .as_ref()
             .ok_or(RegistryError::AgentCmdMissing)?;
+        let agent_cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|err| {
+                tracing::warn!(error = %err, "failed to read current dir for session context");
+                String::new()
+            });
         let agent = AgentProcess::spawn(&cmd.program, &cmd.args)
             .await
             .map_err(RegistryError::AgentSpawn)?;
@@ -262,6 +268,7 @@ impl SessionRegistry {
                 session_ttl: self.session_ttl,
                 meta_propagate: self.meta_propagate,
                 session_list_index: self.session_list_index.clone(),
+                agent_cwd,
             },
         );
         sessions.insert(session_id.to_string(), handle.clone());

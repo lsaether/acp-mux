@@ -178,6 +178,28 @@ the replay log (see below), which already contains `peer_joined` events for
 every peer still in the session — no per-peer presence replay needed at
 attach time.
 
+### `amux/session_context`
+
+Sent directly to each subscriber on attach with the mux-owned execution
+context for the room. This is not an ACP session metadata claim: it identifies
+the cwd inherited by the agent subprocess, which is the context used for
+tools/terminal work even if a client connected from a different local cwd.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "amux/session_context",
+  "params": {
+    "sessionId": "work",
+    "cwd": "/home/volt/Code/acp-mux"
+  }
+}
+```
+
+- Emitted once per attach to the attaching subscriber.
+- Clients can use it for chrome/status UI that should reflect the agent's
+  actual working directory rather than the local client's launch cwd.
+
 ### `amux/session_busy`
 
 Broadcast when a `session/prompt` is rejected because another turn is
