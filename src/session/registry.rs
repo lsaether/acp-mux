@@ -24,7 +24,7 @@ use crate::session::state::{
     SessionSnapshot, spawn_session,
 };
 
-const CONTROL_PLANE_AGENT_TIMEOUT: Duration = Duration::from_secs(2);
+const CONTROL_PLANE_AGENT_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone)]
 pub struct AgentCmd {
@@ -347,5 +347,15 @@ impl SessionRegistry {
     pub async fn live_session_count(&self) -> usize {
         let sessions = self.sessions.lock().await;
         sessions.values().filter(|h| h.is_alive()).count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_plane_agent_timeout_allows_slow_hermes_mcp_startup() {
+        assert!(CONTROL_PLANE_AGENT_TIMEOUT >= Duration::from_secs(8));
     }
 }
