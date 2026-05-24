@@ -2092,12 +2092,13 @@ async fn agent_cancels_permission_request_fans_out() {
 }
 
 /// `amux/cancel_active_turn` from a non-driver peer broadcasts
-/// `amux/turn_cancelled` to every peer AND synthesizes a
-/// `$/cancel_request` to the agent using the active turn's `mux_id`.
+/// `amux/turn_cancelled` to every peer AND sends ACP-native
+/// `session/cancel` to the agent using the active turn's `sessionId`.
 #[tokio::test]
 async fn amux_cancel_active_turn_by_non_driver() {
     let (addr, _) = spawn_server_with_mock_env(&[
         ("MOCK_ACP_ECHO_CANCELS", "1"),
+        ("MOCK_ACP_ECHO_SESSION_CANCELS", "1"),
         ("MOCK_ACP_PROMPT_DELAY_MS", "1500"),
     ])
     .await;
@@ -2157,14 +2158,25 @@ async fn amux_cancel_active_turn_by_non_driver() {
         );
     }
 
-    // The agent should have received a translated $/cancel_request for
-    // the prompt's mux_id (initialize=1, session/new=2, prompt=3).
-    let cancel_echo = a_frames
+    // The agent should have received ACP-native session/cancel for the
+    // active prompt's upstream ACP session id, not a request-id cancel.
+    let session_cancel_echo = a_frames
         .iter()
         .chain(b_frames.iter())
-        .find(|v| v.get("method") == Some(&serde_json::json!("mock/cancel_echo")))
-        .expect("agent should have received the synthesized cancel");
-    assert_eq!(cancel_echo["params"]["requestId"], serde_json::json!(3));
+        .find(|v| v.get("method") == Some(&serde_json::json!("mock/session_cancel_echo")))
+        .expect("agent should have received session/cancel for the active turn");
+    assert_eq!(
+        session_cancel_echo["params"]["sessionId"],
+        serde_json::json!("sess-mock")
+    );
+    let saw_request_cancel_echo = a_frames
+        .iter()
+        .chain(b_frames.iter())
+        .any(|v| v.get("method") == Some(&serde_json::json!("mock/cancel_echo")));
+    assert!(
+        !saw_request_cancel_echo,
+        "amux/cancel_active_turn must not use $/cancel_request for active prompts"
+    );
 
     let _ = ws_a.send(ClientMsg::Close(None)).await;
     let _ = ws_b.send(ClientMsg::Close(None)).await;
@@ -2174,7 +2186,11 @@ async fn amux_cancel_active_turn_by_non_driver() {
 /// no broadcast, no agent traffic.
 #[tokio::test]
 async fn amux_cancel_active_turn_with_no_active_turn_dropped() {
-    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_ECHO_CANCELS", "1")]).await;
+    let (addr, _) = spawn_server_with_mock_env(&[
+        ("MOCK_ACP_ECHO_CANCELS", "1"),
+        ("MOCK_ACP_ECHO_SESSION_CANCELS", "1"),
+    ])
+    .await;
     let url = format!("ws://{addr}/acp?session=nt&peer_id=A");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
@@ -2192,12 +2208,15 @@ async fn amux_cancel_active_turn_with_no_active_turn_dropped() {
     let saw_cancel_echo = frames
         .iter()
         .any(|v| v.get("method") == Some(&serde_json::json!("mock/cancel_echo")));
+    let saw_session_cancel_echo = frames
+        .iter()
+        .any(|v| v.get("method") == Some(&serde_json::json!("mock/session_cancel_echo")));
     assert!(
         !saw_cancelled,
         "should not broadcast turn_cancelled when no turn active"
     );
     assert!(
-        !saw_cancel_echo,
+        !saw_cancel_echo && !saw_session_cancel_echo,
         "should not forward cancel to agent when no turn active"
     );
 

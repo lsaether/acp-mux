@@ -415,22 +415,24 @@ historical events but the protocol shape is identical.
 
 ## Cancellation
 
-amux implements the [request-cancellation
-RFD](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/request-cancellation.mdx)
-with strict per-peer semantics: a subscriber can `$/cancel_request`
-only its own in-flight requests. Cross-peer "stop the active turn" is
-handled by the amux extension `amux/cancel_active_turn`, which
-internally synthesizes a `$/cancel_request` toward the agent — so the
-agent only ever sees standard, RFD-compliant cancellation.
+amux keeps two cancellation paths distinct:
+
+- `$/cancel_request` is strict request-id cancellation in the sender's
+  JSON-RPC id space.
+- `amux/cancel_active_turn` is a mux extension for cross-peer "stop the
+  current turn" and resolves to ACP-native `session/cancel` for the
+  active upstream ACP `sessionId`.
 
 ### `$/cancel_request` — strict
 
-**Subscriber → agent.** amux finds the entry in its `pending` table
-matching `(peer_id, original_id)`, rewrites `requestId` to the
+**Subscriber → agent.** When a subscriber sends `$/cancel_request`,
+amux treats the `requestId` as belonging to that subscriber's local JSON-RPC
+id space. It looks up `(peer_id, original_id)`, rewrites `requestId` to the
 corresponding `mux_id`, and forwards the notification to the agent.
 If no matching entry exists (the id was already resolved, or the
 subscriber is trying to cancel another subscriber's request), the
-cancel is dropped silently.
+cancel is dropped silently. Cross-peer "stop the active turn" uses
+`amux/cancel_active_turn` instead.
 
 **Agent → subscribers.** When the agent emits `$/cancel_request` for
 an in-flight agent-initiated request (in practice `session/request_permission`),
@@ -457,9 +459,9 @@ When amux receives this from any attached peer (including the
 driver):
 
 1. If no active turn, drop silently.
-2. Look up `active_turn_mux_id` → `(driver_peer_id, mux_id)`.
+2. Look up the active turn's driver and ACP `sessionId`.
 3. Broadcast `amux/turn_cancelled { cancelledBy, originalDriver, reason? }`.
-4. Synthesize and forward a `$/cancel_request { requestId: mux_id }` to the agent.
+4. Forward `session/cancel { sessionId }` to the agent.
 5. The existing path takes over: agent eventually responds (cancelled
    or partial), `route_agent_response` clears the active turn,
    `amux/turn_complete` fires with whatever `stopReason` the agent
@@ -472,10 +474,10 @@ between receiving cancellation and producing a final response.
 
 ### Agent compliance
 
-Cancellation is optional per the RFD. amux forwards cancellations
-honestly; if the agent doesn't honor `$/cancel_request` and finishes
-normally, subscribers see the regular response. This is documented
-behavior, not a bug in amux — the proxy stays plumbing.
+amux forwards cancellation primitives honestly. If the agent does not
+honor `session/cancel` for active turns and finishes normally,
+subscribers see the regular response. This is documented behavior, not
+a bug in amux — the proxy stays plumbing.
 
 ## Peer identity
 
