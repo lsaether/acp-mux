@@ -12,6 +12,7 @@ use serde::Serialize;
 
 const METHOD_PEER_JOINED: &str = "amux/peer_joined";
 const METHOD_PEER_LEFT: &str = "amux/peer_left";
+const METHOD_SESSION_CONTEXT: &str = "amux/session_context";
 const METHOD_TURN_STARTED: &str = "amux/turn_started";
 const METHOD_TURN_COMPLETE: &str = "amux/turn_complete";
 const METHOD_SESSION_BUSY: &str = "amux/session_busy";
@@ -63,6 +64,13 @@ struct PeerJoinedParams<'a> {
 struct PeerLeftParams<'a> {
     session_id: &'a str,
     peer_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionContextParams<'a> {
+    session_id: &'a str,
+    cwd: &'a str,
 }
 
 #[derive(Serialize)]
@@ -181,6 +189,13 @@ pub fn peer_left(session_id: &str, peer_id: &str) -> Vec<u8> {
             session_id,
             peer_id,
         },
+    )
+}
+
+pub fn session_context(session_id: &str, cwd: &str) -> Vec<u8> {
+    encode(
+        METHOD_SESSION_CONTEXT,
+        SessionContextParams { session_id, cwd },
     )
 }
 

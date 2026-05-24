@@ -148,6 +148,9 @@ async fn ws_loopback_roundtrip_via_cat() {
             break;
         }
         let v: serde_json::Value = serde_json::from_str(t.as_str()).expect("frame is JSON");
+        if v.get("method") == Some(&serde_json::json!("amux/session_context")) {
+            continue;
+        }
         if v.get("method") == Some(&serde_json::json!("amux/agent_request_opened")) {
             saw_opened = true;
             continue;
@@ -174,6 +177,26 @@ async fn ws_loopback_roundtrip_via_cat() {
         }
     }
     panic!("session did not tear down after last subscriber");
+}
+
+#[tokio::test]
+async fn subscriber_receives_agent_context_cwd_on_attach() {
+    let (addr, _) = spawn_server_with_cat().await;
+    let expected_cwd = std::env::current_dir()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let url = format!("ws://{addr}/acp?session=ctx&peer_id=p1");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
+
+    let context = ws_next_method(&mut ws, "amux/session_context").await;
+
+    assert_eq!(context["params"]["sessionId"], serde_json::json!("ctx"));
+    assert_eq!(context["params"]["cwd"], serde_json::json!(expected_cwd));
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
 }
 
 #[tokio::test]
@@ -650,11 +673,19 @@ async fn amux_peer_joined_and_peer_left() {
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     // A is the initial sub — peer_joined for A is emitted to an empty
-    // map, so A sees nothing yet.
+    // map, so A sees only its direct session_context before B joins.
     let a_early = drain_for(&mut ws_a, Duration::from_millis(100)).await;
     assert!(
-        a_early.is_empty(),
-        "A should see no events before B joins, got {a_early:?}"
+        a_early
+            .iter()
+            .any(|v| v.get("method") == Some(&serde_json::json!("amux/session_context"))),
+        "A should receive direct session_context on attach, got {a_early:?}"
+    );
+    assert!(
+        a_early
+            .iter()
+            .all(|v| v.get("method") == Some(&serde_json::json!("amux/session_context"))),
+        "A should see no peer/presence events before B joins, got {a_early:?}"
     );
 
     let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
@@ -1114,10 +1145,19 @@ async fn replay_turns_disabled_emits_no_history() {
     let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
     let early = drain_for(&mut ws_b, Duration::from_millis(150)).await;
     // peer_joined for B's own join doesn't broadcast to B; without a
-    // replay log, B sees nothing until the next live event.
+    // replay log, B sees only the per-attach session_context until the
+    // next live event.
     assert!(
-        early.is_empty(),
-        "B should see no replay frames, got {early:?}"
+        early
+            .iter()
+            .any(|v| v.get("method") == Some(&serde_json::json!("amux/session_context"))),
+        "B should receive direct session_context on attach, got {early:?}"
+    );
+    assert!(
+        early
+            .iter()
+            .all(|v| v.get("method") == Some(&serde_json::json!("amux/session_context"))),
+        "B should see no replay frames beyond session_context, got {early:?}"
     );
 
     let _ = ws_a.send(ClientMsg::Close(None)).await;

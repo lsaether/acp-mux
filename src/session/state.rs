@@ -450,6 +450,7 @@ pub struct ReplayResetSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct SessionSnapshot {
     pub session_id: String,
+    pub agent_cwd: String,
     pub subscribers: Vec<SubscriberSnapshot>,
     pub pending_request_count: usize,
     pub initialize_cached: bool,
@@ -529,6 +530,7 @@ enum AgentReqState {
 
 struct SessionInner {
     session_id: String,
+    agent_cwd: String,
     session_list_index: Arc<SessionListMetadataIndex>,
     canonical_session_id: Option<String>,
     subscribers: HashMap<String, Subscriber>,
@@ -579,6 +581,7 @@ struct SessionInner {
 impl SessionInner {
     fn new(
         session_id: String,
+        agent_cwd: String,
         replay_policy: ReplayTurns,
         meta_propagate: bool,
         session_list_index: Arc<SessionListMetadataIndex>,
@@ -596,6 +599,7 @@ impl SessionInner {
         };
         Self {
             session_id,
+            agent_cwd,
             session_list_index,
             canonical_session_id: None,
             subscribers: HashMap::new(),
@@ -719,6 +723,7 @@ impl SessionInner {
         );
         self.subscribers.insert(peer_id.clone(), subscriber);
         self.publish_session_list_metadata();
+        self.send_session_context_to(&peer_id);
 
         if let Some(sub) = self.subscribers.get(&peer_id) {
             for entry in snapshot {
@@ -730,6 +735,16 @@ impl SessionInner {
             }
         }
         Ok(())
+    }
+
+    fn send_session_context_to(&self, peer_id: &str) {
+        let Some(sub) = self.subscribers.get(peer_id) else {
+            return;
+        };
+        let frame = Bytes::from(amux::session_context(&self.session_id, &self.agent_cwd));
+        if sub.outbound.send(OutMsg::Frame(frame)).is_err() {
+            tracing::debug!(%peer_id, "subscriber dropped before session context delivered");
+        }
     }
 
     /// Build a serializable snapshot of session state for /debug/sessions.
@@ -751,6 +766,7 @@ impl SessionInner {
         });
         SessionSnapshot {
             session_id: self.session_id.clone(),
+            agent_cwd: self.agent_cwd.clone(),
             subscribers: subs,
             pending_request_count: self.pending.len(),
             initialize_cached: self.initialize_cache.is_some(),
@@ -1776,6 +1792,7 @@ pub struct SessionOptions {
     pub session_ttl: Duration,
     pub meta_propagate: bool,
     pub session_list_index: Arc<SessionListMetadataIndex>,
+    pub agent_cwd: String,
 }
 
 pub fn spawn_session(
@@ -1837,6 +1854,7 @@ async fn run_session(
 ) {
     let mut inner = SessionInner::new(
         session_id.clone(),
+        options.agent_cwd.clone(),
         options.replay_policy,
         options.meta_propagate,
         options.session_list_index.clone(),
