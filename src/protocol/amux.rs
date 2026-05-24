@@ -451,4 +451,20 @@ mod tests {
         assert_eq!(v["params"]["error"], err);
         assert!(v["params"].get("result").is_none());
     }
+
+    #[test]
+    fn agent_request_resolved_omits_missing_result_and_error() {
+        let req_id = json!("stale-perm");
+        let v = parse(&agent_request_resolved(
+            "work",
+            &req_id,
+            "mux:turn-ended",
+            None,
+            None,
+        ));
+        assert_eq!(v["params"]["requestId"], req_id);
+        assert_eq!(v["params"]["resolvedBy"], json!("mux:turn-ended"));
+        assert!(v["params"].get("result").is_none());
+        assert!(v["params"].get("error").is_none());
+    }
 }

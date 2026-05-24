@@ -262,12 +262,12 @@ joiners.
 }
 ```
 
-Exactly one of `result` or `error` is populated and echoes the winning
-reply verbatim. For `session/request_permission` the body is derived
-entirely from `params.options[]` of the original request (which every
-peer already saw), so no new information leaks. If/when other agent →
-client request types start flowing through this path with sensitive
-response bodies, the design should be revisited.
+For peer replies, exactly one of `result` or `error` is populated and
+echoes the winning reply verbatim. For `session/request_permission` the
+body is derived entirely from `params.options[]` of the original request
+(which every peer already saw), so no new information leaks. If/when
+other agent → client request types start flowing through this path with
+sensitive response bodies, the design should be revisited.
 
 #### Turn-end cleanup variant
 
@@ -284,16 +284,14 @@ deadline and proceeded without writing a response), the mux emits one
   "params": {
     "sessionId": "work",
     "requestId": 10001,
-    "resolvedBy": "mux:turn-ended",
-    "result": null,
-    "error": null
+    "resolvedBy": "mux:turn-ended"
   }
 }
 ```
 
 Clients can distinguish a peer-resolved request (`resolvedBy` is a peer
 id) from a turn-end cleanup (`resolvedBy` is the literal string
-`"mux:turn-ended"` and both `result` and `error` are `null`). After the
+`"mux:turn-ended"` and `result` and `error` are omitted). After the
 sweep the mux drops any late subscriber reply for the same id at the
 first-reply-wins gate, so the agent never sees a duplicate or stale
 answer.

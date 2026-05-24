@@ -2190,8 +2190,9 @@ async fn subscriber_cannot_cancel_another_subscribers_request() {
 }
 
 /// Agent-emitted `$/cancel_request` for an in-flight agent-initiated
-/// request (e.g. `session/request_permission`) is forwarded to every
-/// subscriber AND mirrored by `amux/agent_request_resolved { resolvedBy:
+/// request (e.g. `session/request_permission`) is preceded by inert
+/// `amux/agent_request_opened`, forwarded to every subscriber, and
+/// mirrored by `amux/agent_request_resolved { resolvedBy:
 /// "agent:cancelled" }`. Subsequent subscriber replies for the same id
 /// are dropped via the first-writer-wins gate.
 #[tokio::test]
@@ -2234,28 +2235,62 @@ async fn agent_cancels_permission_request_fans_out() {
     let b_frames = drain_for(&mut ws_b, Duration::from_secs(2)).await;
 
     for (label, frames) in [("A", &a_frames), ("B", &b_frames)] {
-        let perm = frames
+        let perm_idx = frames
             .iter()
-            .find(|v| v.get("method") == Some(&serde_json::json!("session/request_permission")))
+            .position(|v| v.get("method") == Some(&serde_json::json!("session/request_permission")))
             .unwrap_or_else(|| panic!("{label}: must see permission request; got {frames:?}"));
+        let perm = &frames[perm_idx];
         let perm_id = &perm["id"];
 
-        let cancel = frames
+        let opened_idx = frames
             .iter()
-            .find(|v| {
+            .position(|v| {
+                v.get("method") == Some(&serde_json::json!("amux/agent_request_opened"))
+                    && &v["params"]["requestId"] == perm_id
+            })
+            .unwrap_or_else(|| panic!("{label}: must see amux/agent_request_opened"));
+        let opened = &frames[opened_idx];
+        assert!(
+            opened_idx < perm_idx,
+            "{label}: opened must precede raw permission; opened@{opened_idx} permission@{perm_idx}",
+        );
+        assert_eq!(
+            opened["params"]["requestMethod"],
+            serde_json::json!("session/request_permission"),
+            "{label}: opened should name the cancelled request method"
+        );
+        assert_eq!(
+            opened["params"]["requestParams"]["sessionId"],
+            serde_json::json!("sess-mock"),
+            "{label}: opened should retain request context for replay"
+        );
+
+        let cancel_idx = frames
+            .iter()
+            .position(|v| {
                 v.get("method") == Some(&serde_json::json!("$/cancel_request"))
                     && &v["params"]["requestId"] == perm_id
             })
             .unwrap_or_else(|| panic!("{label}: must see $/cancel_request for permission id"));
+        let cancel = &frames[cancel_idx];
         assert_eq!(cancel["params"]["requestId"], *perm_id);
+        assert!(
+            opened_idx < cancel_idx,
+            "{label}: opened must precede agent cancellation; opened@{opened_idx} cancel@{cancel_idx}",
+        );
 
-        let resolved = frames
+        let resolved_idx = frames
             .iter()
-            .find(|v| {
+            .position(|v| {
                 v.get("method") == Some(&serde_json::json!("amux/agent_request_resolved"))
                     && &v["params"]["requestId"] == perm_id
             })
             .unwrap_or_else(|| panic!("{label}: must see amux/agent_request_resolved"));
+        let resolved = &frames[resolved_idx];
+        assert!(
+            opened_idx < resolved_idx,
+            "{label}: opened must precede agent-cancelled resolution; opened@{opened_idx} resolved@{resolved_idx}",
+        );
         assert_eq!(
             resolved["params"]["resolvedBy"],
             serde_json::json!("agent:cancelled")
