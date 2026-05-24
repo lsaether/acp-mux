@@ -60,7 +60,7 @@ Health and debug endpoints:
 - **Cold-start session discovery.** `GET /acp/sessions` runs a transient agent-side `session/list` query before any WebSocket attach, useful for dashboards that need to browse persisted sessions before choosing one to resume.
 - **Live `session/list` decoration.** Returned `sessions[]` entries that match a live muxed upstream session get `sessions[i]._meta.amux` fields (`proxySessionId`, `subscriberCount`, optional `drivingSubscriber`), preserving existing `_meta` keys and leaving non-live entries unchanged.
 - **`amux/*` notification namespace.** The mux publishes its own metadata out-of-band: `amux/peer_joined`, `amux/peer_left`, `amux/turn_started`, `amux/turn_complete`, `amux/turn_cancelled`, `amux/session_busy`, `amux/agent_request_resolved`. ACP frames stay clean; clients see two distinguishable channels and demultiplex by method prefix.
-- **Cancellation.** `$/cancel_request` (request-cancellation RFD) works both directions: subscribers can cancel their own in-flight requests; agents can cancel agent-initiated requests (broadcast to peers + `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`). The amux extension `amux/cancel_active_turn` lets *any* attached peer cancel the in-flight turn (not just the driver) — internally it synthesizes a `$/cancel_request` toward the agent and emits `amux/turn_cancelled` to peers.
+- **Cancellation.** `$/cancel_request` (request-cancellation RFD) works both directions: subscribers can cancel their own in-flight requests; agents can cancel agent-initiated requests (broadcast to peers + `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`). The amux extension `amux/cancel_active_turn` lets *any* attached peer cancel the in-flight turn (not just the driver) — internally it sends ACP-native `session/cancel { sessionId }` toward the agent and emits `amux/turn_cancelled` to peers.
 - **Replay log.** Every broadcast-tier frame (`amux/*` + agent notifications) is appended; a late joiner receives the full history before any live event.
 - **TTL grace.** Last subscriber leaving starts a countdown; a reconnect within `--session-ttl-seconds` reuses the same subprocess with all of its caches intact.
 
@@ -89,7 +89,7 @@ amux parses only JSON-RPC envelopes (`id`, `method`, `params`, `result`, `error`
 | `session/new` | ✅ | Core | Forwarded; first response cached for late joiners. |
 | `session/load` | ✅ | Core | Forwarded to the agent like any other request. On success, amux rebinds the room's canonical session id (used by late joiners' `session/new` calls) to the loaded session; failed loads leave the cache untouched. |
 | `session/prompt` | ✅ | Core | Forwarded with id translation; turn serialization; concurrent prompts rejected with `-32001`. |
-| `session/cancel` | ✅ (envelope passthrough) | Core | Per-turn notification; flows through unchanged. |
+| `session/cancel` | ✅ | Core | Forwarded unchanged from vanilla clients; also emitted southbound by `amux/cancel_active_turn` for active-turn interruption. |
 | `session/set_mode` | ✅ (envelope passthrough) | Core | Not specifically handled. |
 | `$/cancel_request` | ✅ | Draft RFD (optional per spec) | Strict per-peer semantics; cancels own in-flight requests only. |
 | `session/attach`, `session/detach` | ⏳ | Open RFD ([#533](https://github.com/agentclientprotocol/agent-client-protocol/pull/533)) | Implemented on branch [`rfd-533-alignment`](https://github.com/lsaether/acp-mux/pull/3), shelved pending RFD ratification. |
@@ -114,7 +114,7 @@ amux parses only JSON-RPC envelopes (`id`, `method`, `params`, `result`, `error`
 | `amux/turn_cancelled` | proxy → subscribers | Intent broadcast when any peer triggers cancellation. |
 | `amux/session_busy` | proxy → subscribers | Companion to `-32001` rejection on concurrent prompts. |
 | `amux/agent_request_resolved` | proxy → subscribers | Dismissal signal for agent-initiated requests (`request_permission`, etc.). |
-| `amux/cancel_active_turn` | subscriber → proxy | Any peer can cancel the active turn; resolves to a synthesized `$/cancel_request` toward the agent. |
+| `amux/cancel_active_turn` | subscriber → proxy | Any peer can cancel the active turn; resolves to ACP-native `session/cancel` toward the agent. |
 
 Detailed shape and semantics: [`docs/design/amux-namespace.md`](docs/design/amux-namespace.md).
 

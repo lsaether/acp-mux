@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Active-turn cancellation for Hermes-backed sessions.** `amux/cancel_active_turn` now forwards ACP-native `session/cancel { sessionId }` for the active prompt while preserving the immediate `amux/turn_cancelled` intent broadcast and later `amux/turn_complete` settlement event. Fixes [#29](https://github.com/lsaether/acp-mux/issues/29).
+
 ## v0.1.2 — 2026-05-23
 
 ### Added

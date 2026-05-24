@@ -19,9 +19,9 @@ const METHOD_AGENT_REQUEST_RESOLVED: &str = "amux/agent_request_resolved";
 const METHOD_TURN_CANCELLED: &str = "amux/turn_cancelled";
 
 /// Method name for the amux extension that lets any attached peer cancel
-/// the in-flight turn (not just the driver). Internally resolves to a
-/// synthesized `$/cancel_request` toward the agent — strict
-/// `$/cancel_request` semantics still apply on the southbound side.
+/// the in-flight turn (not just the driver). Internally resolves to ACP
+/// `session/cancel` toward the agent; strict `$/cancel_request`
+/// semantics remain reserved for request-id cancellation.
 pub const METHOD_CANCEL_ACTIVE_TURN: &str = "amux/cancel_active_turn";
 
 /// Resolved-by sentinel used in `amux/agent_request_resolved` cleanup

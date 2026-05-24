@@ -32,6 +32,11 @@
 //!   `mock/cancel_echo` notification carrying the `requestId` and a
 //!   monotonic counter. Tests use this to confirm the proxy translated
 //!   cancellation correctly.
+//! - `MOCK_ACP_ECHO_SESSION_CANCELS=1` — whenever the mock receives a
+//!   `session/cancel` notification, emit an observable
+//!   `mock/session_cancel_echo` notification carrying the `sessionId`
+//!   and a monotonic counter. Tests use this to confirm active-turn
+//!   cancellation reaches ACP-native cancel handlers.
 //! - `MOCK_ACP_CANCEL_PERMISSION=1` — on `session/prompt` (with
 //!   `MOCK_ACP_EMIT_PERMISSION=1`), after emitting the permission
 //!   request the mock immediately emits a `$/cancel_request` for that
@@ -83,6 +88,9 @@ fn main() {
     let echo_cancels = env::var("MOCK_ACP_ECHO_CANCELS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let echo_session_cancels = env::var("MOCK_ACP_ECHO_SESSION_CANCELS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let cancel_permission = env::var("MOCK_ACP_CANCEL_PERMISSION")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -105,6 +113,7 @@ fn main() {
     let mut next_permission_id: u64 = 10_000;
     let mut response_echo_count: u32 = 0;
     let mut cancel_echo_count: u32 = 0;
+    let mut session_cancel_echo_count: u32 = 0;
 
     let mut line = String::new();
     loop {
@@ -154,9 +163,9 @@ fn main() {
             continue;
         }
 
-        // Notifications without an id. `$/cancel_request` from the proxy
-        // is the only one we care about — optionally echo it so tests
-        // can verify cancellation translation.
+        // Notifications without an id. Echo cancellation notifications on
+        // demand so tests can verify which cancellation primitive the mux
+        // wrote southbound.
         if id.is_none() {
             if echo_cancels && method == "$/cancel_request" {
                 cancel_echo_count += 1;
@@ -171,6 +180,24 @@ fn main() {
                     "params": {
                         "requestId": request_id,
                         "seq": cancel_echo_count,
+                    },
+                });
+                writeln!(stdout, "{echo}").ok();
+                stdout.flush().ok();
+            }
+            if echo_session_cancels && method == "session/cancel" {
+                session_cancel_echo_count += 1;
+                let session_id = frame
+                    .get("params")
+                    .and_then(|p| p.get("sessionId"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let echo = json!({
+                    "jsonrpc": "2.0",
+                    "method": "mock/session_cancel_echo",
+                    "params": {
+                        "sessionId": session_id,
+                        "seq": session_cancel_echo_count,
                     },
                 });
                 writeln!(stdout, "{echo}").ok();

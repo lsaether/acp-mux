@@ -145,6 +145,10 @@ const WS_CLOSE_AGENT_DEAD: u16 = 1011;
 /// JSON-RPC method name for the cancellation notification (request-cancellation
 /// RFD; LSP-derived). Either direction may emit it.
 const CANCEL_REQUEST_METHOD: &str = "$/cancel_request";
+/// ACP-native session cancellation. Hermes Agent wires this method to
+/// its cooperative interrupt path, so active-turn cancellation must use
+/// this session-scoped primitive rather than request-id cancellation.
+const SESSION_CANCEL_METHOD: &str = "session/cancel";
 
 #[derive(Debug, Clone)]
 struct ReplayEntry {
@@ -340,8 +344,7 @@ fn parse_cancel_request_id(params: Option<&Value>) -> Option<Id> {
 
 /// Build a `$/cancel_request` notification frame as NDJSON bytes (no
 /// trailing newline; the writer adds framing). Used both for forwarding
-/// a subscriber-originated cancel with a translated id and for
-/// synthesizing one on behalf of `amux/cancel_active_turn`.
+/// a subscriber-originated cancel with a translated id.
 fn build_cancel_request(request_id: Id) -> Vec<u8> {
     #[derive(serde::Serialize)]
     struct CancelParams<'a> {
@@ -362,6 +365,30 @@ fn build_cancel_request(request_id: Id) -> Vec<u8> {
         },
     })
     .expect("cancel_request frame is always serializable")
+}
+
+/// Build a `session/cancel` notification frame as NDJSON bytes (no
+/// trailing newline; the writer adds framing). Used for
+/// `amux/cancel_active_turn`, where the intended target is the active
+/// ACP session/turn rather than a JSON-RPC request id.
+fn build_session_cancel(session_id: &str) -> Vec<u8> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CancelParams<'a> {
+        session_id: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct CancelFrame<'a> {
+        jsonrpc: &'static str,
+        method: &'static str,
+        params: CancelParams<'a>,
+    }
+    serde_json::to_vec(&CancelFrame {
+        jsonrpc: "2.0",
+        method: SESSION_CANCEL_METHOD,
+        params: CancelParams { session_id },
+    })
+    .expect("session/cancel frame is always serializable")
 }
 
 /// Extract session/update counts from replay entries for debug snapshots.
@@ -517,6 +544,10 @@ struct SessionInner {
     /// `amuxTurnId` paired with the in-flight `session/prompt`. Used to
     /// bookend `amux/turn_started` and `amux/turn_complete`.
     active_amux_turn_id: Option<AmuxTurnId>,
+    /// Upstream ACP `sessionId` paired with the in-flight `session/prompt`.
+    /// Used to translate `amux/cancel_active_turn` into ACP-native
+    /// `session/cancel`.
+    active_turn_session_id: Option<String>,
     /// Monotonic per-session counter for `amuxTurnId` allocation.
     next_amux_turn_id: u64,
     /// Replay log. `None` when policy is `Disabled` (saves memory).
@@ -573,6 +604,7 @@ impl SessionInner {
             driving_subscriber_peer_id: None,
             active_turn_mux_id: None,
             active_amux_turn_id: None,
+            active_turn_session_id: None,
             next_amux_turn_id: 1,
             replay_log,
             next_replay_seq: 1,
@@ -864,8 +896,8 @@ impl SessionInner {
     }
 
     /// `amux/cancel_active_turn`: any attached peer can cancel the
-    /// in-flight turn. Resolves to a synthesized `$/cancel_request`
-    /// toward the agent using the active-turn `mux_id`. Broadcasts
+    /// in-flight turn. Resolves to ACP-native `session/cancel` toward
+    /// the agent using the active turn's ACP `sessionId`. Broadcasts
     /// `amux/turn_cancelled` to all peers immediately (intent), while
     /// `amux/turn_complete` follows later when the agent settles.
     fn handle_amux_cancel_active_turn(
@@ -899,6 +931,15 @@ impl SessionInner {
             return None;
         };
         let original_driver = pending.peer_id.clone();
+        let Some(active_session_id) = self.active_turn_session_id.clone() else {
+            tracing::warn!(
+                session = %self.session_id,
+                %peer_id,
+                active_mux_id,
+                "active turn has no ACP sessionId; dropping cancel",
+            );
+            return None;
+        };
         let reason = notif
             .params
             .as_ref()
@@ -911,8 +952,9 @@ impl SessionInner {
             cancelled_by = %peer_id,
             %original_driver,
             active_mux_id,
+            acp_session_id = %active_session_id,
             reason = ?reason,
-            "amux/cancel_active_turn synthesizing $/cancel_request to agent",
+            "amux/cancel_active_turn sending session/cancel to agent",
         );
 
         let frame = amux::turn_cancelled(
@@ -924,7 +966,7 @@ impl SessionInner {
         );
         self.broadcast(frame);
 
-        Some(build_cancel_request(Id::Number(active_mux_id as i64)))
+        Some(build_session_cancel(&active_session_id))
     }
 
     /// Agent-emitted `$/cancel_request`: cancels an agent-initiated
@@ -1227,6 +1269,16 @@ impl SessionInner {
         self.next_mux_id += 1;
         let original_id = req.id.clone();
         let is_prompt = req.method == "session/prompt";
+        let active_turn_session_id = if is_prompt {
+            req.params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| self.canonical_session_id.clone())
+        } else {
+            None
+        };
         let decorate_session_list = req.method == "session/list";
         let amux_turn_id = if is_prompt {
             let turn_id = AmuxTurnId(self.next_amux_turn_id);
@@ -1269,11 +1321,13 @@ impl SessionInner {
                 if let Some(turn_id) = amux_turn_id {
                     self.active_turn_mux_id = Some(mux_id);
                     self.active_amux_turn_id = Some(turn_id);
+                    self.active_turn_session_id = active_turn_session_id;
                     tracing::info!(
                         session = %self.session_id,
                         %peer_id,
                         mux_id,
                         amux_turn_id = %turn_id.formatted(),
+                        acp_session_id = ?self.active_turn_session_id,
                         "session/prompt forwarded; active turn opened",
                     );
                     self.emit_turn_started(peer_id, turn_id, req.params.as_ref());
@@ -1571,6 +1625,7 @@ impl SessionInner {
 
         if self.active_turn_mux_id == Some(mux_id) {
             self.active_turn_mux_id = None;
+            self.active_turn_session_id = None;
             let turn_id = self.active_amux_turn_id.take();
             tracing::info!(
                 session = %self.session_id,
