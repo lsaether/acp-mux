@@ -18,10 +18,12 @@ Any out-of-band signal it needs to publish — peer presence, turn boundaries,
 busy state, late-join history — goes under `amux/*` with explicit payload.
 
 ACP frames flow byte-for-byte from agent to live clients; multiplex facts flow
-through their own namespace. Late-join replay is the one mux-owned provenance
-exception: replayed frames may gain `params._meta.amux` fields that describe
-when the mux originally recorded the frame. Clients receive distinguishable
-signals and demultiplex them.
+through their own namespace. Late-join replay is mux-owned state
+reconstruction, not a second chance to answer old ACP requests: replayed frames
+may gain `params._meta.amux` fields that describe when the mux originally
+recorded the frame, and resolved agent-initiated requests replay through inert
+`amux/*` lifecycle events rather than re-emitting actionable `session/*`
+requests. Clients receive distinguishable signals and demultiplex them.
 
 Implementation rule: **the multiplexer parses JSON-RPC envelopes only.**
 Everything past `{id, method, params, result, error}` is `serde_json::Value`.
@@ -194,13 +196,56 @@ response with code `-32001`.
 }
 ```
 
+### `amux/agent_request_opened`
+
+Broadcast when the agent emits an agent-initiated JSON-RPC request (for
+example `session/request_permission`). This frame is **not** actionable:
+it has no JSON-RPC `id` at the top level, clients must not answer it, and
+the raw ACP request remains the only frame that can be replied to. The
+purpose is durable replay/audit context for late joiners, which must not
+receive stale actionable requests after the agent has already moved on.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "amux/agent_request_opened",
+  "params": {
+    "sessionId": "work",
+    "requestId": 10001,
+    "requestMethod": "session/request_permission",
+    "requestParams": {
+      "sessionId": "sess-mock",
+      "toolCall": { "toolCallId": "tool-1", "title": "demo_tool" },
+      "options": [{ "optionId": "allow_once", "name": "Allow once" }]
+    },
+    "amuxTurnId": "at-42"
+  }
+}
+```
+
+Fields:
+
+- `requestId` is the original agent-owned JSON-RPC request id. It is data
+  here, not a top-level reply target.
+- `requestMethod` / `requestParams` mirror the original request envelope
+  enough for a replaying client to explain what was asked.
+- `amuxTurnId` is present when the request happened during an active mux
+  turn and matches the surrounding `amux/turn_started` /
+  `amux/turn_complete` pair.
+
+Live subscribers receive `amux/agent_request_opened` plus the raw ACP
+request. Late joiners replay only the `amux/*` lifecycle (`opened` then
+`resolved`) and never receive the raw, already-stale request.
+
 ### `amux/agent_request_resolved`
 
 Broadcast when an agent-initiated request (e.g. `session/request_permission`)
-that the mux fanned out to every subscriber receives its first reply.
+that the mux fanned out live to every subscriber receives its first reply.
 The first reply is forwarded to the agent; later replies for the same
 id are dropped. This notification lets peers that lost the race (or
-never replied) dismiss the request from their UI.
+never replied) dismiss the request from their UI. Together with the prior
+`amux/agent_request_opened`, it is also the replay-safe lifecycle for late
+joiners.
 
 ```json
 {
@@ -217,12 +262,12 @@ never replied) dismiss the request from their UI.
 }
 ```
 
-Exactly one of `result` or `error` is populated and echoes the winning
-reply verbatim. For `session/request_permission` the body is derived
-entirely from `params.options[]` of the original request (which every
-peer already saw), so no new information leaks. If/when other agent →
-client request types start flowing through this path with sensitive
-response bodies, the design should be revisited.
+For peer replies, exactly one of `result` or `error` is populated and
+echoes the winning reply verbatim. For `session/request_permission` the
+body is derived entirely from `params.options[]` of the original request
+(which every peer already saw), so no new information leaks. If/when
+other agent → client request types start flowing through this path with
+sensitive response bodies, the design should be revisited.
 
 #### Turn-end cleanup variant
 
@@ -239,16 +284,14 @@ deadline and proceeded without writing a response), the mux emits one
   "params": {
     "sessionId": "work",
     "requestId": 10001,
-    "resolvedBy": "mux:turn-ended",
-    "result": null,
-    "error": null
+    "resolvedBy": "mux:turn-ended"
   }
 }
 ```
 
 Clients can distinguish a peer-resolved request (`resolvedBy` is a peer
 id) from a turn-end cleanup (`resolvedBy` is the literal string
-`"mux:turn-ended"` and both `result` and `error` are `null`). After the
+`"mux:turn-ended"` and `result` and `error` are omitted). After the
 sweep the mux drops any late subscriber reply for the same id at the
 first-reply-wins gate, so the agent never sees a duplicate or stale
 answer.
@@ -357,10 +400,12 @@ protocol, timeout, or JSON-RPC errors return `502` with a small JSON error body.
 ## Late-join / replay log
 
 The multiplexer maintains a per-session event log: every broadcast-tier
-frame it has sent — its own `amux/*` notifications and the agent's
+frame it has sent — its own `amux/*` notifications, including inert
+`amux/agent_request_opened` request context, and the agent's
 `session/update` notifications. Per-subscriber frames (responses to a
-specific subscriber's requests, agent-initiated `session/request_permission`)
-are NOT logged; they're directed by definition.
+specific subscriber's requests, raw actionable agent-initiated requests such as
+`session/request_permission`) are NOT logged; they're directed by definition
+and may already be resolved by the time a late joiner arrives.
 
 When a new subscriber attaches:
 
@@ -394,8 +439,9 @@ When a new subscriber attaches:
 
 This gives newcomers a complete reconstruction of session state — every
 peer that joined or left, every completed turn (with its prompt content via
-the `turn_started` bookend), and any in-flight turn's already-streamed
-chunks.
+the `turn_started` bookend), any agent-initiated request context via inert
+`amux/agent_request_opened` / `amux/agent_request_resolved` pairs, and any
+in-flight turn's already-streamed chunks.
 
 **v0.1 ships unbounded replay.** The log grows for the life of the session.
 Storage pressure on long-running sessions is acceptable for early use and
@@ -512,7 +558,11 @@ A client consuming this protocol needs to:
    `agent_message_chunk` → response text, `agent_thought_chunk` →
    thinking buffer, `tool_call` / `tool_call_update` → tool call records,
    `plan` → plan, `usage_update` → context-window indicator.
-3. On `amux/turn_complete`, close the Turn with `stopReason`.
+3. On live raw `session/request_permission`, show a reply affordance.
+   On replayed `amux/agent_request_opened`, render only inert context:
+   no top-level JSON-RPC `id`, no response should be sent. Use
+   `amux/agent_request_resolved` to dismiss/annotate the request outcome.
+4. On `amux/turn_complete`, close the Turn with `stopReason`.
 
 The `amux/*` bookends remove the need for client-side heuristics like
 "close the previous turn when a new prompt arrives" or "dedup my own
