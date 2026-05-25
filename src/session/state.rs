@@ -70,12 +70,12 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::agent::process::AgentProcess;
-use crate::cli::ReplayTurns;
+use crate::cli::{ClientToolMode, ClientToolPolicy, ReplayTurns};
 use crate::multiplex::subscriber::{OutMsg, Subscriber};
 use crate::protocol::amux::{self, AmuxTurnId};
 use crate::protocol::jsonrpc::{
@@ -139,6 +139,11 @@ const FIRST_MUX_ID: u64 = 1;
 /// -32000..=-32099 range is reserved by the spec for implementation
 /// defined errors; -32001 was chosen by the ROADMAP.
 const SESSION_BUSY_ERROR_CODE: i64 = -32001;
+
+/// JSON-RPC error code for implementation-defined ACP client-tool policy
+/// rejections. The structured `data.reason` distinguishes this from other
+/// mux-owned failures.
+const CLIENT_TOOL_BLOCKED_ERROR_CODE: i64 = -32000;
 
 /// WebSocket close code used when the agent subprocess exits while
 /// subscribers are still attached. 1011 = "internal error" per RFC 6455.
@@ -393,6 +398,24 @@ fn build_session_cancel(session_id: &str) -> Vec<u8> {
     .expect("session/cancel frame is always serializable")
 }
 
+fn build_client_tool_blocked_response(id: Id, method: &str) -> Vec<u8> {
+    let resp = IncomingResponse {
+        jsonrpc: JsonRpcVersion,
+        id,
+        result: None,
+        error: Some(JsonRpcError {
+            code: CLIENT_TOOL_BLOCKED_ERROR_CODE,
+            message: format!("client tool request blocked by acp-mux policy: {method}"),
+            data: Some(json!({
+                "reason": "client_tool_blocked",
+                "method": method,
+                "policy": "block",
+            })),
+        }),
+    };
+    serde_json::to_vec(&resp).expect("client-tool blocked response is always serializable")
+}
+
 /// Extract session/update counts from replay entries for debug snapshots.
 fn replay_log_update_counts_by_acp_session_id(
     log: &VecDeque<ReplayEntry>,
@@ -528,6 +551,33 @@ enum AgentReqState {
     Consumed,
 }
 
+#[derive(Debug, Default)]
+struct AgentLineAction {
+    session_empty: bool,
+    response_to_agent: Option<Vec<u8>>,
+}
+
+impl AgentLineAction {
+    fn none() -> Self {
+        Self::default()
+    }
+
+    fn session_empty(session_empty: bool) -> Self {
+        Self {
+            session_empty,
+            response_to_agent: None,
+        }
+    }
+
+    fn response_to_agent(response_to_agent: Vec<u8>) -> Self {
+        Self {
+            session_empty: false,
+            response_to_agent: Some(response_to_agent),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct SessionInner {
     session_id: String,
     agent_cwd: String,
@@ -570,6 +620,9 @@ struct SessionInner {
     /// Opt-in propagation of mux-owned trace metadata into outbound
     /// subscriber → agent requests under `params._meta.amux`.
     meta_propagate: bool,
+    /// Policy for agent-initiated ACP client-tool request namespaces
+    /// (`fs/*`, `terminal/*`).
+    client_tool_policy: ClientToolPolicy,
     /// State for every agent-initiated request id we have ever broadcast
     /// in this session. `InFlight` until the first subscriber reply
     /// arrives; `Consumed` thereafter. We keep `Consumed` ids around for
@@ -584,6 +637,7 @@ impl SessionInner {
         agent_cwd: String,
         replay_policy: ReplayTurns,
         meta_propagate: bool,
+        client_tool_policy: ClientToolPolicy,
         session_list_index: Arc<SessionListMetadataIndex>,
     ) -> Self {
         let replay_log = match replay_policy {
@@ -617,6 +671,7 @@ impl SessionInner {
             replay_generation: 0,
             last_replay_reset: None,
             meta_propagate,
+            client_tool_policy,
             agent_pending: HashMap::new(),
         }
     }
@@ -1214,6 +1269,34 @@ impl SessionInner {
         self.broadcast(frame);
     }
 
+    fn sanitize_initialize_client_capabilities(&self, req: &mut IncomingRequest) {
+        let Some(Value::Object(params)) = req.params.as_mut() else {
+            return;
+        };
+        let Some(Value::Object(client_capabilities)) = params.get_mut("clientCapabilities") else {
+            return;
+        };
+
+        let mut stripped = vec![];
+        if self.client_tool_policy.fs == ClientToolMode::Block
+            && client_capabilities.remove("fs").is_some()
+        {
+            stripped.push("fs");
+        }
+        if self.client_tool_policy.terminal == ClientToolMode::Block
+            && client_capabilities.remove("terminal").is_some()
+        {
+            stripped.push("terminal");
+        }
+        if !stripped.is_empty() {
+            tracing::info!(
+                session = %self.session_id,
+                namespaces = ?stripped,
+                "stripped blocked client-tool capabilities from initialize",
+            );
+        }
+    }
+
     fn translate_outbound_request(
         &mut self,
         peer_id: &str,
@@ -1260,6 +1343,10 @@ impl SessionInner {
                 "session busy: another turn is in flight",
             );
             return None;
+        }
+
+        if req.method == "initialize" {
+            self.sanitize_initialize_client_capabilities(&mut req);
         }
 
         if req.method != "initialize" {
@@ -1547,7 +1634,7 @@ impl SessionInner {
 
     /// Process one stdout line from the agent. Returns true if every
     /// subscriber has dropped during fan-out and the session should end.
-    fn handle_agent_line(&mut self, line: Vec<u8>) -> bool {
+    fn handle_agent_line(&mut self, line: Vec<u8>) -> AgentLineAction {
         let frame = match Incoming::parse(&line) {
             Ok(f) => f,
             Err(err) => {
@@ -1556,19 +1643,21 @@ impl SessionInner {
                     error = %err,
                     "invalid JSON-RPC frame from agent; falling back to raw broadcast",
                 );
-                return self.broadcast(line);
+                return AgentLineAction::session_empty(self.broadcast(line));
             }
         };
         match frame {
-            Incoming::Notification(notif) => self.handle_agent_notification(notif, line),
+            Incoming::Notification(notif) => {
+                AgentLineAction::session_empty(self.handle_agent_notification(notif, line))
+            }
             Incoming::Response(resp) => {
                 self.route_agent_response(resp);
-                false
+                AgentLineAction::none()
             }
-            Incoming::Request(req) => {
-                self.route_agent_request(req, line);
-                false
-            }
+            Incoming::Request(req) => match self.route_agent_request(req, line) {
+                Some(response_to_agent) => AgentLineAction::response_to_agent(response_to_agent),
+                None => AgentLineAction::none(),
+            },
         }
     }
 
@@ -1598,8 +1687,30 @@ impl SessionInner {
     /// `amux/agent_request_opened` sibling through `broadcast` first so
     /// the request context is durable for late joiners and ordered before
     /// the matching `amux/agent_request_resolved` lifecycle event.
-    fn route_agent_request(&mut self, req: IncomingRequest, line: Vec<u8>) {
+    fn route_agent_request(&mut self, req: IncomingRequest, line: Vec<u8>) -> Option<Vec<u8>> {
         let id = req.id.clone();
+        if let Some(mode) = self.client_tool_policy.mode_for_method(&req.method) {
+            match mode {
+                ClientToolMode::Block => {
+                    tracing::warn!(
+                        session = %self.session_id,
+                        id = ?id,
+                        method = %req.method,
+                        "blocking agent-initiated client-tool request by policy",
+                    );
+                    return Some(build_client_tool_blocked_response(id, &req.method));
+                }
+                ClientToolMode::UnsafeDebug => {
+                    tracing::warn!(
+                        session = %self.session_id,
+                        id = ?id,
+                        method = %req.method,
+                        subscribers = self.subscribers.len(),
+                        "UNSAFE: broadcasting agent-initiated client-tool request by explicit debug policy",
+                    );
+                }
+            }
+        }
         if self.subscribers.is_empty() {
             tracing::warn!(
                 session = %self.session_id,
@@ -1607,7 +1718,7 @@ impl SessionInner {
                 method = %req.method,
                 "agent-initiated request with no attached subscribers; dropping",
             );
-            return;
+            return None;
         }
         self.agent_pending
             .insert(id.clone(), AgentReqState::InFlight);
@@ -1650,6 +1761,7 @@ impl SessionInner {
                 }
             }
         });
+        None
     }
 
     fn route_agent_response(&mut self, mut resp: IncomingResponse) {
@@ -1791,6 +1903,7 @@ pub struct SessionOptions {
     pub replay_policy: ReplayTurns,
     pub session_ttl: Duration,
     pub meta_propagate: bool,
+    pub client_tool_policy: ClientToolPolicy,
     pub session_list_index: Arc<SessionListMetadataIndex>,
     pub agent_cwd: String,
 }
@@ -1857,6 +1970,7 @@ async fn run_session(
         options.agent_cwd.clone(),
         options.replay_policy,
         options.meta_propagate,
+        options.client_tool_policy,
         options.session_list_index.clone(),
     );
     inner
@@ -1911,7 +2025,17 @@ async fn run_session(
                         None
                     }
                     Some(SessionMsg::AgentStdoutLine(line)) => {
-                        if inner.handle_agent_line(line) {
+                        let action = inner.handle_agent_line(line);
+                        if let Some(out) = action.response_to_agent
+                            && let Err(err) = agent.send(&out).await
+                        {
+                            tracing::warn!(
+                                session = %session_id,
+                                error = %err,
+                                "agent stdin write failed while handling agent-initiated request policy",
+                            );
+                        }
+                        if action.session_empty {
                             Some(ExitReason::LastSubscriberLeft)
                         } else {
                             None

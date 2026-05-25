@@ -19,6 +19,9 @@
 //!   "cancelled"}`. The mock does NOT block on the response; it carries
 //!   on so subscriber-side response handling can be tested independently
 //!   of agent turn timing.
+//! - `MOCK_ACP_EMIT_CLIENT_TOOL=<method>` — on `session/prompt`, emit an
+//!   agent-initiated client-tool request such as `fs/read_text_file`,
+//!   `fs/write_text_file`, or `terminal/create` (id 20000+counter).
 //! - `MOCK_ACP_PROMPT_DELAY_MS=N` — sleep N ms before responding to
 //!   `session/prompt`. Lets the test queue a second concurrent prompt at
 //!   acp-mux while the first turn is in flight (chunk 6).
@@ -47,6 +50,9 @@
 //!   a small canned set of sessions (the current `sess-mock` plus two
 //!   historical entries). Used to test session/list end-to-end
 //!   passthrough through amux.
+//! - `MOCK_ACP_ECHO_INITIALIZE_PARAMS=1` — include the received
+//!   `initialize.params` in the initialize result under
+//!   `_seenInitializeParams`. Used by proxy sanitization tests.
 //! - `MOCK_ACP_SESSION_LIST_META=1` — add agent-owned `_meta` and
 //!   `_meta.amux` fields to the current session/list entry so tests can
 //!   verify mux decoration merges instead of replacing upstream metadata.
@@ -78,6 +84,9 @@ fn main() {
     let emit_permission = env::var("MOCK_ACP_EMIT_PERMISSION")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let emit_client_tool = env::var("MOCK_ACP_EMIT_CLIENT_TOOL")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let prompt_delay_ms = env::var("MOCK_ACP_PROMPT_DELAY_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -97,6 +106,9 @@ fn main() {
     let session_list = env::var("MOCK_ACP_SESSION_LIST")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let echo_initialize_params = env::var("MOCK_ACP_ECHO_INITIALIZE_PARAMS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let session_list_meta = env::var("MOCK_ACP_SESSION_LIST_META")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -111,6 +123,7 @@ fn main() {
     let mut session_new_count: u32 = 0;
     let mut prompt_count: u32 = 0;
     let mut next_permission_id: u64 = 10_000;
+    let mut next_client_tool_id: u64 = 20_000;
     let mut response_echo_count: u32 = 0;
     let mut cancel_echo_count: u32 = 0;
     let mut session_cancel_echo_count: u32 = 0;
@@ -155,6 +168,8 @@ fn main() {
                     "params": {
                         "id": id,
                         "seq": response_echo_count,
+                        "result": frame.get("result").cloned().unwrap_or(Value::Null),
+                        "error": frame.get("error").cloned().unwrap_or(Value::Null),
                     },
                 });
                 writeln!(stdout, "{echo}").ok();
@@ -219,6 +234,10 @@ fn main() {
                     result["agentCapabilities"] = json!({
                         "sessionCapabilities": { "list": {} },
                     });
+                }
+                if echo_initialize_params {
+                    result["_seenInitializeParams"] =
+                        frame.get("params").cloned().unwrap_or(Value::Null);
                 }
                 let resp = json!({
                     "jsonrpc": "2.0",
@@ -392,6 +411,18 @@ fn main() {
                     }
                 }
 
+                if let Some(method) = emit_client_tool.as_deref() {
+                    next_client_tool_id += 1;
+                    let request = json!({
+                        "jsonrpc": "2.0",
+                        "id": next_client_tool_id,
+                        "method": method,
+                        "params": mock_client_tool_params(method, &sess),
+                    });
+                    writeln!(stdout, "{request}").ok();
+                    stdout.flush().ok();
+                }
+
                 // Stream two update notifications.
                 for chunk in ["hello ", "world"] {
                     let upd = json!({
@@ -434,5 +465,27 @@ fn main() {
                 stdout.flush().ok();
             }
         }
+    }
+}
+
+fn mock_client_tool_params(method: &str, session_id: &Value) -> Value {
+    match method {
+        "fs/read_text_file" => json!({
+            "sessionId": session_id,
+            "path": "/tmp/amux-client-tool-read.txt",
+        }),
+        "fs/write_text_file" => json!({
+            "sessionId": session_id,
+            "path": "/tmp/amux-client-tool-write.txt",
+            "content": "hello from mock_acp",
+        }),
+        "terminal/create" => json!({
+            "sessionId": session_id,
+            "command": "echo",
+            "args": ["hello from mock_acp"],
+        }),
+        _ => json!({
+            "sessionId": session_id,
+        }),
     }
 }
