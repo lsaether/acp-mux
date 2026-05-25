@@ -37,6 +37,7 @@ Health and debug endpoints:
 | `--session-ttl-seconds`    | `60`          | Grace window after last subscriber leaves — a reconnect within this window keeps the same subprocess. |
 | `--replay-turns`           | `unbounded`   | `unbounded` keeps the full broadcast log; `0` disables it; `N > 0` is accepted and warned (bounded eviction lands in v0.2). |
 | `--meta-propagate`         | `false`       | Opt into injecting mux trace fields into subscriber → agent requests at `params._meta.amux`. |
+| `--unsafe-debug-client-tool-broadcast` | `false` | **Unsafe/debug only.** Restores raw fanout for agent-initiated `fs/*` and `terminal/*` requests; side effects may duplicate across subscribers. |
 | `--log-level`              | `info`        | `trace`/`debug`/`info`/`warn`/`error`. `RUST_LOG` wins when set. |
 
 ## Agent compatibility
@@ -45,8 +46,8 @@ Health and debug endpoints:
 
 | Agent / harness | Status | Notes |
 |---|---|---|
-| **[hermes-agent](https://github.com/hermes-agent/hermes)** | ✅ Directly supported | Hermes self-handles fs/terminal/tool execution inside its own process and never delegates those calls over ACP, so [#2](https://github.com/lsaether/acp-mux/issues/2) does not apply to the Hermes path. |
-| **Codex (Zed-bundled)**, **claude-code-acp**, **copilot-acp** | ⚠️ Best-effort / partial | Basic ACP envelope routing should work, but these are not directly harnessed right now. Agents that delegate `fs/*` or `terminal/*` to the client will misbehave until [#2](https://github.com/lsaether/acp-mux/issues/2) lands. |
+| **[hermes-agent](https://github.com/hermes-agent/hermes)** | ✅ Directly supported | Hermes self-handles fs/terminal/tool execution inside its own process and does not delegate those calls over ACP. |
+| **Codex (Zed-bundled)**, **claude-code-acp**, **copilot-acp** | ⚠️ Best-effort / partial | Basic ACP envelope routing should work, but these are not directly harnessed right now. Agents that delegate `fs/*` or `terminal/*` to the client are safe-blocked by default; full delegated-client compatibility is tracked in [#37](https://github.com/lsaether/acp-mux/issues/37) and follow-ups. |
 
 ## How it works
 
@@ -54,14 +55,15 @@ Health and debug endpoints:
 - **JSON-RPC envelope routing.** The mux parses only the envelope (`id`, `method`, `params`, `result`, `error`). Payloads are forwarded byte-for-byte. Policy keys off the `method` string.
 - **Per-session id translation.** Each subscriber's request `id` is rewritten to a per-session `mux_id` before forwarding; the response is rewritten back and sent only to the originator.
 - **`initialize` / `session/new` caching.** First response is cached; later joiners are answered locally without re-sending to the agent.
-- **Broadcast agent-initiated requests.** Agent-initiated requests (e.g. `session/request_permission`) are fanned out live to every attached subscriber; any peer can reply. The mux also emits inert `amux/agent_request_opened` lifecycle metadata for replay/audit context. The first reply for a given id is forwarded to the agent and later replies for the same id are dropped, so the agent always sees exactly one response.
+- **Collaborative agent-initiated requests.** `session/request_permission` is fanned out live to every attached subscriber; any peer can reply. The mux also emits inert `amux/agent_request_opened` lifecycle metadata for replay/audit context. The first reply for a given id is forwarded to the agent and later replies for the same id are dropped, so the agent always sees exactly one response.
+- **Client-tool policy.** By default, agent-initiated `fs/*` and `terminal/*` client-tool requests are blocked in the mux, answered to the agent with JSON-RPC `-32000`, and not broadcast/replayed. `initialize.params.clientCapabilities.fs` and `.terminal` are stripped before the first initialize reaches the agent. `--unsafe-debug-client-tool-broadcast` explicitly restores the old raw fanout for diagnostics only.
 - **Turn serialization.** Concurrent `session/prompt` while a turn is in flight is rejected with JSON-RPC `-32001`. The last subscriber to issue a substantive request is still surfaced as the "driving subscriber" in `/debug/sessions` and `amux/turn_started` for UI attribution.
 - **Opt-in request trace metadata.** With `--meta-propagate`, outbound subscriber → agent requests get mux-owned `params._meta.amux` fields (`peerId`, `peerName`, `role`, `muxId`, and `amuxTurnId` for prompts) for cross-client debugging. Default mode leaves request payload metadata unchanged.
 - **Cold-start session discovery.** `GET /acp/sessions` runs a transient agent-side `session/list` query before any WebSocket attach, useful for dashboards that need to browse persisted sessions before choosing one to resume.
 - **Live `session/list` decoration.** Returned `sessions[]` entries that match a live muxed upstream session get `sessions[i]._meta.amux` fields (`proxySessionId`, `subscriberCount`, optional `drivingSubscriber`), preserving existing `_meta` keys and leaving non-live entries unchanged.
 - **`amux/*` notification namespace.** The mux publishes its own metadata out-of-band: `amux/session_context`, `amux/peer_joined`, `amux/peer_left`, `amux/turn_started`, `amux/turn_complete`, `amux/turn_cancelled`, `amux/session_busy`, `amux/agent_request_opened`, `amux/agent_request_resolved`. ACP frames stay clean; clients see two distinguishable channels and demultiplex by method prefix.
-- **Cancellation.** `$/cancel_request` (request-cancellation RFD) works both directions: subscribers can cancel their own in-flight requests; agents can cancel agent-initiated requests (broadcast to peers + `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`). The amux extension `amux/cancel_active_turn` lets *any* attached peer cancel the in-flight turn (not just the driver) — internally it sends ACP-native `session/cancel { sessionId }` toward the agent and emits `amux/turn_cancelled` to peers.
-- **Replay log.** Every broadcast-tier frame (`amux/*` + agent notifications) is appended; a late joiner receives the full history before any live event. Raw actionable agent-initiated requests are live-only and are not replayed; late joiners see the inert `amux/agent_request_opened` + `amux/agent_request_resolved` lifecycle pair instead.
+- **Cancellation.** `$/cancel_request` (request-cancellation RFD / unstable schema, not stable ACP v1) works both directions: subscribers can cancel their own in-flight requests; agents can cancel agent-initiated requests (broadcast to peers + `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`). The amux extension `amux/cancel_active_turn` lets *any* attached peer cancel the in-flight turn (not just the driver) — internally it sends ACP-native `session/cancel { sessionId }` toward the agent and emits `amux/turn_cancelled` to peers.
+- **Replay log.** Every broadcast-tier frame (`amux/*` + agent notifications) is appended; a late joiner receives the full history before any live event. Raw collaborative agent-initiated requests are live-only and are not replayed; late joiners see the inert `amux/agent_request_opened` + `amux/agent_request_resolved` lifecycle pair instead. Blocked client-tool requests never enter this lifecycle.
 - **TTL grace.** Last subscriber leaving starts a countdown; a reconnect within `--session-ttl-seconds` reuses the same subprocess with all of its caches intact.
 
 ## Client contract
@@ -78,33 +80,45 @@ Detailed protocol spec: [`docs/design/amux-namespace.md`](docs/design/amux-names
 
 ## ACP coverage
 
-amux parses only JSON-RPC envelopes (`id`, `method`, `params`, `result`, `error`) and forwards payloads byte-for-byte. Any ACP method amux doesn't specifically intercept passes through transparently. The table below lists methods that need special handling and where amux stands.
+amux parses only JSON-RPC envelopes (`id`, `method`, `params`, `result`, `error`) and forwards payloads byte-for-byte unless a method has mux-specific semantics. Any ACP method amux does not specifically intercept passes through transparently.
 
-"Spec status" reflects the upstream ACP lifecycle ([RFD process](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/about.mdx)): **Core** = part of the stable spec; **Draft RFD** = merged into `docs/rfds/` on main but not yet promoted to Preview/Completed (implementations may begin, not a stability commitment); **Open RFD** = still an unmerged PR.
+This table was audited against the stable ACP v1 schema release [`v0.13.3`](https://github.com/agentclientprotocol/agent-client-protocol/releases/tag/v0.13.3) (published 2026-05-22) and the upstream docs at `agentclientprotocol/agent-client-protocol@a3b012c`. **Stable v1** means present in `schema/schema.json` and the current `/protocol/*` docs. **Unstable/RFD** means it appears only in `schema.unstable.json`, `docs/rfds/*`, or an unmerged proposal; amux support there is intentionally called out as extension behavior, not stable ACP compliance.
 
 ### Client-initiated (subscriber → agent)
 
 | Method | amux | Spec status | Notes |
 |---|---|---|---|
-| `initialize` | ✅ | Core | Forwarded; first response cached; `agentCapabilities` from the upstream agent passed through. |
-| `session/new` | ✅ | Core | Forwarded; first response cached for late joiners. |
-| `session/load` | ✅ | Core | Forwarded to the agent like any other request. On success, amux rebinds the room's canonical session id (used by late joiners' `session/new` calls) to the loaded session; failed loads leave the cache untouched. |
-| `session/prompt` | ✅ | Core | Forwarded with id translation; turn serialization; concurrent prompts rejected with `-32001`. |
-| `session/cancel` | ✅ | Core | Forwarded unchanged from vanilla clients; also emitted southbound by `amux/cancel_active_turn` for active-turn interruption. |
-| `session/set_mode` | ✅ (envelope passthrough) | Core | Not specifically handled. |
-| `$/cancel_request` | ✅ | Draft RFD (optional per spec) | Strict per-peer semantics; cancels own in-flight requests only. |
-| `session/attach`, `session/detach` | ⏳ | Open RFD ([#533](https://github.com/agentclientprotocol/agent-client-protocol/pull/533)) | Implemented on branch [`rfd-533-alignment`](https://github.com/lsaether/acp-mux/pull/3), shelved pending RFD ratification. |
-| `session/list` | ✅ | Draft RFD | Over WS, forwarded to the agent like any other request; capability advertisement (`sessionCapabilities.list`) propagates from the agent. The outbound request can carry `params._meta.amux` trace fields when `--meta-propagate` is enabled. Returned `sessions[]` entries that match live mux state are decorated under `sessions[i]._meta.amux`; non-live entries and existing agent-owned metadata are preserved. For cold-start UIs, `GET /acp/sessions?cwd=...` performs a transient agent-side `session/list` before any WS attach. |
+| `initialize` | ✅ | Stable v1 | Forwarded after stripping blocked client-tool capabilities; first response cached; upstream `agentCapabilities` passed through. |
+| `authenticate` | ✅ (envelope passthrough) | Stable v1 | Auth state belongs to the shared upstream agent subprocess. |
+| `logout` | ✅ (envelope passthrough) | Stable v1 | Stable as of the logout-method RFD completion; amux does not currently clear cached initialize/session state after logout. |
+| `session/new` | ✅ | Stable v1 | Forwarded; first response cached for late joiners. |
+| `session/load` | ✅ | Stable v1 | Forwarded to the agent. On success, amux rebinds the room's canonical session id and replay-generation boundary to the loaded session; failed loads leave the cache untouched. |
+| `session/resume` | ⚠️ envelope passthrough | Stable v1 | Forwarded, but not yet given `session/load`-style canonical-session rebinding for late joiners. |
+| `session/close` | ⚠️ envelope passthrough | Stable v1 | Forwarded, but amux does not yet tear down the mux room or clear local caches after a successful close. |
+| `session/list` | ✅ | Stable v1 | Over WS, forwarded with id translation and optional `params._meta.amux` trace fields. Returned `sessions[]` entries matching live mux state are decorated under `sessions[i]._meta.amux`; non-live entries and agent-owned metadata are preserved. `GET /acp/sessions?cwd=...` performs a transient agent-side `session/list` before any WS attach. |
+| `session/prompt` | ✅ | Stable v1 | Forwarded with id translation; turn serialization; concurrent prompts rejected with `-32001`. |
+| `session/cancel` | ✅ | Stable v1 | Forwarded unchanged from vanilla clients; also emitted southbound by `amux/cancel_active_turn` for active-turn interruption. |
+| `session/set_mode` | ✅ (envelope passthrough) | Stable v1 | Not specifically handled. Session modes remain in stable v1 but are expected to change in ACP v2. |
+| `session/set_config_option` | ✅ (envelope passthrough) | Stable v1 | Not specifically handled; upstream agent owns config state and any resulting `session/update` notifications. |
+| `$/cancel_request` | ✅ | Unstable/RFD | Optional request-cancellation RFD; not in stable `schema.json`. Strict per-peer semantics; subscribers can cancel their own in-flight requests only. |
 
 ### Agent-initiated (agent → subscriber)
 
 | Method | amux | Spec status | Notes |
 |---|---|---|---|
-| `session/update` | ✅ | Core | Broadcast to every attached subscriber; appended to replay log. |
-| `session/request_permission` | ✅ | Core | Broadcast live with first-writer-wins reply; `amux/agent_request_opened` records inert replay context; `amux/agent_request_resolved` fires when consumed; turn-end sweep cleans up abandoned requests. |
-| `$/cancel_request` | ✅ | Draft RFD (optional per spec) | Marks `agent_pending` Consumed; broadcasts to all peers; emits `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`. |
-| `fs/read_text_file`, `fs/write_text_file` | ❌ | Core | Tracked in [#2](https://github.com/lsaether/acp-mux/issues/2). amux currently broadcasts these to subscribers, which is broken for any agent that delegates fs to the client (Codex, claude-code-acp, copilot-acp). Self-handling design agreed; implementation deferred. |
-| `terminal/create`, `terminal/output`, `terminal/wait_for_exit`, `terminal/kill`, `terminal/release` | ❌ | Core | Same as `fs/*` — tracked in [#2](https://github.com/lsaether/acp-mux/issues/2). |
+| `session/update` | ✅ | Stable v1 | Broadcast to every attached subscriber; appended to replay log. Includes stable update variants such as `session_info_update`, `available_commands_update`, `current_mode_update`, and `config_option_update` as opaque payloads. |
+| `session/request_permission` | ✅ | Stable v1 | Broadcast live with first-writer-wins reply; `amux/agent_request_opened` records inert replay context; `amux/agent_request_resolved` fires when consumed; turn-end sweep cleans up abandoned requests. |
+| `fs/read_text_file`, `fs/write_text_file` | ✅ safe default / 🚧 not provided | Stable v1 client-tool methods | amux does not advertise filesystem client capabilities by default. If an agent sends `fs/*` anyway, amux returns structured `-32000 { reason: "client_tool_blocked" }` to the agent and does not broadcast/replay. Full delegated-client modes are tracked in [#37](https://github.com/lsaether/acp-mux/issues/37). |
+| `terminal/create`, `terminal/output`, `terminal/wait_for_exit`, `terminal/kill`, `terminal/release` | ✅ safe default / 🚧 not provided | Stable v1 client-tool methods | Same policy as `fs/*`: `terminal` is stripped from advertised client capabilities and runtime requests are blocked unless `--unsafe-debug-client-tool-broadcast` is explicitly enabled. |
+| `$/cancel_request` | ✅ | Unstable/RFD | Optional request-cancellation RFD; not in stable `schema.json`. Marks `agent_pending` Consumed; broadcasts to all peers; emits `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`. |
+
+### Unstable ACP / RFD surfaces
+
+| Surface | amux | Status | Notes |
+|---|---|---|---|
+| `params._meta.amux` trace propagation | ✅ opt-in | `_meta` stable, propagation convention from RFD | `--meta-propagate` writes mux-owned metadata under the reserved `_meta` extension field without replacing existing agent/client metadata. |
+| `session/delete`, `session/fork`, provider methods, NES methods, MCP-over-ACP, elicitation | ➡️ generic passthrough only | Unstable schema / RFDs | Not intentionally implemented by amux. If experimental peers send them, amux envelope-routes them unless they later need mux-specific state handling. |
+| `session/attach`, `session/detach` | ⏳ shelved branch only | Historical open RFD / PR #533 | Implemented on branch [`rfd-533-alignment`](https://github.com/lsaether/acp-mux/pull/3), not shipped on main. |
 
 ### amux extensions (not part of ACP)
 
