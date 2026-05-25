@@ -483,6 +483,11 @@ historical events but the protocol shape is identical.
 
 ## Cancellation
 
+`$/cancel_request` is implemented from the ACP request-cancellation RFD and
+the upstream unstable schema; it is not part of the stable ACP v1 schema as of
+ACP `v0.13.3`. `amux/cancel_active_turn` is an acp-mux extension layered on
+top of stable ACP `session/cancel`.
+
 amux keeps two cancellation paths distinct:
 
 - `$/cancel_request` is strict request-id cancellation in the sender's
@@ -503,10 +508,12 @@ cancel is dropped silently. Cross-peer "stop the active turn" uses
 `amux/cancel_active_turn` instead.
 
 **Agent → subscribers.** When the agent emits `$/cancel_request` for
-an in-flight agent-initiated request (in practice `session/request_permission`),
-amux marks the `agent_pending` entry `Consumed` so late subscriber
-replies are swallowed by the existing first-writer-wins gate. The
-cancellation is then broadcast to every subscriber, and an
+an in-flight broadcast-tier agent-initiated request (for example
+`session/request_permission`; ACP client-tool requests are blocked by default
+before entering this lifecycle), amux marks the `agent_pending` entry
+`Consumed` so late subscriber replies are swallowed by the existing
+first-writer-wins gate. The cancellation is then broadcast to every subscriber,
+and an
 `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }` is
 emitted alongside for amux-aware clients.
 

@@ -1043,11 +1043,12 @@ impl SessionInner {
     }
 
     /// Agent-emitted `$/cancel_request`: cancels an agent-initiated
-    /// request that's still InFlight in `agent_pending` (in practice
-    /// always `session/request_permission`, the only agent-initiated
-    /// request the spec defines today). Forward the cancellation to
-    /// every subscriber so their UIs dismiss, mark the entry Consumed
-    /// to swallow late replies, and emit the
+    /// request that's still InFlight in `agent_pending` (currently only
+    /// broadcast-tier requests such as `session/request_permission`; ACP
+    /// client-tool requests are policy-blocked by default before they
+    /// enter this lifecycle). Forward the cancellation to every
+    /// subscriber so their UIs dismiss, mark the entry Consumed to
+    /// swallow late replies, and emit the
     /// `amux/agent_request_resolved` sibling for amux clients.
     fn handle_agent_cancel(
         &mut self,
@@ -1238,11 +1239,11 @@ impl SessionInner {
     /// Broadcast `amux/agent_request_resolved` so peers can dismiss the
     /// matching pending UI. Called once per agent-initiated request id
     /// (on the InFlight → Consumed transition). The frame echoes the
-    /// winning subscriber's `result` or `error` verbatim; for the only
-    /// agent-initiated request the protocol currently has —
-    /// `session/request_permission` — the result is derived entirely
-    /// from `options[]` that was already broadcast in the request, so
-    /// no new information leaks.
+    /// winning subscriber's `result` or `error` verbatim. For
+    /// `session/request_permission`, the result is derived entirely from
+    /// `options[]` that was already broadcast in the request, so no new
+    /// information leaks. ACP client-tool requests (`fs/*`,
+    /// `terminal/*`) are not broadcast in the default policy.
     fn emit_agent_request_resolved(&mut self, resolved_by: &str, resp: &IncomingResponse) {
         let request_id_value = match serde_json::to_value(&resp.id) {
             Ok(v) => v,
