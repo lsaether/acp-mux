@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
 
 use crate::agent::process::AgentProcess;
-use crate::cli::ReplayTurns;
+use crate::cli::{ClientToolPolicy, ReplayTurns};
 use crate::multiplex::subscriber::Subscriber;
 use crate::protocol::jsonrpc::{Id, Incoming, JsonRpcError, ParseError};
 use crate::session::state::{
@@ -135,6 +135,7 @@ pub struct SessionRegistry {
     replay_policy: ReplayTurns,
     session_ttl: Duration,
     meta_propagate: bool,
+    client_tool_policy: ClientToolPolicy,
     session_list_index: Arc<SessionListMetadataIndex>,
     sessions: Mutex<HashMap<String, SessionHandle>>,
 }
@@ -145,7 +146,13 @@ impl SessionRegistry {
         replay_policy: ReplayTurns,
         session_ttl: Duration,
     ) -> Arc<Self> {
-        Self::new_with_meta_propagation(agent_cmd, replay_policy, session_ttl, false)
+        Self::new_with_client_tool_policy(
+            agent_cmd,
+            replay_policy,
+            session_ttl,
+            false,
+            ClientToolPolicy::default(),
+        )
     }
 
     pub fn new_with_meta_propagation(
@@ -154,11 +161,28 @@ impl SessionRegistry {
         session_ttl: Duration,
         meta_propagate: bool,
     ) -> Arc<Self> {
+        Self::new_with_client_tool_policy(
+            agent_cmd,
+            replay_policy,
+            session_ttl,
+            meta_propagate,
+            ClientToolPolicy::default(),
+        )
+    }
+
+    pub fn new_with_client_tool_policy(
+        agent_cmd: Option<AgentCmd>,
+        replay_policy: ReplayTurns,
+        session_ttl: Duration,
+        meta_propagate: bool,
+        client_tool_policy: ClientToolPolicy,
+    ) -> Arc<Self> {
         Arc::new(Self {
             agent_cmd,
             replay_policy,
             session_ttl,
             meta_propagate,
+            client_tool_policy,
             session_list_index: Arc::new(SessionListMetadataIndex::new()),
             sessions: Mutex::new(HashMap::new()),
         })
@@ -267,6 +291,7 @@ impl SessionRegistry {
                 replay_policy: self.replay_policy,
                 session_ttl: self.session_ttl,
                 meta_propagate: self.meta_propagate,
+                client_tool_policy: self.client_tool_policy,
                 session_list_index: self.session_list_index.clone(),
                 agent_cwd,
             },

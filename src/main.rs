@@ -26,11 +26,19 @@ async fn main() -> Result<()> {
         );
     }
 
-    let registry = SessionRegistry::new_with_meta_propagation(
+    let client_tool_policy = cli.client_tool_policy();
+    if cli.unsafe_debug_client_tool_broadcast {
+        tracing::warn!(
+            "UNSAFE: raw-broadcasting agent-initiated fs/* and terminal/* client-tool requests; side effects may duplicate",
+        );
+    }
+
+    let registry = SessionRegistry::new_with_client_tool_policy(
         agent_cmd,
         cli.replay_turns,
         std::time::Duration::from_secs(cli.session_ttl_seconds),
         cli.meta_propagate,
+        client_tool_policy,
     );
     let app = server::router(server::AppState::new(registry));
 

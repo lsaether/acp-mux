@@ -39,6 +39,11 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub meta_propagate: bool,
 
+    /// UNSAFE: raw-broadcast agent-initiated fs/* and terminal/* client-tool
+    /// requests to every subscriber. May duplicate local side effects.
+    #[arg(long, default_value_t = false)]
+    pub unsafe_debug_client_tool_broadcast: bool,
+
     /// Logging verbosity. Overridden by RUST_LOG when that variable is set.
     #[arg(long, value_enum, default_value_t = LogLevel::Info)]
     pub log_level: LogLevel,
@@ -61,6 +66,60 @@ impl LogLevel {
             LogLevel::Info => "info",
             LogLevel::Warn => "warn",
             LogLevel::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientToolMode {
+    Block,
+    UnsafeDebug,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientToolPolicy {
+    pub fs: ClientToolMode,
+    pub terminal: ClientToolMode,
+}
+
+impl ClientToolPolicy {
+    pub fn block_by_default() -> Self {
+        Self {
+            fs: ClientToolMode::Block,
+            terminal: ClientToolMode::Block,
+        }
+    }
+
+    pub fn unsafe_debug_broadcast() -> Self {
+        Self {
+            fs: ClientToolMode::UnsafeDebug,
+            terminal: ClientToolMode::UnsafeDebug,
+        }
+    }
+
+    pub fn mode_for_method(&self, method: &str) -> Option<ClientToolMode> {
+        if method.starts_with("fs/") {
+            Some(self.fs)
+        } else if method.starts_with("terminal/") {
+            Some(self.terminal)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for ClientToolPolicy {
+    fn default() -> Self {
+        Self::block_by_default()
+    }
+}
+
+impl Cli {
+    pub fn client_tool_policy(&self) -> ClientToolPolicy {
+        if self.unsafe_debug_client_tool_broadcast {
+            ClientToolPolicy::unsafe_debug_broadcast()
+        } else {
+            ClientToolPolicy::block_by_default()
         }
     }
 }
@@ -153,5 +212,43 @@ mod tests {
     fn meta_propagate_flag_enables_trace_injection() {
         let cli = Cli::try_parse_from(["amux", "--meta-propagate"]).unwrap();
         assert!(cli.meta_propagate);
+    }
+
+    #[test]
+    fn client_tool_policy_blocks_fs_and_terminal_by_default() {
+        let cli = Cli::try_parse_from(["amux"]).unwrap();
+        let policy = cli.client_tool_policy();
+        assert_eq!(
+            policy.mode_for_method("fs/read_text_file"),
+            Some(ClientToolMode::Block)
+        );
+        assert_eq!(
+            policy.mode_for_method("terminal/create"),
+            Some(ClientToolMode::Block)
+        );
+        assert_eq!(
+            policy.mode_for_method("session/request_permission"),
+            None,
+            "permission prompts stay on the collaborative request path",
+        );
+        assert_eq!(
+            policy.mode_for_method("vendor/unknown"),
+            None,
+            "v1 only classifies fs/* and terminal/* namespaces",
+        );
+    }
+
+    #[test]
+    fn unsafe_debug_flag_enables_fs_and_terminal_broadcast() {
+        let cli = Cli::try_parse_from(["amux", "--unsafe-debug-client-tool-broadcast"]).unwrap();
+        let policy = cli.client_tool_policy();
+        assert_eq!(
+            policy.mode_for_method("fs/write_text_file"),
+            Some(ClientToolMode::UnsafeDebug)
+        );
+        assert_eq!(
+            policy.mode_for_method("terminal/create"),
+            Some(ClientToolMode::UnsafeDebug)
+        );
     }
 }

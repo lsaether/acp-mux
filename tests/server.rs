@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use amux::cli::ReplayTurns;
+use amux::cli::{ClientToolPolicy, ReplayTurns};
 use amux::server::{
     AppState, CLOSE_CODE_BAD_QUERY, CLOSE_CODE_INTERNAL, CLOSE_CODE_PEER_CONFLICT, router,
 };
@@ -65,6 +65,27 @@ async fn spawn_server_with_meta_propagation(
         ReplayTurns::Unbounded,
         TEST_DEFAULT_TTL,
         enabled,
+    );
+    let app = router(AppState::new(registry.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (addr, registry)
+}
+
+async fn spawn_server_with_client_tool_policy(
+    agent_cmd: Option<AgentCmd>,
+    client_tool_policy: ClientToolPolicy,
+) -> (SocketAddr, Arc<SessionRegistry>) {
+    let registry = SessionRegistry::new_with_client_tool_policy(
+        agent_cmd,
+        ReplayTurns::Unbounded,
+        TEST_DEFAULT_TTL,
+        false,
+        client_tool_policy,
     );
     let app = router(AppState::new(registry.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -621,6 +642,18 @@ async fn original_id_is_preserved_across_mux() {
 /// Helper for chunk 5/6 tests: spawn acp-mux with mock_acp wrapped to
 /// pass through env vars (permission emission, prompt delay).
 async fn spawn_server_with_mock_env(env: &[(&str, &str)]) -> (SocketAddr, Arc<SessionRegistry>) {
+    spawn_server(Some(mock_agent_cmd_with_env(env))).await
+}
+
+async fn spawn_server_with_mock_env_and_client_tool_policy(
+    env: &[(&str, &str)],
+    client_tool_policy: ClientToolPolicy,
+) -> (SocketAddr, Arc<SessionRegistry>) {
+    spawn_server_with_client_tool_policy(Some(mock_agent_cmd_with_env(env)), client_tool_policy)
+        .await
+}
+
+fn mock_agent_cmd_with_env(env: &[(&str, &str)]) -> AgentCmd {
     // We can't customize per-process env via AgentCmd directly without
     // adding it to the schema; for now use `env -i` style invocation
     // via /usr/bin/env if available, falling back to a wrapper that
@@ -630,11 +663,10 @@ async fn spawn_server_with_mock_env(env: &[(&str, &str)]) -> (SocketAddr, Arc<Se
         args.push(format!("{k}={v}"));
     }
     args.push(mock_acp_path());
-    spawn_server(Some(AgentCmd {
+    AgentCmd {
         program: "/usr/bin/env".to_string(),
         args,
-    }))
-    .await
+    }
 }
 
 /// Drain all text frames from `ws` until `dur` elapses; returns them
@@ -1336,6 +1368,189 @@ async fn agent_request_broadcasts_to_every_subscriber() {
 
     let _ = ws_a.send(ClientMsg::Close(None)).await;
     let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn agent_fs_read_request_blocked_by_default_and_not_broadcast() {
+    assert_agent_client_tool_blocked_by_default("fs/read_text_file").await;
+}
+
+#[tokio::test]
+async fn agent_fs_write_request_blocked_by_default_and_not_broadcast() {
+    assert_agent_client_tool_blocked_by_default("fs/write_text_file").await;
+}
+
+#[tokio::test]
+async fn agent_terminal_create_request_blocked_by_default_and_not_broadcast() {
+    assert_agent_client_tool_blocked_by_default("terminal/create").await;
+}
+
+#[tokio::test]
+async fn unsafe_debug_client_tool_broadcast_preserves_raw_fanout() {
+    let (a_frames, b_frames) = drive_agent_client_tool_prompt_with_policy(
+        "fs/read_text_file",
+        ClientToolPolicy::unsafe_debug_broadcast(),
+    )
+    .await;
+
+    assert!(
+        frames_contain_method(&a_frames, "fs/read_text_file"),
+        "unsafe debug should preserve raw fs request fanout to A; frames: {a_frames:?}",
+    );
+    assert!(
+        frames_contain_method(&b_frames, "fs/read_text_file"),
+        "unsafe debug should preserve raw fs request fanout to B; frames: {b_frames:?}",
+    );
+    assert!(
+        find_client_tool_block_echo(&a_frames, "fs/read_text_file").is_none(),
+        "unsafe debug should not synthesize a blocked error; frames: {a_frames:?}",
+    );
+
+    // Permission prompts remain the collaborative broadcast path; this
+    // test covers only the scary client-tool escape hatch.
+}
+
+#[tokio::test]
+async fn initialize_strips_blocked_client_tool_capabilities_by_default() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_ECHO_INITIALIZE_PARAMS", "1")]).await;
+    let url = format!("ws://{addr}/acp?session=clienttool&peer_id=A");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    let resp = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":true,"writeTextFile":true},"terminal":true,"session":{"load":{}},"customTool":{"enabled":true}}}}"#,
+    )
+    .await;
+
+    let caps = resp["result"]["_seenInitializeParams"]["clientCapabilities"]
+        .as_object()
+        .expect("mock should echo clientCapabilities object");
+    assert!(
+        !caps.contains_key("fs"),
+        "blocked default policy must not advertise fs capability to the agent: {caps:?}",
+    );
+    assert!(
+        !caps.contains_key("terminal"),
+        "blocked default policy must not advertise terminal capability to the agent: {caps:?}",
+    );
+    assert_eq!(
+        caps.get("session"),
+        Some(&serde_json::json!({"load": {}})),
+        "non-client-tool capabilities should be preserved",
+    );
+    assert_eq!(
+        caps.get("customTool"),
+        Some(&serde_json::json!({"enabled": true})),
+        "unknown client capabilities should not be stripped in v1",
+    );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+async fn assert_agent_client_tool_blocked_by_default(method: &str) {
+    let (a_frames, b_frames) = drive_agent_client_tool_prompt(method).await;
+
+    assert!(
+        !frames_contain_method(&a_frames, method),
+        "blocked {method} must not be delivered to subscriber A; frames: {a_frames:?}",
+    );
+    assert!(
+        !frames_contain_method(&b_frames, method),
+        "blocked {method} must not be delivered to subscriber B; frames: {b_frames:?}",
+    );
+
+    let echo = find_client_tool_block_echo(&a_frames, method).unwrap_or_else(|| {
+        panic!("blocked {method} should produce a structured error response to the agent; frames: {a_frames:?}")
+    });
+    assert_eq!(echo["params"]["error"]["code"], serde_json::json!(-32000));
+    assert_eq!(
+        echo["params"]["error"]["data"]["reason"],
+        serde_json::json!("client_tool_blocked"),
+    );
+    assert_eq!(
+        echo["params"]["error"]["data"]["method"],
+        serde_json::json!(method),
+    );
+}
+
+async fn drive_agent_client_tool_prompt(
+    method: &str,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let (addr, _) = spawn_server_with_mock_env(&[
+        ("MOCK_ACP_EMIT_CLIENT_TOOL", method),
+        ("MOCK_ACP_ECHO_RESPONSES", "1"),
+    ])
+    .await;
+    drive_prompt_and_collect(addr).await
+}
+
+async fn drive_agent_client_tool_prompt_with_policy(
+    method: &str,
+    client_tool_policy: ClientToolPolicy,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let (addr, _) = spawn_server_with_mock_env_and_client_tool_policy(
+        &[
+            ("MOCK_ACP_EMIT_CLIENT_TOOL", method),
+            ("MOCK_ACP_ECHO_RESPONSES", "1"),
+        ],
+        client_tool_policy,
+    )
+    .await;
+    drive_prompt_and_collect(addr).await
+}
+
+async fn drive_prompt_and_collect(
+    addr: SocketAddr,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let url_a = format!("ws://{addr}/acp?session=clienttool&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=clienttool&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let frames = collect_frames(&mut ws_a, &mut ws_b, Duration::from_secs(3)).await;
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+    frames
+}
+
+fn frames_contain_method(frames: &[serde_json::Value], method: &str) -> bool {
+    frames
+        .iter()
+        .any(|v| v.get("method") == Some(&serde_json::json!(method)))
+}
+
+fn find_client_tool_block_echo<'a>(
+    frames: &'a [serde_json::Value],
+    method: &str,
+) -> Option<&'a serde_json::Value> {
+    frames.iter().find(|v| {
+        v.get("method") == Some(&serde_json::json!("mock/response_echo"))
+            && v["params"]["error"]["data"]["reason"] == serde_json::json!("client_tool_blocked")
+            && v["params"]["error"]["data"]["method"] == serde_json::json!(method)
+    })
 }
 
 /// When two subscribers reply to the same agent-initiated request id,
