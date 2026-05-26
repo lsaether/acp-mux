@@ -25,13 +25,14 @@ recorded the frame, and resolved agent-initiated requests replay through inert
 `amux/*` lifecycle events rather than re-emitting actionable `session/*`
 requests. Clients receive distinguishable signals and demultiplex them.
 
-Implementation rule: **the multiplexer parses JSON-RPC envelopes only, with
-one narrow turn-serialization exception.** Everything past
+Implementation rule: **the multiplexer parses JSON-RPC envelopes only, except
+for mux-owned `amux/*` control methods.** Everything past
 `{id, method, params, result, error}` is `serde_json::Value`. Policy hooks
-(response caching, request routing) key off the `method` string; payload contents
-are opaque passthrough except that active-turn `session/prompt` handling inspects
-`params.prompt` just enough to permit text-only Hermes busy-control slash
-prompts (`/steer ...`, `/queue ...`) through without opening a second mux turn.
+(response caching, request routing) key off the `method` string; ACP payload
+contents remain opaque passthrough. Active-turn steering/queueing is not inferred
+from ACP `session/prompt` text. Clients use explicit `amux/steer_active_turn`
+or `amux/queue_prompt` requests, whose small `params` payloads are parsed by
+the mux control plane.
 
 ## Why a separate namespace
 
@@ -205,16 +206,16 @@ tools/terminal work even if a client connected from a different local cwd.
 
 ### `amux/session_busy`
 
-Broadcast when a `session/prompt` is rejected because another turn is
-already in flight. The rejected subscriber also gets a JSON-RPC error
-response with code `-32001`. Text-only Hermes busy-control prompts
-(`/steer ...`, `/queue ...`) are the exception: while a turn is active,
-amux forwards them southbound as ordinary JSON-RPC requests with id
-translation, but does not update the active driver, allocate an
-`amuxTurnId`, or emit turn bookends for them. Any downstream
-`session/update` acknowledgement the agent emits for the control command
-(for example Hermes' `/queue` depth text) is still broadcast and replayed
-like every other agent notification.
+Broadcast when a plain ACP `session/prompt` is rejected because another
+turn is already in flight. The rejected subscriber also gets a JSON-RPC
+error response with code `-32001`. Active-turn control does not rely on
+slash-command text inside `session/prompt`: clients use `amux/steer_active_turn`
+or `amux/queue_prompt` instead. Accepted amux control requests are forwarded
+southbound with id translation, but do not update the active driver, allocate
+an `amuxTurnId`, or emit turn bookends. Any downstream `session/update`
+acknowledgement the agent emits for the control command (for example Hermes'
+`/queue` depth text) is still broadcast and replayed like every other agent
+notification.
 
 ```json
 {
@@ -227,6 +228,60 @@ like every other agent notification.
   }
 }
 ```
+
+### `amux/steer_active_turn`
+
+Subscriber → proxy JSON-RPC request. Lets any attached peer steer the active
+turn without sending a second ordinary ACP prompt.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 17,
+  "method": "amux/steer_active_turn",
+  "params": {
+    "sessionId": "sess-mock",
+    "text": "focus on the migration path"
+  }
+}
+```
+
+### `amux/queue_prompt`
+
+Subscriber → proxy JSON-RPC request. Queues text for a compatible downstream
+agent while the current turn continues.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 18,
+  "method": "amux/queue_prompt",
+  "params": {
+    "sessionId": "sess-mock",
+    "text": "after that, update the docs"
+  }
+}
+```
+
+Shared semantics for both active-turn controls:
+
+- They require an active turn. If no prompt is in flight, the requester gets
+  JSON-RPC `-32002` (`amux active-turn control requires an active turn`).
+- `params.text` is the preferred payload. A text-only ACP-style
+  `params.prompt` array is also accepted for clients that already model
+  composer content as blocks. Empty text, non-text blocks, or non-string
+  `sessionId` values receive JSON-RPC `-32602`.
+- `params.sessionId` is optional when the mux already knows the active turn's
+  ACP session id. When present, it must match the active turn.
+- Accepted controls are translated to compatible downstream `session/prompt`
+  sideband requests. The current bridge renders Hermes-compatible text
+  (`/steer …` or `/queue …`) for the agent, but that compatibility is reached
+  through explicit `amux/*` methods rather than by inspecting generic ACP
+  prompt text.
+- They do **not** update `drivingSubscriber`, allocate a new `amuxTurnId`, or
+  emit `amux/turn_started` / `amux/turn_complete` bookends. The JSON-RPC
+  response returns only to the requester; agent-emitted notifications still
+  broadcast and replay normally.
 
 ### `amux/agent_request_opened`
 

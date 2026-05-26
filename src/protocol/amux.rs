@@ -20,6 +20,14 @@ const METHOD_AGENT_REQUEST_OPENED: &str = "amux/agent_request_opened";
 const METHOD_AGENT_REQUEST_RESOLVED: &str = "amux/agent_request_resolved";
 const METHOD_TURN_CANCELLED: &str = "amux/turn_cancelled";
 
+/// Method name for the amux extension that lets any attached peer steer
+/// the in-flight turn without issuing a second ordinary ACP prompt.
+pub const METHOD_STEER_ACTIVE_TURN: &str = "amux/steer_active_turn";
+
+/// Method name for the amux extension that asks a compatible agent to
+/// enqueue text for the next turn while another turn is active.
+pub const METHOD_QUEUE_PROMPT: &str = "amux/queue_prompt";
+
 /// Method name for the amux extension that lets any attached peer cancel
 /// the in-flight turn (not just the driver). Internally resolves to ACP
 /// `session/cancel` toward the agent; strict `$/cancel_request`

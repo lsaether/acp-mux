@@ -22,10 +22,11 @@
 //!   no longer has a privileged role at routing time.
 //! - `session/prompt` requests participate in turn serialization: while a
 //!   prompt is in flight, a second ordinary `session/prompt` is rejected
-//!   locally with JSON-RPC error code `-32001` ("session busy"). Text-only
-//!   Hermes busy-control slash prompts (`/steer ...`, `/queue ...`) are
-//!   forwarded as sideband requests without opening a second mux turn. The
-//!   active turn clears when the matching response returns from the agent.
+//!   locally with JSON-RPC error code `-32001` ("session busy"). Active-turn
+//!   steering/queueing uses explicit `amux/steer_active_turn` and
+//!   `amux/queue_prompt` requests, which are translated to compatible
+//!   sideband prompts without opening a second mux turn. The active turn
+//!   clears when the matching response returns from the agent.
 //! - `response` → forward unchanged. Subscriber-originated responses only
 //!   show up as replies to agent-initiated requests, whose ids belong to
 //!   the agent's own id space (never our `mux_id` space), so they round
@@ -141,6 +142,14 @@ const FIRST_MUX_ID: u64 = 1;
 /// -32000..=-32099 range is reserved by the spec for implementation
 /// defined errors; -32001 was chosen by the ROADMAP.
 const SESSION_BUSY_ERROR_CODE: i64 = -32001;
+
+/// JSON-RPC error code returned for amux active-turn control requests
+/// that cannot be applied because there is no turn to control.
+const NO_ACTIVE_TURN_ERROR_CODE: i64 = -32002;
+
+/// Standard JSON-RPC invalid params code used when an amux control request
+/// is missing its text/session payload.
+const INVALID_PARAMS_ERROR_CODE: i64 = -32602;
 
 /// JSON-RPC error code for implementation-defined ACP client-tool policy
 /// rejections. The structured `data.reason` distinguishes this from other
@@ -579,45 +588,22 @@ impl AgentLineAction {
     }
 }
 
-fn is_busy_control_prompt(req: &IncomingRequest) -> bool {
-    if req.method != "session/prompt" {
-        return false;
+fn text_from_text_only_prompt(prompt: &Value) -> Option<String> {
+    let prompt = prompt.as_array()?;
+    if prompt.is_empty() {
+        return None;
     }
-    let Some(prompt) = req
-        .params
-        .as_ref()
-        .and_then(|params| params.get("prompt"))
-        .and_then(Value::as_array)
-    else {
-        return false;
-    };
 
     let mut text = String::new();
     for block in prompt {
-        let Some(block_type) = block.get("type").and_then(Value::as_str) else {
-            return false;
-        };
+        let block_type = block.get("type").and_then(Value::as_str)?;
         if block_type != "text" {
-            return false;
+            return None;
         }
-        let Some(block_text) = block.get("text").and_then(Value::as_str) else {
-            return false;
-        };
+        let block_text = block.get("text").and_then(Value::as_str)?;
         text.push_str(block_text);
     }
-
-    let trimmed = text.trim_start();
-    has_busy_control_command(trimmed, "steer") || has_busy_control_command(trimmed, "queue")
-}
-
-fn has_busy_control_command(trimmed: &str, command: &str) -> bool {
-    let Some(rest) = trimmed.strip_prefix('/') else {
-        return false;
-    };
-    let Some(rest) = rest.strip_prefix(command) else {
-        return false;
-    };
-    rest.chars().next().is_some_and(char::is_whitespace) && !rest.trim().is_empty()
+    Some(text)
 }
 
 #[derive(Debug)]
@@ -1341,6 +1327,122 @@ impl SessionInner {
         }
     }
 
+    fn prepare_amux_active_turn_control_request(
+        &mut self,
+        peer_id: &str,
+        req: &mut IncomingRequest,
+        command: &str,
+    ) -> bool {
+        let original_method = req.method.clone();
+        if self.active_turn_mux_id.is_none() {
+            self.send_error_response(
+                peer_id,
+                req.id.clone(),
+                NO_ACTIVE_TURN_ERROR_CODE,
+                "amux active-turn control requires an active turn",
+            );
+            return false;
+        }
+
+        let Some(Value::Object(params)) = req.params.as_ref() else {
+            self.send_error_response(
+                peer_id,
+                req.id.clone(),
+                INVALID_PARAMS_ERROR_CODE,
+                "amux control params must be an object",
+            );
+            return false;
+        };
+
+        let text = match params.get("text") {
+            Some(Value::String(text)) => text.clone(),
+            Some(_) => {
+                self.send_error_response(
+                    peer_id,
+                    req.id.clone(),
+                    INVALID_PARAMS_ERROR_CODE,
+                    "amux control params.text must be a string",
+                );
+                return false;
+            }
+            None => match params.get("prompt").and_then(text_from_text_only_prompt) {
+                Some(text) => text,
+                None => {
+                    self.send_error_response(
+                        peer_id,
+                        req.id.clone(),
+                        INVALID_PARAMS_ERROR_CODE,
+                        "amux control params.text or text-only params.prompt is required",
+                    );
+                    return false;
+                }
+            },
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            self.send_error_response(
+                peer_id,
+                req.id.clone(),
+                INVALID_PARAMS_ERROR_CODE,
+                "amux control text must be non-empty",
+            );
+            return false;
+        }
+
+        let requested_session_id = match params.get("sessionId") {
+            Some(Value::String(session_id)) => Some(session_id.clone()),
+            Some(_) => {
+                self.send_error_response(
+                    peer_id,
+                    req.id.clone(),
+                    INVALID_PARAMS_ERROR_CODE,
+                    "amux control params.sessionId must be a string when present",
+                );
+                return false;
+            }
+            None => None,
+        };
+        let active_session_id = self
+            .active_turn_session_id
+            .clone()
+            .or_else(|| self.canonical_session_id.clone());
+        if let (Some(requested), Some(active)) = (&requested_session_id, &active_session_id)
+            && requested != active
+        {
+            self.send_error_response(
+                peer_id,
+                req.id.clone(),
+                INVALID_PARAMS_ERROR_CODE,
+                "amux control params.sessionId must match the active turn sessionId",
+            );
+            return false;
+        }
+        let Some(session_id) = requested_session_id.or(active_session_id) else {
+            self.send_error_response(
+                peer_id,
+                req.id.clone(),
+                INVALID_PARAMS_ERROR_CODE,
+                "amux control could not determine an ACP sessionId",
+            );
+            return false;
+        };
+
+        let control_prompt = format!("/{command} {text}");
+        req.method = "session/prompt".to_string();
+        req.params = Some(json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": control_prompt }],
+        }));
+        tracing::info!(
+            session = %self.session_id,
+            %peer_id,
+            amux_method = %original_method,
+            slash_command = %command,
+            "translated amux active-turn control request to sideband session/prompt",
+        );
+        true
+    }
+
     fn translate_outbound_request(
         &mut self,
         peer_id: &str,
@@ -1363,20 +1465,31 @@ impl SessionInner {
             return None;
         }
 
-        let busy_control_prompt = req.method == "session/prompt"
-            && self.active_turn_mux_id.is_some()
-            && is_busy_control_prompt(&req);
+        let amux_control_prompt = match req.method.as_str() {
+            amux::METHOD_STEER_ACTIVE_TURN => {
+                if !self.prepare_amux_active_turn_control_request(peer_id, &mut req, "steer") {
+                    return None;
+                }
+                true
+            }
+            amux::METHOD_QUEUE_PROMPT => {
+                if !self.prepare_amux_active_turn_control_request(peer_id, &mut req, "queue") {
+                    return None;
+                }
+                true
+            }
+            _ => false,
+        };
 
         // Turn serialization: a second concurrent ordinary `session/prompt`
         // is rejected locally with -32001 and does NOT update the driver
-        // (the in-flight turn's originator stays the driver). Text-only
-        // Hermes busy-control slash prompts are allowed through as sideband
-        // requests so `/steer` can guide the active turn and `/queue` can
-        // append work to Hermes' prompt queue without creating a mux turn.
+        // (the in-flight turn's originator stays the driver). Active-turn
+        // control must use the explicit amux/* request surface above; plain
+        // ACP `session/prompt` stays generic and serialized.
         // Also broadcast an amux/session_busy notification for rejections
         // so peers see the rejection.
         if req.method == "session/prompt"
-            && !busy_control_prompt
+            && !amux_control_prompt
             && let Some(active) = self.active_turn_mux_id
         {
             let held_by = self.pending.get(&active).map(|pr| pr.peer_id.clone());
@@ -1402,7 +1515,7 @@ impl SessionInner {
             self.sanitize_initialize_client_capabilities(&mut req);
         }
 
-        if req.method != "initialize" && !busy_control_prompt {
+        if req.method != "initialize" && !amux_control_prompt {
             self.note_driving_subscriber(peer_id);
         }
 
@@ -1426,7 +1539,7 @@ impl SessionInner {
         let mux_id = self.next_mux_id;
         self.next_mux_id += 1;
         let original_id = req.id.clone();
-        let is_prompt = req.method == "session/prompt" && !busy_control_prompt;
+        let is_prompt = req.method == "session/prompt" && !amux_control_prompt;
         let active_turn_session_id = if is_prompt {
             req.params
                 .as_ref()
