@@ -330,29 +330,6 @@ where
     panic!("timed out waiting for method {method}");
 }
 
-async fn ws_next_session_update_type<S>(
-    ws: &mut tokio_tungstenite::WebSocketStream<S>,
-    update_type: &str,
-) -> serde_json::Value
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while std::time::Instant::now() < deadline {
-        let Ok(Some(Ok(ClientMsg::Text(t)))) = timeout(Duration::from_millis(100), ws.next()).await
-        else {
-            continue;
-        };
-        let v: serde_json::Value = serde_json::from_str(t.as_str()).expect("frame is JSON");
-        if v.get("method") == Some(&serde_json::json!("session/update"))
-            && v["params"]["update"]["type"] == serde_json::json!(update_type)
-        {
-            return v;
-        }
-    }
-    panic!("timed out waiting for session/update type {update_type}");
-}
-
 // ===== RFD #533 multi-client attach facade =====
 
 #[tokio::test]
@@ -393,13 +370,17 @@ async fn rfd533_attach_returns_roster_and_history_policy() {
         "historyPolicy none must omit history: {none:?}",
     );
     assert!(
-        none["result"]["connectedClients"]
+        none["result"].get("connectedClients").is_none(),
+        "amux-specific roster metadata should not sit at the top level: {none:?}",
+    );
+    assert!(
+        none["result"]["_meta"]["amux"]["connectedClients"]
             .as_array()
             .unwrap()
             .iter()
             .any(|c| c["clientId"] == serde_json::json!("A")
                 && c["name"] == serde_json::json!("Alice")),
-        "attach result should expose current connected peer roster: {none:?}",
+        "attach result should expose current peer roster under _meta.amux: {none:?}",
     );
 
     let after_message = ws_request(
@@ -424,7 +405,7 @@ async fn rfd533_attach_returns_roster_and_history_policy() {
 }
 
 #[tokio::test]
-async fn rfd533_attach_pending_only_reissues_permission_and_resolved_update() {
+async fn rfd533_attach_pending_only_reissues_permission_and_keeps_resolution_in_amux() {
     let (addr, _) = spawn_server_with_mock_env(&[
         ("MOCK_ACP_EMIT_PERMISSION", "1"),
         ("MOCK_ACP_PROMPT_DELAY_MS", "2000"),
@@ -495,26 +476,21 @@ async fn rfd533_attach_pending_only_reissues_permission_and_resolved_update() {
     .await
     .unwrap();
 
-    let resolved = ws_next_session_update_type(&mut ws_a, "permission_resolved").await;
+    let resolved = ws_next_method(&mut ws_a, "amux/agent_request_resolved").await;
+    assert_eq!(resolved["params"]["sessionId"], serde_json::json!("rfd533"));
+    assert_eq!(resolved["params"]["requestId"], permission_a["id"]);
+    assert_eq!(resolved["params"]["resolvedBy"], serde_json::json!("B"));
     assert_eq!(
-        resolved["params"]["sessionId"],
-        serde_json::json!("sess-mock")
-    );
-    assert_eq!(
-        resolved["params"]["update"]["requestId"],
-        permission_a["id"]
-    );
-    assert_eq!(
-        resolved["params"]["update"]["chosenOptionId"],
+        resolved["params"]["result"]["outcome"]["optionId"],
         serde_json::json!("allow_once")
     );
-    assert_eq!(
-        resolved["params"]["update"]["resolvedBy"]["clientId"],
-        serde_json::json!("B")
-    );
-    assert_eq!(
-        resolved["params"]["update"]["resolvedBy"]["name"],
-        serde_json::json!("Bob")
+    let followup = drain_for(&mut ws_a, Duration::from_millis(100)).await;
+    assert!(
+        followup.iter().all(|v| {
+            v.get("method") != Some(&serde_json::json!("session/update"))
+                || v["params"]["update"].get("type").is_none()
+        }),
+        "permission resolution should stay in amux/*, not fabricated session/update siblings: {followup:?}",
     );
 
     let _ = ws_a.send(ClientMsg::Close(None)).await;
@@ -522,7 +498,7 @@ async fn rfd533_attach_pending_only_reissues_permission_and_resolved_update() {
 }
 
 #[tokio::test]
-async fn rfd533_prompt_turn_and_disconnect_session_updates() {
+async fn rfd533_attach_detach_keeps_lifecycle_in_amux_namespace() {
     let (addr, _) = spawn_server_with_mock().await;
     let url_a = format!("ws://{addr}/acp?session=rfd533&peer_id=A&peer_name=Alice");
     let url_b = format!("ws://{addr}/acp?session=rfd533&peer_id=B&peer_name=Bob");
@@ -556,23 +532,16 @@ async fn rfd533_prompt_turn_and_disconnect_session_updates() {
     .await
     .unwrap();
 
-    let prompt_received = ws_next_session_update_type(&mut ws_b, "prompt_received").await;
+    let turn_started = ws_next_method(&mut ws_b, "amux/turn_started").await;
+    assert_eq!(turn_started["params"]["peerId"], serde_json::json!("A"));
     assert_eq!(
-        prompt_received["params"]["sessionId"],
-        serde_json::json!("sess-mock")
-    );
-    assert_eq!(
-        prompt_received["params"]["update"]["sentBy"]["clientId"],
-        serde_json::json!("A")
-    );
-    assert_eq!(
-        prompt_received["params"]["update"]["prompt"][0]["text"],
+        turn_started["params"]["content"][0]["text"],
         serde_json::json!("hello from A")
     );
 
-    let turn_complete = ws_next_session_update_type(&mut ws_b, "turn_complete").await;
+    let turn_complete = ws_next_method(&mut ws_b, "amux/turn_complete").await;
     assert_eq!(
-        turn_complete["params"]["update"]["stopReason"],
+        turn_complete["params"]["stopReason"],
         serde_json::json!("end_turn")
     );
 
@@ -587,14 +556,15 @@ async fn rfd533_prompt_turn_and_disconnect_session_updates() {
         serde_json::json!("sess-mock")
     );
 
-    let disconnected = ws_next_session_update_type(&mut ws_a, "client_disconnected").await;
-    assert_eq!(
-        disconnected["params"]["update"]["client"]["clientId"],
-        serde_json::json!("B")
-    );
-    assert_eq!(
-        disconnected["params"]["update"]["client"]["name"],
-        serde_json::json!("Bob")
+    let disconnected = ws_next_method(&mut ws_a, "amux/peer_left").await;
+    assert_eq!(disconnected["params"]["peerId"], serde_json::json!("B"));
+    let followup = drain_for(&mut ws_a, Duration::from_millis(100)).await;
+    assert!(
+        followup.iter().all(|v| {
+            v.get("method") != Some(&serde_json::json!("session/update"))
+                || v["params"]["update"].get("type").is_none()
+        }),
+        "detach should not fabricate session/update client_disconnected siblings: {followup:?}",
     );
 
     let _ = ws_a.send(ClientMsg::Close(None)).await;
@@ -850,8 +820,8 @@ async fn prompt_notifications_broadcast_response_routes_to_originator() {
         }
     }
 
-    // Both A and B should have seen the two agent chunks plus the two
-    // proxy-owned RFD #533 session/update siblings.
+    // Both A and B should have seen only the two agent-emitted chunks;
+    // mux lifecycle remains in amux/*.
     let count_updates = |frames: &[serde_json::Value]| {
         frames
             .iter()
@@ -865,8 +835,8 @@ async fn prompt_notifications_broadcast_response_routes_to_originator() {
             .filter(|v| v["params"]["update"].get("kind").is_some())
             .count()
     };
-    assert_eq!(count_updates(&a_frames), 4, "A frames: {a_frames:?}");
-    assert_eq!(count_updates(&b_frames), 4, "B frames: {b_frames:?}");
+    assert_eq!(count_updates(&a_frames), 2, "A frames: {a_frames:?}");
+    assert_eq!(count_updates(&b_frames), 2, "B frames: {b_frames:?}");
     assert_eq!(count_agent_updates(&a_frames), 2, "A frames: {a_frames:?}");
     assert_eq!(count_agent_updates(&b_frames), 2, "B frames: {b_frames:?}");
 
@@ -1235,8 +1205,10 @@ async fn replay_log_delivers_history_to_late_joiner() {
     let replay = drain_for(&mut ws_b, Duration::from_millis(400)).await;
 
     // The replay should include, in this order:
-    //   peer_joined(A), turn_started(A), prompt_received sibling,
-    //   2x agent session/update, turn_complete, turn_complete sibling
+    //   peer_joined(A), turn_started(A), 2x agent session/update,
+    //   turn_complete. The RFD #533 attach/detach foundation deliberately
+    //   keeps lifecycle notifications in amux/* rather than fabricating
+    //   proxy-owned session/update siblings.
     let methods: Vec<&str> = replay
         .iter()
         .filter_map(|v| v.get("method").and_then(|m| m.as_str()))
@@ -1268,13 +1240,12 @@ async fn replay_log_delivers_history_to_late_joiner() {
         .collect();
     assert_eq!(
         updates.len(),
-        4,
-        "two agent updates plus two RFD #533 siblings in replay"
+        2,
+        "replay should contain only agent-emitted session/update frames"
     );
 
     // Agent-owned session/update chunks must sit between turn_started
-    // and turn_complete in the replay order. Proxy-owned siblings bookend
-    // the same turn for RFD #533 clients.
+    // and turn_complete in the replay order.
     let agent_update_positions: Vec<_> = replay
         .iter()
         .enumerate()
@@ -1286,12 +1257,13 @@ async fn replay_log_delivers_history_to_late_joiner() {
     for pos in &agent_update_positions {
         assert!(*pos > ts_idx && *pos < tc_idx, "session/update inside turn");
     }
-    let proxy_update_types: Vec<_> = replay
-        .iter()
-        .filter(|v| v.get("method") == Some(&serde_json::json!("session/update")))
-        .filter_map(|v| v["params"]["update"]["type"].as_str())
-        .collect();
-    assert_eq!(proxy_update_types, vec!["prompt_received", "turn_complete"]);
+    assert!(
+        replay.iter().all(|v| {
+            v.get("method") != Some(&serde_json::json!("session/update"))
+                || v["params"]["update"].get("type").is_none()
+        }),
+        "replay should not include fabricated proxy-owned session/update siblings: {replay:?}",
+    );
 
     // B should NOT see a response to A's request (id=7) — that was a
     // per-subscriber frame, not broadcast-tier.
@@ -1346,18 +1318,17 @@ async fn replay_log_adds_mux_record_metadata_to_late_join_frames() {
         .collect();
     assert_eq!(
         session_updates.len(),
-        4,
-        "expected two agent updates plus two proxy siblings: {replay:?}"
+        2,
+        "expected only two agent updates: {replay:?}"
     );
 
     let mut seqs = Vec::new();
     let mut recorded_ats = Vec::new();
     let mut agent_update_count = 0;
-    let mut proxy_update_types = Vec::new();
     for update in &session_updates {
         // ACP payload remains where clients expect it; agent-owned updates
-        // retain their original `kind` discriminator while proxy-owned RFD
-        // #533 siblings use `type`.
+        // retain their original `kind` discriminator. The mux does not
+        // fabricate RFD #533 lifecycle updates in session/update.
         assert_eq!(
             update["params"]["sessionId"],
             serde_json::json!("sess-mock")
@@ -1365,9 +1336,10 @@ async fn replay_log_adds_mux_record_metadata_to_late_join_frames() {
         if update["params"]["update"].get("kind").is_some() {
             agent_update_count += 1;
         }
-        if let Some(ty) = update["params"]["update"]["type"].as_str() {
-            proxy_update_types.push(ty.to_string());
-        }
+        assert!(
+            update["params"]["update"].get("type").is_none(),
+            "mux should not add proxy-owned session/update lifecycle siblings: {update:?}",
+        );
 
         let amux = &update["params"]["_meta"]["amux"];
         let recorded_at = amux["recordedAt"]
@@ -1385,17 +1357,13 @@ async fn replay_log_adds_mux_record_metadata_to_late_join_frames() {
     }
 
     assert_eq!(agent_update_count, 2, "agent chunks should remain intact");
-    assert_eq!(
-        proxy_update_types,
-        vec!["prompt_received".to_string(), "turn_complete".to_string()]
-    );
     assert!(
         seqs.windows(2).all(|w| w[0] < w[1]),
         "replaySeq should be monotonic: {seqs:?}"
     );
     assert_eq!(
         recorded_ats.len(),
-        4,
+        2,
         "each replayed update should carry its original record timestamp"
     );
 

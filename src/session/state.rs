@@ -83,13 +83,12 @@ use crate::cli::{ClientToolMode, ClientToolPolicy, ReplayTurns};
 use crate::multiplex::subscriber::{OutMsg, Subscriber};
 use crate::protocol::amux::{self, AmuxTurnId};
 use crate::protocol::attach::{
-    self, AttachParams, AttachResult, ConnectedClient, DetachParams, DetachResult, HistoryEntry,
-    HistoryPolicy,
+    self, AttachAmuxMeta, AttachMeta, AttachParams, AttachResult, ConnectedClient, DetachParams,
+    DetachResult, HistoryEntry, HistoryPolicy,
 };
 use crate::protocol::jsonrpc::{
     Id, Incoming, IncomingRequest, IncomingResponse, JsonRpcError, JsonRpcVersion,
 };
-use crate::protocol::session_update;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionListAmuxMetadata {
@@ -967,22 +966,15 @@ impl SessionInner {
     }
 
     /// Returns true if the session should end (no subscribers left).
-    /// Emits `amux/peer_left` and the RFD #533
-    /// `session/update { type: "client_disconnected" }` sibling to every
-    /// remaining subscriber when an ACP session id is known.
+    /// Emits `amux/peer_left` to every remaining subscriber. The mux does not
+    /// fabricate ACP `session/update` lifecycle notifications; clients that
+    /// need mux lifecycle should consume `amux/*`.
     fn detach(&mut self, peer_id: &str) -> bool {
         let removed = self.subscribers.remove(peer_id);
-        if let Some(sub) = removed.as_ref() {
+        if removed.is_some() {
             tracing::info!(session = %self.session_id, %peer_id, "subscriber detached");
             let frame = amux::peer_left(&self.session_id, peer_id);
             self.broadcast(frame);
-            if let Some(acp_id) = self.acp_session_id().map(str::to_string) {
-                self.broadcast(session_update::client_disconnected(
-                    &acp_id,
-                    peer_id,
-                    sub.peer_name.as_deref(),
-                ));
-            }
             let orphaned_queue_item_ids: Vec<String> = self
                 .queued_prompts
                 .iter()
@@ -1404,27 +1396,6 @@ impl SessionInner {
             error_value.as_ref(),
         );
         self.broadcast(frame);
-        if let Some(acp_id) = self.acp_session_id().map(str::to_string) {
-            let resolved_by_name = self
-                .subscribers
-                .get(resolved_by)
-                .and_then(|s| s.peer_name.as_deref());
-            let chosen_option_id = resp
-                .result
-                .as_ref()
-                .and_then(|r| r.get("outcome"))
-                .and_then(|o| o.get("optionId"))
-                .and_then(Value::as_str);
-            self.broadcast(session_update::permission_resolved(
-                &acp_id,
-                &request_id_value,
-                resolved_by,
-                resolved_by_name,
-                chosen_option_id,
-                resp.result.as_ref(),
-                error_value.as_ref(),
-            ));
-        }
     }
 
     fn sanitize_initialize_client_capabilities(&self, req: &mut IncomingRequest) {
@@ -2026,15 +1997,6 @@ impl SessionInner {
             supersedes_turn_id,
         );
         self.broadcast(frame);
-        if let Some(acp_id) = self.acp_session_id().map(str::to_string) {
-            let prompt = content.clone();
-            self.broadcast(session_update::prompt_received(
-                &acp_id,
-                &prompt,
-                peer_id,
-                peer_name.as_deref(),
-            ));
-        }
     }
 
     /// Build and broadcast `amux/turn_complete`. `stop_reason` is the
@@ -2045,10 +2007,6 @@ impl SessionInner {
         let stop_reason = result.and_then(|r| r.get("stopReason")).unwrap_or(&null);
         let frame = amux::turn_complete(&self.session_id, turn_id, stop_reason);
         self.broadcast(frame);
-        if let Some(acp_id) = self.acp_session_id().map(str::to_string) {
-            let stop_reason = stop_reason.clone();
-            self.broadcast(session_update::turn_complete(&acp_id, &stop_reason));
-        }
     }
 
     fn submit_next_queued_prompt(&mut self) -> Option<Vec<u8>> {
@@ -2398,8 +2356,10 @@ impl SessionInner {
             session_id: resolved_session_id,
             client_id: params.client_id.unwrap_or_else(|| peer_id.to_string()),
             history_policy: effective_policy,
-            connected_clients,
             history,
+            meta: AttachMeta {
+                amux: AttachAmuxMeta { connected_clients },
+            },
         };
         let result = match serde_json::to_value(result) {
             Ok(v) => v,

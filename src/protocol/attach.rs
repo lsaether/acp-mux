@@ -1,9 +1,10 @@
-//! RFD #533 `session/attach` and `session/detach` request/response shapes.
+//! RFD #533-inspired `session/attach` and `session/detach` request/response shapes.
 //!
 //! amux handles these proxy-local methods itself. They are logical
 //! ACP handshakes layered on top of the existing WebSocket attach query:
-//! the transport peer already exists, and `session/attach` returns a roster
-//! plus an optional replay history shaped by `historyPolicy`.
+//! the transport peer already exists, and `session/attach` returns optional
+//! replay history shaped by `historyPolicy`. amux-specific peer metadata lives
+//! under `result._meta.amux` so the top-level result remains standards-shaped.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -55,9 +56,22 @@ pub struct AttachResult {
     pub session_id: String,
     pub client_id: String,
     pub history_policy: HistoryPolicy,
-    pub connected_clients: Vec<ConnectedClient>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history: Option<Vec<HistoryEntry>>,
+    #[serde(rename = "_meta")]
+    pub meta: AttachMeta,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachMeta {
+    pub amux: AttachAmuxMeta,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachAmuxMeta {
+    pub connected_clients: Vec<ConnectedClient>,
 }
 
 #[derive(Debug, Clone, Serialize)]
