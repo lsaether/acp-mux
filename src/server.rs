@@ -31,7 +31,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::multiplex::subscriber::{OutMsg, Subscriber};
+use crate::multiplex::subscriber::{OutMsg, ReplayOrder, Subscriber};
 use crate::session::registry::{ControlPlaneSessionListError, RegistryError, SessionRegistry};
 use crate::session::state::{SessionMsg, SessionSnapshot};
 
@@ -61,6 +61,7 @@ pub struct AttachQuery {
     pub peer_id: Option<String>,
     pub peer_name: Option<String>,
     pub role: Option<String>,
+    pub replay_order: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,10 +153,11 @@ async fn handle_attach(state: AppState, q: AttachQuery, mut socket: WebSocket) {
         peer_id,
         peer_name,
         role,
+        replay_order,
     } = validated;
 
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutMsg>();
-    let subscriber = Subscriber::new(peer_id.clone(), peer_name, role, outbound_tx);
+    let subscriber = Subscriber::new(peer_id.clone(), peer_name, role, replay_order, outbound_tx);
 
     let handle = match state.registry.attach(&session, subscriber).await {
         Ok(h) => h,
@@ -304,6 +306,7 @@ struct ValidatedAttach {
     peer_id: String,
     peer_name: Option<String>,
     role: Option<String>,
+    replay_order: ReplayOrder,
 }
 
 fn validate(q: &AttachQuery) -> Result<ValidatedAttach, &'static str> {
@@ -315,12 +318,22 @@ fn validate(q: &AttachQuery) -> Result<ValidatedAttach, &'static str> {
     if peer_id.is_empty() {
         return Err("empty ?peer_id");
     }
+    let replay_order = parse_replay_order(q.replay_order.as_deref())?;
     Ok(ValidatedAttach {
         session: session.to_string(),
         peer_id: peer_id.to_string(),
         peer_name: q.peer_name.clone(),
         role: q.role.clone(),
+        replay_order,
     })
+}
+
+fn parse_replay_order(value: Option<&str>) -> Result<ReplayOrder, &'static str> {
+    match value.unwrap_or("chronological") {
+        "" | "chronological" => Ok(ReplayOrder::Chronological),
+        "newest_turn_first" => Ok(ReplayOrder::NewestTurnFirst),
+        _ => Err("invalid ?replay_order (expected chronological or newest_turn_first)"),
+    }
 }
 
 /// Strip a single trailing `\n` (and the preceding `\r`, if any) from the
@@ -390,6 +403,7 @@ mod tests {
             peer_id: Some("p1".into()),
             peer_name: None,
             role: None,
+            replay_order: None,
         };
         assert!(validate(&q).is_err());
 
@@ -398,11 +412,13 @@ mod tests {
             peer_id: Some("p1".into()),
             peer_name: Some("Alice".into()),
             role: Some("driver".into()),
+            replay_order: Some("newest_turn_first".into()),
         };
         let v = validate(&q).unwrap();
         assert_eq!(v.session, "ok");
         assert_eq!(v.peer_id, "p1");
         assert_eq!(v.peer_name.as_deref(), Some("Alice"));
         assert_eq!(v.role.as_deref(), Some("driver"));
+        assert_eq!(v.replay_order, ReplayOrder::NewestTurnFirst);
     }
 }

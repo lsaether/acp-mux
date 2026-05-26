@@ -180,10 +180,12 @@ about who issued the cancel.
 ```
 
 `peer_joined` is broadcast to every existing subscriber when a new
-subscriber attaches. The newcomer's view of the existing roster comes from
-the replay log (see below), which already contains `peer_joined` events for
-every peer still in the session — no per-peer presence replay needed at
-attach time.
+subscriber attaches. With the default chronological replay order, a
+newcomer's view of existing peers comes from replayed `peer_joined` /
+`peer_left` history. With `replay_order=newest_turn_first`, the newcomer
+must treat the attach-time `amux/session_snapshot` as the authoritative
+current roster instead of deriving presence by applying historical lifecycle
+events out of order.
 
 ### `amux/session_context`
 
@@ -206,6 +208,72 @@ tools/terminal work even if a client connected from a different local cwd.
 - Emitted once per attach to the attaching subscriber.
 - Clients can use it for chrome/status UI that should reflect the agent's
   actual working directory rather than the local client's launch cwd.
+
+### `amux/session_snapshot`
+
+Sent directly to an attaching subscriber that opts into
+`replay_order=newest_turn_first`. It is an unlogged attach-time state
+snapshot, not historical transcript. Clients should use it as the source of
+truth for mutable mux state before applying subsequent live events.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "amux/session_snapshot",
+  "params": {
+    "sessionId": "work",
+    "cwd": "/home/volt/Code/acp-mux",
+    "peers": [
+      {
+        "peerId": "desktop-1",
+        "peerName": "desktop",
+        "role": "driver",
+        "isSelf": false,
+        "isDriving": true
+      }
+    ],
+    "busy": {
+      "active": true,
+      "activeMuxId": 12,
+      "activeAmuxTurnId": "at-7",
+      "activeSessionId": "sess-mock",
+      "promptText": "optional text-only prompt"
+    },
+    "queue": { "items": [] },
+    "replay": {
+      "order": "newest_turn_first",
+      "generation": 0,
+      "logLength": 42
+    }
+  }
+}
+```
+
+`peers` includes the attaching subscriber and marks it with `isSelf`. The
+`busy` object reflects the active turn, if any. Queue entries are current
+pending items only; completed/removed/orphaned queue history is not part of the
+snapshot.
+
+### `amux/replay_started` / `amux/replay_complete`
+
+Sent directly to an attaching subscriber in `newest_turn_first` mode to bracket
+historical transcript backfill. They are unlogged attach metadata.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "amux/replay_started",
+  "params": {
+    "sessionId": "work",
+    "replayOrder": "newest_turn_first",
+    "replayGeneration": 0
+  }
+}
+```
+
+`amux/replay_complete` has the same params and marks that this attach's
+historical backfill has finished. Replayed transcript frames between the
+markers still carry original `recordedAt` / `replaySeq` provenance.
 
 ### `amux/session_busy`
 
@@ -668,7 +736,8 @@ specific subscriber's requests, raw actionable agent-initiated requests such as
 `session/request_permission`) are NOT logged; they're directed by definition
 and may already be resolved by the time a late joiner arrives.
 
-When a new subscriber attaches:
+When a new subscriber attaches without an explicit replay order (or with
+`replay_order=chronological`):
 
 1. The multiplexer replays the entire log to the newcomer in original
    order. Live frame payloads are stored unchanged, then replay delivery
@@ -694,15 +763,39 @@ When a new subscriber attaches:
 
    Existing `params._meta` keys are preserved; `amux` is the mux-owned
    subnamespace. Non-JSON/raw frames replay unchanged.
-2. Live events that arrive during replay are queued for the newcomer and
-   flushed after replay completes, preserving global ordering.
-3. Only then does the newcomer enter the live broadcast set.
+2. The newcomer is already in the live broadcast set, but the actor sends
+   replay frames to that subscriber's outbound queue before processing later
+   session messages, preserving chronological replay-before-live delivery for
+   that subscriber.
 
-This gives newcomers a complete reconstruction of session state — every
-peer that joined or left, every completed turn (with its prompt content via
-the `turn_started` bookend), any agent-initiated request context via inert
+This gives newcomers a complete chronological reconstruction of session state —
+every peer that joined or left, every completed turn (with its prompt content
+via the `turn_started` bookend), any agent-initiated request context via inert
 `amux/agent_request_opened` / `amux/agent_request_resolved` pairs, and any
 in-flight turn's already-streamed chunks.
+
+A subscriber may instead attach with
+`replay_order=newest_turn_first`. Invalid `replay_order` values are rejected
+with the normal bad-query close code. In this opt-in mode:
+
+1. `amux/session_context` is sent first.
+2. `amux/session_snapshot` provides authoritative mutable state: current peers,
+   driving/self flags, busy/active turn state, and current queue items.
+3. `amux/replay_started` marks the beginning of historical transcript backfill.
+4. Turn segments are delivered newest to oldest. Each segment remains internally
+   chronological: `amux/turn_started`, the ACP/amux transcript frames that
+   occurred during that turn, and `amux/turn_complete` when the turn has
+   completed. An active/incomplete turn is the newest segment and is delivered
+   first without a fabricated completion.
+5. Historical presence, busy, and queue lifecycle events are not used as the
+   source of truth in this mode; clients use the snapshot plus subsequent live
+   events for mutable state.
+6. `amux/replay_complete` marks that the historical backfill for this attach is
+   finished.
+
+`recordedAt` and `replaySeq` remain provenance from the original log. Under
+`newest_turn_first`, their arrival order is intentionally non-monotonic; clients
+that need chronological sort keys should use `replaySeq`, not delivery order.
 
 **v0.1 ships unbounded replay.** The log grows for the life of the session.
 Storage pressure on long-running sessions is acceptable for early use and

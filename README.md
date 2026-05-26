@@ -19,7 +19,7 @@ cargo build --release
 amux --agent-cmd 'hermes acp' --port 8765
 ```
 
-Then connect WebSocket clients to `ws://127.0.0.1:8765/acp?session=<id>&peer_id=<unique>&peer_name=<display>&role=<optional>`.
+Then connect WebSocket clients to `ws://127.0.0.1:8765/acp?session=<session>&peer_id=<unique>&peer_name=<display>&role=<optional>`. Late-joining clients can also opt into reconnect-friendly transcript backfill with `replay_order=newest_turn_first`; omitted or `chronological` preserves original-order replay.
 
 Health and debug endpoints:
 
@@ -61,16 +61,17 @@ Health and debug endpoints:
 - **Opt-in request trace metadata.** With `--meta-propagate`, outbound subscriber → agent requests get mux-owned `params._meta.amux` fields (`peerId`, `peerName`, `role`, `muxId`, and `amuxTurnId` for prompts) for cross-client debugging. Default mode leaves request payload metadata unchanged.
 - **Cold-start session discovery.** `GET /acp/sessions` runs a transient agent-side `session/list` query before any WebSocket attach, useful for dashboards that need to browse persisted sessions before choosing one to resume.
 - **Live `session/list` decoration.** Returned `sessions[]` entries that match a live muxed upstream session get `sessions[i]._meta.amux` fields (`proxySessionId`, `subscriberCount`, optional `drivingSubscriber`), preserving existing `_meta` keys and leaving non-live entries unchanged.
-- **`amux/*` extension namespace.** The mux publishes its own metadata/control plane out-of-band: `amux/session_context`, `amux/peer_joined`, `amux/peer_left`, `amux/turn_started`, `amux/turn_complete`, `amux/turn_cancelled`, `amux/session_busy`, `amux/control_submitted`, `amux/queue_item_added`, `amux/queue_item_submitted`, `amux/queue_item_completed`, `amux/queue_item_removed`, `amux/queue_item_orphaned`, `amux/agent_request_opened`, `amux/agent_request_resolved`, plus subscriber-request controls such as `amux/steer_active_turn`, `amux/queue_prompt`, `amux/unqueue_prompt`, and `amux/cancel_active_turn`. ACP frames stay clean; clients see two distinguishable channels and demultiplex by method prefix.
+- **`amux/*` extension namespace.** The mux publishes its own metadata/control plane out-of-band: `amux/session_context`, `amux/session_snapshot`, `amux/replay_started`, `amux/replay_complete`, `amux/peer_joined`, `amux/peer_left`, `amux/turn_started`, `amux/turn_complete`, `amux/turn_cancelled`, `amux/session_busy`, `amux/control_submitted`, `amux/queue_item_added`, `amux/queue_item_submitted`, `amux/queue_item_completed`, `amux/queue_item_removed`, `amux/queue_item_orphaned`, `amux/agent_request_opened`, `amux/agent_request_resolved`, plus subscriber-request controls such as `amux/steer_active_turn`, `amux/queue_prompt`, `amux/unqueue_prompt`, and `amux/cancel_active_turn`. ACP frames stay clean; clients see two distinguishable channels and demultiplex by method prefix.
 - **Cancellation.** `$/cancel_request` (request-cancellation RFD / unstable schema, not stable ACP v1) works both directions: subscribers can cancel their own in-flight requests; agents can cancel agent-initiated requests (broadcast to peers + `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`). The amux extension `amux/cancel_active_turn` lets *any* attached peer cancel the in-flight turn (not just the driver) — internally it sends ACP-native `session/cancel { sessionId }` toward the agent and emits `amux/turn_cancelled` to peers.
-- **Replay log.** Every broadcast-tier frame (`amux/*` + agent notifications) is appended; a late joiner receives the full history before any live event. Raw collaborative agent-initiated requests are live-only and are not replayed; late joiners see the inert `amux/agent_request_opened` + `amux/agent_request_resolved` lifecycle pair instead. Blocked client-tool requests never enter this lifecycle.
+- **Replay log.** Every broadcast-tier frame (`amux/*` + agent notifications) is appended. By default, a late joiner receives chronological history before later live events. With `replay_order=newest_turn_first`, the late joiner first receives `amux/session_snapshot`, then `amux/replay_started`, then turn segments newest-to-oldest with each segment internally chronological, then `amux/replay_complete`. Raw collaborative agent-initiated requests are live-only and are not replayed; late joiners see the inert `amux/agent_request_opened` + `amux/agent_request_resolved` lifecycle pair instead. Blocked client-tool requests never enter this lifecycle.
 - **TTL grace.** Last subscriber leaving starts a countdown; a reconnect within `--session-ttl-seconds` reuses the same subprocess with all of its caches intact.
 
 ## Client contract
 
 Clients SHOULD:
 
-- Treat `amux/peer_joined` (with `peerId == self.peer_id`) as the empty-roster signal — used only by replay log late joiners.
+- For chronological replay, derive historical presence from replayed `amux/peer_joined` / `amux/peer_left`; for `replay_order=newest_turn_first`, seed mutable state from `amux/session_snapshot` instead.
+- Treat `amux/replay_started` / `amux/replay_complete` as historical-backfill boundaries in newest-first mode.
 - Treat `amux/turn_started` / `amux/turn_complete` as turn bookends; the `peerId` field attributes the turn.
 - Treat `amux/agent_request_opened` / `amux/agent_request_resolved` as the non-actionable lifecycle for agent-initiated requests. Only raw live `session/request_permission` requests should create a reply affordance; replayed `amux/agent_request_opened` is context, not a request to answer.
 - Filter `amux/*` frames out of the conversation render and use them for presence / turn UI.

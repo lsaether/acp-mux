@@ -26,6 +26,13 @@ impl From<Vec<u8>> for OutMsg {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayOrder {
+    #[default]
+    Chronological,
+    NewestTurnFirst,
+}
+
 /// A connected WebSocket subscriber. Owned by the session actor; cloned
 /// metadata is fine but the `outbound` sender is move-only per subscriber
 /// — drop it to signal the WS-out task to shut down.
@@ -34,6 +41,7 @@ pub struct Subscriber {
     pub peer_id: String,
     pub peer_name: Option<String>,
     pub role: Option<String>,
+    pub replay_order: ReplayOrder,
     pub outbound: mpsc::UnboundedSender<OutMsg>,
 }
 
@@ -42,12 +50,14 @@ impl Subscriber {
         peer_id: String,
         peer_name: Option<String>,
         role: Option<String>,
+        replay_order: ReplayOrder,
         outbound: mpsc::UnboundedSender<OutMsg>,
     ) -> Self {
         Self {
             peer_id,
             peer_name,
             role,
+            replay_order,
             outbound,
         }
     }

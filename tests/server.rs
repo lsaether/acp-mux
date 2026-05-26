@@ -127,6 +127,17 @@ async fn ws_missing_peer_id_closes_4400() {
 }
 
 #[tokio::test]
+async fn ws_invalid_replay_order_closes_4400() {
+    let (addr, _) = spawn_server_with_cat().await;
+    let url = format!("ws://{addr}/acp?session=phase1&peer_id=p1&replay_order=banana");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
+    let close = wait_for_close(&mut ws).await.expect("expected close frame");
+    assert_eq!(u16::from(close), CLOSE_CODE_BAD_QUERY);
+}
+
+#[tokio::test]
 async fn ws_no_agent_cmd_closes_1011() {
     let (addr, _) = spawn_server(None).await;
     let url = format!("ws://{addr}/acp?session=ok&peer_id=p1");
@@ -694,6 +705,40 @@ where
     out
 }
 
+async fn run_prompt_to_completion<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    id: u64,
+    text: &str,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": "sess-mock",
+            "prompt": [{ "type": "text", "text": text }],
+        },
+    })
+    .to_string();
+    ws.send(ClientMsg::Text(payload.into())).await.unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(200), ws.next()).await {
+            Ok(Some(Ok(ClientMsg::Text(t)))) => {
+                let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                if v.get("id") == Some(&serde_json::json!(id)) && v.get("result").is_some() {
+                    return;
+                }
+            }
+            _ => continue,
+        }
+    }
+    panic!("timed out waiting for prompt response id={id}");
+}
+
 /// Chunk 7: amux/peer_joined fires when B joins, A sees it; B does not
 /// see their own join (emit-before-insert). On detach the remaining
 /// subscriber sees amux/peer_left.
@@ -1005,6 +1050,206 @@ async fn replay_log_delivers_history_to_late_joiner() {
         .iter()
         .any(|v| v.get("id") == Some(&serde_json::json!(7)));
     assert!(!saw_a_response, "B should not see A's prompt response");
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn newest_turn_first_replays_turn_segments_with_snapshot_and_markers() {
+    let (addr, _) = spawn_server_with_mock().await;
+    let url_a =
+        format!("ws://{addr}/acp?session=issue44order&peer_id=A&peer_name=Alice&role=driver");
+    let url_b = format!(
+        "ws://{addr}/acp?session=issue44order&peer_id=B&peer_name=Bob&role=observer&replay_order=newest_turn_first"
+    );
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    run_prompt_to_completion(&mut ws_a, 7, "one").await;
+    run_prompt_to_completion(&mut ws_a, 8, "two").await;
+    run_prompt_to_completion(&mut ws_a, 9, "three").await;
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let replay = drain_for(&mut ws_b, Duration::from_millis(600)).await;
+
+    let method_pos = |method: &str| -> usize {
+        replay
+            .iter()
+            .position(|v| v.get("method") == Some(&serde_json::json!(method)))
+            .unwrap_or_else(|| panic!("missing method {method} in replay: {replay:?}"))
+    };
+
+    let snapshot_idx = method_pos("amux/session_snapshot");
+    let started_idx = method_pos("amux/replay_started");
+    let complete_idx = method_pos("amux/replay_complete");
+    assert!(
+        snapshot_idx < started_idx,
+        "snapshot should precede replay_started"
+    );
+
+    let snapshot = &replay[snapshot_idx];
+    let peers = snapshot["params"]["peers"]
+        .as_array()
+        .expect("snapshot peers");
+    assert!(
+        peers
+            .iter()
+            .any(|p| p["peerId"] == serde_json::json!("A")
+                && p["isDriving"] == serde_json::json!(true)),
+        "snapshot should include driving peer A: {snapshot:?}",
+    );
+    assert!(
+        peers.iter().any(
+            |p| p["peerId"] == serde_json::json!("B") && p["isSelf"] == serde_json::json!(true)
+        ),
+        "snapshot should mark peer B as self: {snapshot:?}",
+    );
+    assert_eq!(
+        snapshot["params"]["busy"]["active"],
+        serde_json::json!(false)
+    );
+
+    assert!(
+        replay
+            .iter()
+            .all(|v| v.get("method") != Some(&serde_json::json!("amux/peer_joined"))),
+        "newest-first replay should use session_snapshot for historical presence, got {replay:?}",
+    );
+
+    let starts: Vec<(usize, &serde_json::Value)> = replay
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.get("method") == Some(&serde_json::json!("amux/turn_started")))
+        .collect();
+    assert_eq!(
+        starts.len(),
+        3,
+        "expected three replayed turn starts: {replay:?}"
+    );
+    let start_ids: Vec<_> = starts
+        .iter()
+        .map(|(_, v)| v["params"]["amuxTurnId"].as_str().unwrap())
+        .collect();
+    assert_eq!(start_ids, vec!["at-3", "at-2", "at-1"]);
+    let start_texts: Vec<_> = starts
+        .iter()
+        .map(|(_, v)| v["params"]["content"][0]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(start_texts, vec!["three", "two", "one"]);
+    assert!(
+        started_idx < starts[0].0,
+        "replay_started before first turn"
+    );
+    assert!(complete_idx > starts[2].0, "replay_complete after backfill");
+
+    for (start_idx, turn) in starts {
+        let turn_id = turn["params"]["amuxTurnId"].as_str().unwrap();
+        let turn_complete_idx = replay
+            .iter()
+            .position(|v| {
+                v.get("method") == Some(&serde_json::json!("amux/turn_complete"))
+                    && v["params"]["amuxTurnId"] == serde_json::json!(turn_id)
+            })
+            .unwrap_or_else(|| panic!("missing turn_complete for {turn_id}: {replay:?}"));
+        assert!(
+            start_idx < turn_complete_idx,
+            "turn segment {turn_id} must be internally chronological"
+        );
+        let update_count = replay[start_idx + 1..turn_complete_idx]
+            .iter()
+            .filter(|v| v.get("method") == Some(&serde_json::json!("session/update")))
+            .count();
+        assert_eq!(
+            update_count, 2,
+            "turn segment {turn_id} should contain its two updates"
+        );
+    }
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn newest_turn_first_snapshot_marks_active_turn_before_backfill() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "1200")]).await;
+    let url_a =
+        format!("ws://{addr}/acp?session=issue44active&peer_id=A&peer_name=Alice&role=driver");
+    let url_b = format!(
+        "ws://{addr}/acp?session=issue44active&peer_id=B&peer_name=Bob&role=observer&replay_order=newest_turn_first"
+    );
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": "sess-mock",
+            "prompt": [{ "type": "text", "text": "active" }],
+        },
+    })
+    .to_string();
+    ws_a.send(ClientMsg::Text(payload.into())).await.unwrap();
+    let started = ws_next_method(&mut ws_a, "amux/turn_started").await;
+    assert_eq!(started["params"]["amuxTurnId"], serde_json::json!("at-1"));
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let replay = drain_for(&mut ws_b, Duration::from_millis(350)).await;
+
+    let snapshot = replay
+        .iter()
+        .find(|v| v.get("method") == Some(&serde_json::json!("amux/session_snapshot")))
+        .unwrap_or_else(|| panic!("missing session_snapshot: {replay:?}"));
+    assert_eq!(
+        snapshot["params"]["busy"]["active"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        snapshot["params"]["busy"]["activeAmuxTurnId"],
+        serde_json::json!("at-1")
+    );
+
+    let turn_started_idx = replay
+        .iter()
+        .position(|v| v.get("method") == Some(&serde_json::json!("amux/turn_started")))
+        .unwrap_or_else(|| panic!("missing turn_started: {replay:?}"));
+    assert_eq!(
+        replay[turn_started_idx]["params"]["content"][0]["text"],
+        serde_json::json!("active")
+    );
+    let replay_complete_idx = replay
+        .iter()
+        .position(|v| v.get("method") == Some(&serde_json::json!("amux/replay_complete")))
+        .unwrap_or_else(|| panic!("missing replay_complete: {replay:?}"));
+    assert!(turn_started_idx < replay_complete_idx);
+    assert!(
+        replay[..replay_complete_idx]
+            .iter()
+            .all(|v| v.get("method") != Some(&serde_json::json!("amux/turn_complete"))),
+        "active turn should not gain a replayed completion before the delayed agent responds: {replay:?}",
+    );
 
     let _ = ws_a.send(ClientMsg::Close(None)).await;
     let _ = ws_b.send(ClientMsg::Close(None)).await;

@@ -13,6 +13,9 @@ use serde::Serialize;
 const METHOD_PEER_JOINED: &str = "amux/peer_joined";
 const METHOD_PEER_LEFT: &str = "amux/peer_left";
 const METHOD_SESSION_CONTEXT: &str = "amux/session_context";
+const METHOD_SESSION_SNAPSHOT: &str = "amux/session_snapshot";
+const METHOD_REPLAY_STARTED: &str = "amux/replay_started";
+const METHOD_REPLAY_COMPLETE: &str = "amux/replay_complete";
 const METHOD_TURN_STARTED: &str = "amux/turn_started";
 const METHOD_TURN_COMPLETE: &str = "amux/turn_complete";
 const METHOD_SESSION_BUSY: &str = "amux/session_busy";
@@ -295,6 +298,32 @@ pub fn session_context(session_id: &str, cwd: &str) -> Vec<u8> {
     encode(
         METHOD_SESSION_CONTEXT,
         SessionContextParams { session_id, cwd },
+    )
+}
+
+pub fn session_snapshot(params: &serde_json::Value) -> Vec<u8> {
+    encode(METHOD_SESSION_SNAPSHOT, params)
+}
+
+pub fn replay_started(session_id: &str, replay_order: &str, replay_generation: u64) -> Vec<u8> {
+    encode(
+        METHOD_REPLAY_STARTED,
+        serde_json::json!({
+            "sessionId": session_id,
+            "replayOrder": replay_order,
+            "replayGeneration": replay_generation,
+        }),
+    )
+}
+
+pub fn replay_complete(session_id: &str, replay_order: &str, replay_generation: u64) -> Vec<u8> {
+    encode(
+        METHOD_REPLAY_COMPLETE,
+        serde_json::json!({
+            "sessionId": session_id,
+            "replayOrder": replay_order,
+            "replayGeneration": replay_generation,
+        }),
     )
 }
 

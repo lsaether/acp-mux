@@ -80,7 +80,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent::process::AgentProcess;
 use crate::cli::{ClientToolMode, ClientToolPolicy, ReplayTurns};
-use crate::multiplex::subscriber::{OutMsg, Subscriber};
+use crate::multiplex::subscriber::{OutMsg, ReplayOrder, Subscriber};
 use crate::protocol::amux::{self, AmuxTurnId};
 use crate::protocol::jsonrpc::{
     Id, Incoming, IncomingRequest, IncomingResponse, JsonRpcError, JsonRpcVersion,
@@ -193,6 +193,25 @@ impl ReplayEntry {
 
     fn frame_for_replay(&self) -> Bytes {
         inject_replay_metadata(&self.frame, &self.recorded_at, self.seq)
+    }
+
+    fn method(&self) -> Option<String> {
+        frame_method(&self.frame)
+    }
+}
+
+fn frame_method(frame: &Bytes) -> Option<String> {
+    serde_json::from_slice::<Value>(frame)
+        .ok()?
+        .get("method")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn replay_order_label(order: ReplayOrder) -> &'static str {
+    match order {
+        ReplayOrder::Chronological => "chronological",
+        ReplayOrder::NewestTurnFirst => "newest_turn_first",
     }
 }
 
@@ -847,6 +866,7 @@ impl SessionInner {
             .as_ref()
             .map(|log| log.iter().cloned().collect())
             .unwrap_or_default();
+        let replay_order = subscriber.replay_order;
 
         let frame = amux::peer_joined(
             &self.session_id,
@@ -861,22 +881,183 @@ impl SessionInner {
             session = %self.session_id,
             peer_id = %peer_id,
             replay_frames = snapshot.len(),
+            replay_order = replay_order_label(replay_order),
             "subscriber joined session",
         );
         self.subscribers.insert(peer_id.clone(), subscriber);
         self.publish_session_list_metadata();
         self.send_session_context_to(&peer_id);
 
-        if let Some(sub) = self.subscribers.get(&peer_id) {
-            for entry in snapshot {
-                let frame = entry.frame_for_replay();
-                if sub.outbound.send(OutMsg::Frame(frame)).is_err() {
-                    tracing::debug!(%peer_id, "newcomer dropped during replay");
-                    break;
-                }
+        match replay_order {
+            ReplayOrder::Chronological => self.deliver_chronological_replay(&peer_id, snapshot),
+            ReplayOrder::NewestTurnFirst => {
+                self.deliver_newest_turn_first_replay(&peer_id, snapshot)
             }
         }
         Ok(())
+    }
+
+    fn deliver_chronological_replay(&self, peer_id: &str, snapshot: Vec<ReplayEntry>) {
+        let Some(sub) = self.subscribers.get(peer_id) else {
+            return;
+        };
+        for entry in snapshot {
+            let frame = entry.frame_for_replay();
+            if sub.outbound.send(OutMsg::Frame(frame)).is_err() {
+                tracing::debug!(%peer_id, "newcomer dropped during replay");
+                break;
+            }
+        }
+    }
+
+    fn deliver_newest_turn_first_replay(&self, peer_id: &str, snapshot: Vec<ReplayEntry>) {
+        let session_snapshot = amux::session_snapshot(&self.build_attach_session_snapshot(peer_id));
+        let replay_started = amux::replay_started(
+            &self.session_id,
+            replay_order_label(ReplayOrder::NewestTurnFirst),
+            self.replay_generation,
+        );
+        let replay_complete = amux::replay_complete(
+            &self.session_id,
+            replay_order_label(ReplayOrder::NewestTurnFirst),
+            self.replay_generation,
+        );
+        let frames = std::iter::once(Bytes::from(session_snapshot))
+            .chain(std::iter::once(Bytes::from(replay_started)))
+            .chain(
+                Self::newest_turn_first_entries(snapshot)
+                    .into_iter()
+                    .map(|entry| entry.frame_for_replay()),
+            )
+            .chain(std::iter::once(Bytes::from(replay_complete)));
+
+        let Some(sub) = self.subscribers.get(peer_id) else {
+            return;
+        };
+        for frame in frames {
+            if sub.outbound.send(OutMsg::Frame(frame)).is_err() {
+                tracing::debug!(%peer_id, "newcomer dropped during newest-first replay");
+                break;
+            }
+        }
+    }
+
+    fn build_attach_session_snapshot(&self, self_peer_id: &str) -> Value {
+        let mut peers: Vec<Value> = self
+            .subscribers
+            .values()
+            .map(|s| {
+                json!({
+                    "peerId": s.peer_id,
+                    "peerName": s.peer_name,
+                    "role": s.role,
+                    "isSelf": s.peer_id == self_peer_id,
+                    "isDriving": self.driving_subscriber_peer_id.as_ref() == Some(&s.peer_id),
+                })
+            })
+            .collect();
+        peers.sort_by(|a, b| {
+            a.get("peerId")
+                .and_then(Value::as_str)
+                .cmp(&b.get("peerId").and_then(Value::as_str))
+        });
+
+        let queue_items: Vec<Value> = self
+            .queued_prompts
+            .iter()
+            .filter_map(|item| {
+                let queue_item_id = item.queue_item_id.as_ref()?;
+                let kind = match item.kind {
+                    QueuedPromptKind::Prompt => "prompt",
+                    QueuedPromptKind::Queue => "queue",
+                    QueuedPromptKind::HardSteer { .. } => "hard_steer",
+                };
+                Some(json!({
+                    "queueItemId": queue_item_id,
+                    "peerId": item.peer_id,
+                    "sessionId": item.session_id,
+                    "promptText": item.prompt_text,
+                    "kind": kind,
+                }))
+            })
+            .collect();
+
+        json!({
+            "sessionId": self.session_id,
+            "cwd": self.agent_cwd,
+            "peers": peers,
+            "busy": {
+                "active": self.active_turn_mux_id.is_some(),
+                "activeMuxId": self.active_turn_mux_id,
+                "activeAmuxTurnId": self.active_amux_turn_id.map(|t| t.formatted()),
+                "activeSessionId": self.active_turn_session_id,
+                "promptText": self.active_turn_prompt_text,
+            },
+            "queue": {
+                "items": queue_items,
+            },
+            "replay": {
+                "order": replay_order_label(ReplayOrder::NewestTurnFirst),
+                "generation": self.replay_generation,
+                "logLength": self.replay_log.as_ref().map(|log| log.len()).unwrap_or(0),
+            },
+        })
+    }
+
+    fn newest_turn_first_entries(snapshot: Vec<ReplayEntry>) -> Vec<ReplayEntry> {
+        let mut segments: Vec<Vec<ReplayEntry>> = Vec::new();
+        let mut current: Option<Vec<ReplayEntry>> = None;
+
+        for entry in snapshot {
+            match entry.method().as_deref() {
+                Some("amux/turn_started") => {
+                    if let Some(segment) = current.take()
+                        && !segment.is_empty()
+                    {
+                        segments.push(segment);
+                    }
+                    current = Some(vec![entry]);
+                }
+                Some("amux/turn_complete") => {
+                    if let Some(mut segment) = current.take() {
+                        segment.push(entry);
+                        segments.push(segment);
+                    }
+                }
+                Some(method) if Self::skip_from_newest_turn_backfill(method) => {}
+                _ => {
+                    if let Some(segment) = current.as_mut() {
+                        segment.push(entry);
+                    }
+                }
+            }
+        }
+        if let Some(segment) = current
+            && !segment.is_empty()
+        {
+            segments.push(segment);
+        }
+
+        segments
+            .into_iter()
+            .rev()
+            .flat_map(Vec::into_iter)
+            .collect()
+    }
+
+    fn skip_from_newest_turn_backfill(method: &str) -> bool {
+        matches!(
+            method,
+            "amux/peer_joined"
+                | "amux/peer_left"
+                | "amux/session_busy"
+                | "amux/control_submitted"
+                | "amux/queue_item_added"
+                | "amux/queue_item_submitted"
+                | "amux/queue_item_completed"
+                | "amux/queue_item_removed"
+                | "amux/queue_item_orphaned"
+        )
     }
 
     fn send_session_context_to(&self, peer_id: &str) {
