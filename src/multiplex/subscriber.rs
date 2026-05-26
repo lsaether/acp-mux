@@ -34,6 +34,10 @@ pub struct Subscriber {
     pub peer_id: String,
     pub peer_name: Option<String>,
     pub role: Option<String>,
+    /// Suppress the legacy transport-level replay snapshot normally sent
+    /// immediately after a late WebSocket attach. Attach-aware clients use
+    /// this when `session/attach.result.history` is their bootstrap source.
+    pub suppress_legacy_replay: bool,
     pub outbound: mpsc::UnboundedSender<OutMsg>,
 }
 
@@ -42,12 +46,14 @@ impl Subscriber {
         peer_id: String,
         peer_name: Option<String>,
         role: Option<String>,
+        suppress_legacy_replay: bool,
         outbound: mpsc::UnboundedSender<OutMsg>,
     ) -> Self {
         Self {
             peer_id,
             peer_name,
             role,
+            suppress_legacy_replay,
             outbound,
         }
     }

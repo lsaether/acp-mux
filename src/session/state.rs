@@ -851,7 +851,8 @@ impl SessionInner {
     /// 2. Emit amux/peer_joined → broadcast to existing subs (newcomer is
     ///    not in the map yet) + append to log.
     /// 3. Insert newcomer into subscriber map.
-    /// 4. Deliver the snapshot to the newcomer's outbound. The snapshot
+    /// 4. Unless the subscriber opted out with transport `replay=skip`,
+    ///    deliver the snapshot to the newcomer's outbound. The snapshot
     ///    contains every broadcast-tier frame that happened before this
     ///    attach, in order, so the newcomer reconstructs the session.
     ///
@@ -861,11 +862,15 @@ impl SessionInner {
         if self.subscribers.contains_key(&subscriber.peer_id) {
             return Err(AttachError::PeerIdInUse);
         }
-        let snapshot: Vec<ReplayEntry> = self
-            .replay_log
-            .as_ref()
-            .map(|log| log.iter().cloned().collect())
-            .unwrap_or_default();
+        let suppress_legacy_replay = subscriber.suppress_legacy_replay;
+        let snapshot: Vec<ReplayEntry> = if suppress_legacy_replay {
+            Vec::new()
+        } else {
+            self.replay_log
+                .as_ref()
+                .map(|log| log.iter().cloned().collect())
+                .unwrap_or_default()
+        };
 
         let frame = amux::peer_joined(
             &self.session_id,
@@ -880,6 +885,7 @@ impl SessionInner {
             session = %self.session_id,
             peer_id = %peer_id,
             replay_frames = snapshot.len(),
+            suppress_legacy_replay,
             "subscriber joined session",
         );
         self.subscribers.insert(peer_id.clone(), subscriber);
