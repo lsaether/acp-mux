@@ -1311,6 +1311,293 @@ async fn amux_session_busy_on_concurrent_prompt() {
     let _ = ws_b.send(ClientMsg::Close(None)).await;
 }
 
+#[tokio::test]
+async fn busy_steer_prompt_forwards_without_new_turn() {
+    assert_busy_control_prompt_forwards_without_new_turn("/steer revise the approach").await;
+}
+
+#[tokio::test]
+async fn busy_queue_prompt_forwards_without_new_turn() {
+    assert_busy_control_prompt_forwards_without_new_turn("/queue do this next").await;
+}
+
+async fn assert_busy_control_prompt_forwards_without_new_turn(control_prompt: &str) {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "150")]).await;
+    let url_a = format!("ws://{addr}/acp?session=busy-control&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=busy-control&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":100,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"hi"}]}}"#.into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let control_text = serde_json::to_string(control_prompt).unwrap();
+    let control_request = format!(
+        r#"{{"jsonrpc":"2.0","id":200,"method":"session/prompt","params":{{"sessionId":"sess-mock","prompt":[{{"type":"text","text":{control_text}}}]}}}}"#,
+    );
+    ws_b.send(ClientMsg::Text(control_request.into()))
+        .await
+        .unwrap();
+
+    let (a_frames, b_frames) = collect_frames(&mut ws_a, &mut ws_b, Duration::from_secs(2)).await;
+    let control_response = b_frames
+        .iter()
+        .find(|v| v.get("id") == Some(&serde_json::json!(200)))
+        .unwrap_or_else(|| {
+            panic!("B should receive the control prompt response, frames: {b_frames:?}")
+        });
+    assert!(
+        control_response.get("result").is_some(),
+        "busy control prompt should be forwarded, not rejected: {control_response:?}"
+    );
+    assert_eq!(
+        control_response["result"]["_invocation"],
+        serde_json::json!(2),
+        "mock agent should have processed the original prompt plus the busy control prompt"
+    );
+    assert!(
+        b_frames.iter().all(|v| v.get("error").and_then(|e| e.get("code"))
+            != Some(&serde_json::json!(-32001))),
+        "busy control prompt must not get session-busy -32001, frames: {b_frames:?}"
+    );
+
+    for (label, frames) in [("A", &a_frames), ("B", &b_frames)] {
+        let turn_started: Vec<_> = frames
+            .iter()
+            .filter(|v| v.get("method") == Some(&serde_json::json!("amux/turn_started")))
+            .collect();
+        assert_eq!(
+            turn_started.len(),
+            1,
+            "{label} should see only the original turn_started, not a second control turn: {frames:?}"
+        );
+        assert_eq!(turn_started[0]["params"]["peerId"], serde_json::json!("A"));
+
+        let turn_complete_count = frames
+            .iter()
+            .filter(|v| v.get("method") == Some(&serde_json::json!("amux/turn_complete")))
+            .count();
+        assert_eq!(
+            turn_complete_count, 1,
+            "{label} should see only the original turn_complete, not a second control turn: {frames:?}"
+        );
+
+        let session_update_count = frames
+            .iter()
+            .filter(|v| v.get("method") == Some(&serde_json::json!("session/update")))
+            .count();
+        assert!(
+            session_update_count >= 4,
+            "{label} should still receive agent notifications produced by the sideband control prompt: {frames:?}"
+        );
+    }
+
+    let body = http_get(&format!("http://{addr}/debug/sessions")).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let session = v["sessions"]
+        .as_array()
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|s| s["sessionId"] == serde_json::json!("busy-control"))
+        })
+        .unwrap_or_else(|| panic!("debug/sessions should include busy-control room: {v:?}"));
+    assert_eq!(
+        session["drivingSubscriber"],
+        serde_json::json!("A"),
+        "busy control prompts must not steal the active turn driver"
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn busy_queue_prompt_notifications_replay_to_late_joiner() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "150")]).await;
+    let url_a = format!("ws://{addr}/acp?session=busy-queue-replay&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=busy-queue-replay&peer_id=B");
+    let url_c = format!("ws://{addr}/acp?session=busy-queue-replay&peer_id=C");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":100,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"hi"}]}}"#.into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    ws_b.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":200,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"/queue do this next"}]}}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let (a_frames, b_frames) = collect_frames(&mut ws_a, &mut ws_b, Duration::from_secs(2)).await;
+    let control_response = b_frames
+        .iter()
+        .find(|v| v.get("id") == Some(&serde_json::json!(200)))
+        .unwrap_or_else(|| panic!("B should receive queue control response: {b_frames:?}"));
+    assert!(
+        control_response.get("result").is_some(),
+        "queue control prompt should be forwarded, not rejected: {control_response:?}"
+    );
+
+    for (label, frames) in [("A", &a_frames), ("B", &b_frames)] {
+        let update_count = frames
+            .iter()
+            .filter(|v| v.get("method") == Some(&serde_json::json!("session/update")))
+            .count();
+        assert_eq!(
+            update_count, 4,
+            "{label} should see original-turn updates plus queue acknowledgement/update frames: {frames:?}"
+        );
+    }
+
+    let (mut ws_c, _) = tokio_tungstenite::connect_async(url_c).await.unwrap();
+    let replay = drain_for(&mut ws_c, Duration::from_millis(500)).await;
+    let methods: Vec<&str> = replay
+        .iter()
+        .filter_map(|v| v.get("method").and_then(|m| m.as_str()))
+        .collect();
+
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| **method == "amux/turn_started")
+            .count(),
+        1,
+        "late joiner should replay only the original mux turn start: {replay:?}"
+    );
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| **method == "amux/turn_complete")
+            .count(),
+        1,
+        "late joiner should replay only the original mux turn completion: {replay:?}"
+    );
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| **method == "session/update")
+            .count(),
+        4,
+        "late joiner should replay agent-emitted queue acknowledgement/update frames: {replay:?}"
+    );
+    assert!(
+        replay
+            .iter()
+            .all(|v| v.get("method") != Some(&serde_json::json!("amux/session_busy"))),
+        "allowed busy queue prompt should not produce replayed session_busy: {replay:?}"
+    );
+    assert!(
+        replay
+            .iter()
+            .all(|v| v.get("id") != Some(&serde_json::json!(200))),
+        "late joiner must not replay B's per-subscriber queue prompt response: {replay:?}"
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+    let _ = ws_c.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn busy_multimodal_control_prompt_still_rejected() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "300")]).await;
+    let url_a = format!("ws://{addr}/acp?session=busy-control-multimodal&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=busy-control-multimodal&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":100,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"hi"}]}}"#.into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    ws_b.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":200,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"/steer look here"},{"type":"image","url":"file:///tmp/nope.png"}]}}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let b_frames = drain_for(&mut ws_b, Duration::from_secs(1)).await;
+    let b_json = b_frames
+        .iter()
+        .find(|v| v.get("id") == Some(&serde_json::json!(200)))
+        .unwrap_or_else(|| panic!("B should receive a rejection response, frames: {b_frames:?}"));
+    assert_eq!(
+        b_json["error"]["code"],
+        serde_json::json!(-32001),
+        "non-text busy control prompts must not bypass turn serialization"
+    );
+    assert!(
+        b_frames
+            .iter()
+            .any(|v| v.get("method") == Some(&serde_json::json!("amux/session_busy"))),
+        "non-text busy control prompts should still emit amux/session_busy: {b_frames:?}"
+    );
+
+    let _ = drain_for(&mut ws_a, Duration::from_secs(1)).await;
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
 /// Agent-initiated requests fan out to every attached subscriber so
 /// any peer can confirm. Previously this was driver-only routing; the
 /// duplicate-reply concern is now handled by the first-reply-wins

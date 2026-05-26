@@ -25,10 +25,13 @@ recorded the frame, and resolved agent-initiated requests replay through inert
 `amux/*` lifecycle events rather than re-emitting actionable `session/*`
 requests. Clients receive distinguishable signals and demultiplex them.
 
-Implementation rule: **the multiplexer parses JSON-RPC envelopes only.**
-Everything past `{id, method, params, result, error}` is `serde_json::Value`.
-Policy hooks (turn serialization, response caching) key off the `method`
-string; payload contents are opaque passthrough.
+Implementation rule: **the multiplexer parses JSON-RPC envelopes only, with
+one narrow turn-serialization exception.** Everything past
+`{id, method, params, result, error}` is `serde_json::Value`. Policy hooks
+(response caching, request routing) key off the `method` string; payload contents
+are opaque passthrough except that active-turn `session/prompt` handling inspects
+`params.prompt` just enough to permit text-only Hermes busy-control slash
+prompts (`/steer ...`, `/queue ...`) through without opening a second mux turn.
 
 ## Why a separate namespace
 
@@ -204,7 +207,14 @@ tools/terminal work even if a client connected from a different local cwd.
 
 Broadcast when a `session/prompt` is rejected because another turn is
 already in flight. The rejected subscriber also gets a JSON-RPC error
-response with code `-32001`.
+response with code `-32001`. Text-only Hermes busy-control prompts
+(`/steer ...`, `/queue ...`) are the exception: while a turn is active,
+amux forwards them southbound as ordinary JSON-RPC requests with id
+translation, but does not update the active driver, allocate an
+`amuxTurnId`, or emit turn bookends for them. Any downstream
+`session/update` acknowledgement the agent emits for the control command
+(for example Hermes' `/queue` depth text) is still broadcast and replayed
+like every other agent notification.
 
 ```json
 {

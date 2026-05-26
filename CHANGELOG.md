@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- **Busy-time Hermes control prompts.** During an active turn, text-only `/steer ...` and `/queue ...` `session/prompt` requests are forwarded to the agent as sideband requests instead of being rejected as concurrent turns. They keep the original active turn driver/bookkeeping intact and do not emit a second `amux/turn_started` / `amux/turn_complete` pair; ordinary and multimodal concurrent prompts still receive `-32001`. Fixes [#39](https://github.com/lsaether/acp-mux/issues/39).
 - **Active-turn cancellation for Hermes-backed sessions.** `amux/cancel_active_turn` now forwards ACP-native `session/cancel { sessionId }` for the active prompt while preserving the immediate `amux/turn_cancelled` intent broadcast and later `amux/turn_complete` settlement event. Fixes [#29](https://github.com/lsaether/acp-mux/issues/29).
 
 ## v0.1.2 — 2026-05-23

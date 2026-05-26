@@ -21,9 +21,11 @@
 //!   Inbound (agent → subscribers) `request` arm below), so the driver
 //!   no longer has a privileged role at routing time.
 //! - `session/prompt` requests participate in turn serialization: while a
-//!   prompt is in flight, a second `session/prompt` is rejected locally
-//!   with JSON-RPC error code `-32001` ("session busy"). The active turn
-//!   clears when the matching response returns from the agent.
+//!   prompt is in flight, a second ordinary `session/prompt` is rejected
+//!   locally with JSON-RPC error code `-32001` ("session busy"). Text-only
+//!   Hermes busy-control slash prompts (`/steer ...`, `/queue ...`) are
+//!   forwarded as sideband requests without opening a second mux turn. The
+//!   active turn clears when the matching response returns from the agent.
 //! - `response` → forward unchanged. Subscriber-originated responses only
 //!   show up as replies to agent-initiated requests, whose ids belong to
 //!   the agent's own id space (never our `mux_id` space), so they round
@@ -575,6 +577,47 @@ impl AgentLineAction {
             response_to_agent: Some(response_to_agent),
         }
     }
+}
+
+fn is_busy_control_prompt(req: &IncomingRequest) -> bool {
+    if req.method != "session/prompt" {
+        return false;
+    }
+    let Some(prompt) = req
+        .params
+        .as_ref()
+        .and_then(|params| params.get("prompt"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+
+    let mut text = String::new();
+    for block in prompt {
+        let Some(block_type) = block.get("type").and_then(Value::as_str) else {
+            return false;
+        };
+        if block_type != "text" {
+            return false;
+        }
+        let Some(block_text) = block.get("text").and_then(Value::as_str) else {
+            return false;
+        };
+        text.push_str(block_text);
+    }
+
+    let trimmed = text.trim_start();
+    has_busy_control_command(trimmed, "steer") || has_busy_control_command(trimmed, "queue")
+}
+
+fn has_busy_control_command(trimmed: &str, command: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix('/') else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(command) else {
+        return false;
+    };
+    rest.chars().next().is_some_and(char::is_whitespace) && !rest.trim().is_empty()
 }
 
 #[derive(Debug)]
@@ -1320,11 +1363,20 @@ impl SessionInner {
             return None;
         }
 
-        // Turn serialization: a second concurrent `session/prompt` is
-        // rejected locally with -32001 and does NOT update the driver
-        // (the in-flight turn's originator stays the driver). Also broadcast
-        // an amux/session_busy notification so peers see the rejection.
+        let busy_control_prompt = req.method == "session/prompt"
+            && self.active_turn_mux_id.is_some()
+            && is_busy_control_prompt(&req);
+
+        // Turn serialization: a second concurrent ordinary `session/prompt`
+        // is rejected locally with -32001 and does NOT update the driver
+        // (the in-flight turn's originator stays the driver). Text-only
+        // Hermes busy-control slash prompts are allowed through as sideband
+        // requests so `/steer` can guide the active turn and `/queue` can
+        // append work to Hermes' prompt queue without creating a mux turn.
+        // Also broadcast an amux/session_busy notification for rejections
+        // so peers see the rejection.
         if req.method == "session/prompt"
+            && !busy_control_prompt
             && let Some(active) = self.active_turn_mux_id
         {
             let held_by = self.pending.get(&active).map(|pr| pr.peer_id.clone());
@@ -1350,7 +1402,7 @@ impl SessionInner {
             self.sanitize_initialize_client_capabilities(&mut req);
         }
 
-        if req.method != "initialize" {
+        if req.method != "initialize" && !busy_control_prompt {
             self.note_driving_subscriber(peer_id);
         }
 
@@ -1374,7 +1426,7 @@ impl SessionInner {
         let mux_id = self.next_mux_id;
         self.next_mux_id += 1;
         let original_id = req.id.clone();
-        let is_prompt = req.method == "session/prompt";
+        let is_prompt = req.method == "session/prompt" && !busy_control_prompt;
         let active_turn_session_id = if is_prompt {
             req.params
                 .as_ref()
