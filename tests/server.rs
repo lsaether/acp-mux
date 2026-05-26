@@ -1479,11 +1479,15 @@ async fn amux_steer_active_turn_hard_replaces_after_cancel() {
             .as_str()
             .expect("replacement prompt is text");
         assert!(
-            replacement_text.contains("Previous active turn was interrupted"),
-            "replacement prompt should include mux prompt-injection context: {replacement_text}"
+            replacement_text.starts_with("Active turn steered by peer `B` (supersedes at-1)."),
+            "replacement prompt should use compact mux prompt-injection context: {replacement_text}"
         );
-        assert!(replacement_text.contains("original mission"));
-        assert!(replacement_text.contains("revise the approach"));
+        assert!(
+            !replacement_text.contains("Previous active turn was interrupted"),
+            "replacement prompt should avoid the older verbose preamble: {replacement_text}"
+        );
+        assert!(replacement_text.contains("Original:\noriginal mission"));
+        assert!(replacement_text.contains("Steer:\nrevise the approach"));
 
         let turn_complete_count = frames
             .iter()

@@ -637,9 +637,9 @@ fn build_hard_steer_prompt(
     original_prompt: Option<&str>,
     steering_text: &str,
 ) -> String {
-    let original_prompt = original_prompt.unwrap_or("(original prompt unavailable or non-text)");
+    let original_prompt = original_prompt.unwrap_or("(unavailable/non-text)");
     format!(
-        "Previous active turn was interrupted by peer `{peer_id}`. Continue from any useful prior work, but follow the new steering instruction.\n\nSuperseded turn: {supersedes}\n\nOriginal prompt:\n{original_prompt}\n\nNew steering instruction:\n{steering_text}",
+        "Active turn steered by peer `{peer_id}` (supersedes {supersedes}). Use the steer below to answer the original prompt.\n\nOriginal:\n{original_prompt}\n\nSteer:\n{steering_text}",
         supersedes = supersedes_turn_id.formatted(),
     )
 }
