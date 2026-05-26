@@ -48,10 +48,13 @@
 //!   the mux also broadcasts `amux/agent_request_resolved { requestId,
 //!   resolvedBy, result | error }` so peers that lost the race (or never
 //!   replied) can dismiss the request from their UI. Replay clients see
-//!   the non-actionable opened/resolved lifecycle, not the stale raw ACP
-//!   request. This lets any attached peer (not just the driver) confirm
-//!   an agent-initiated request while preserving the JSON-RPC contract
-//!   that the agent sees exactly one reply per id.
+//!   the non-actionable opened/resolved lifecycle for historical context;
+//!   newest-first attach also re-offers current turn-scoped permission
+//!   requests that are still in flight, while leaving ambiguous non-turn
+//!   raw request replay for a later semantics pass. This lets any attached
+//!   peer (not just the driver) confirm an agent-initiated request while
+//!   preserving the JSON-RPC contract that the agent sees exactly one
+//!   reply per id.
 //!
 //! Turn-end cleanup: when the session/prompt response arrives and
 //! `active_turn_mux_id` clears, the mux sweeps every `agent_pending`
@@ -135,6 +138,7 @@ impl SessionListMetadataIndex {
 const SESSION_QUEUE_CAPACITY: usize = 256;
 const MAX_MUX_QUEUE_PROMPTS: usize = 6;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const NEWEST_TURN_BACKFILL_SEGMENT_DELAY: Duration = Duration::from_millis(3);
 
 /// Mux ids start at 1; 0 is reserved as a sentinel.
 const FIRST_MUX_ID: u64 = 1;
@@ -584,10 +588,42 @@ struct PendingRequest {
 /// subscriber to reply. `InFlight` accepts the next response; `Consumed`
 /// drops all further responses for the same id with a debug log so the
 /// agent never receives duplicate replies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+struct PendingAgentRequest {
+    method: String,
+    frame: Bytes,
+    amux_turn_id: Option<AmuxTurnId>,
+}
+
+impl PendingAgentRequest {
+    fn should_reoffer_on_newest_first_attach(&self) -> bool {
+        // Phase 2 keeps the actionable re-offer surface intentionally
+        // narrow: turn-scoped ACP permission prompts are safe to re-ask a
+        // late joiner because the matching inert opened lifecycle is also
+        // present in the replayed turn segment. Ambiguous non-turn raw
+        // requests are deferred to the Phase 3 semantics pass.
+        self.method == "session/request_permission" && self.amux_turn_id.is_some()
+    }
+
+    fn snapshot_summary(&self, request_id: &Id) -> Value {
+        json!({
+            "requestId": request_id,
+            "method": self.method,
+            "amuxTurnId": self.amux_turn_id.map(|turn_id| turn_id.formatted()),
+            "reofferable": self.should_reoffer_on_newest_first_attach(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 enum AgentReqState {
-    InFlight,
+    InFlight(PendingAgentRequest),
     Consumed,
+}
+
+struct NewestTurnReplayPlan {
+    latest_segment: Vec<ReplayEntry>,
+    older_segments: Vec<Vec<ReplayEntry>>,
 }
 
 #[derive(Debug, Clone)]
@@ -851,12 +887,11 @@ impl SessionInner {
     /// 2. Emit amux/peer_joined → broadcast to existing subs (newcomer is
     ///    not in the map yet) + append to log.
     /// 3. Insert newcomer into subscriber map.
-    /// 4. Deliver the snapshot to the newcomer's outbound. The snapshot
-    ///    contains every broadcast-tier frame that happened before this
-    ///    attach, in order, so the newcomer reconstructs the session.
-    ///
-    /// Because the actor serializes all SessionMsg handling, no live frames
-    /// can interleave during this sequence.
+    /// 4. Deliver replay to the newcomer's outbound. Chronological replay
+    ///    is delivered synchronously before later live messages. Newest-first
+    ///    replay delivers snapshot + latest segment immediately, then drains
+    ///    older segments from a small background task so live frames can
+    ///    interleave while the historical tail is still backfilling.
     fn attach(&mut self, subscriber: Subscriber) -> Result<(), AttachError> {
         if self.subscribers.contains_key(&subscriber.peer_id) {
             return Err(AttachError::PeerIdInUse);
@@ -922,24 +957,82 @@ impl SessionInner {
             replay_order_label(ReplayOrder::NewestTurnFirst),
             self.replay_generation,
         );
-        let frames = std::iter::once(Bytes::from(session_snapshot))
-            .chain(std::iter::once(Bytes::from(replay_started)))
-            .chain(
-                Self::newest_turn_first_entries(snapshot)
-                    .into_iter()
-                    .map(|entry| entry.frame_for_replay()),
-            )
-            .chain(std::iter::once(Bytes::from(replay_complete)));
-
         let Some(sub) = self.subscribers.get(peer_id) else {
             return;
         };
-        for frame in frames {
+
+        let outbound = sub.outbound.clone();
+        let plan = Self::newest_turn_first_plan(snapshot);
+        let initial_frames = std::iter::once(Bytes::from(session_snapshot))
+            .chain(std::iter::once(Bytes::from(replay_started)))
+            .chain(
+                plan.latest_segment
+                    .into_iter()
+                    .map(|entry| entry.frame_for_replay()),
+            )
+            .chain(self.pending_agent_request_reoffer_frames());
+
+        for frame in initial_frames {
             if sub.outbound.send(OutMsg::Frame(frame)).is_err() {
-                tracing::debug!(%peer_id, "newcomer dropped during newest-first replay");
-                break;
+                tracing::debug!(%peer_id, "newcomer dropped during newest-first initial replay");
+                return;
             }
         }
+
+        let peer_id_for_task = peer_id.to_string();
+        let _backfill_task = tokio::spawn(async move {
+            Self::deliver_newest_turn_first_backfill(
+                peer_id_for_task,
+                outbound,
+                plan.older_segments,
+                Bytes::from(replay_complete),
+            )
+            .await;
+        });
+    }
+
+    async fn deliver_newest_turn_first_backfill(
+        peer_id: String,
+        outbound: mpsc::UnboundedSender<OutMsg>,
+        older_segments: Vec<Vec<ReplayEntry>>,
+        replay_complete: Bytes,
+    ) {
+        for segment in older_segments {
+            for entry in segment {
+                if outbound
+                    .send(OutMsg::Frame(entry.frame_for_replay()))
+                    .is_err()
+                {
+                    tracing::debug!(%peer_id, "newcomer dropped during newest-first backfill");
+                    return;
+                }
+            }
+            tokio::time::sleep(NEWEST_TURN_BACKFILL_SEGMENT_DELAY).await;
+        }
+        if outbound.send(OutMsg::Frame(replay_complete)).is_err() {
+            tracing::debug!(%peer_id, "newcomer dropped before newest-first replay_complete");
+        }
+    }
+
+    fn pending_agent_request_reoffer_frames(&self) -> Vec<Bytes> {
+        let mut reoffers: Vec<(&Id, &PendingAgentRequest)> = self
+            .agent_pending
+            .iter()
+            .filter_map(|(id, state)| match state {
+                AgentReqState::InFlight(request)
+                    if request.should_reoffer_on_newest_first_attach() =>
+                {
+                    Some((id, request))
+                }
+                _ => None,
+            })
+            .collect();
+        reoffers.sort_by(|(a, _), (b, _)| format!("{a:?}").cmp(&format!("{b:?}")));
+
+        reoffers
+            .into_iter()
+            .map(|(_, request)| request.frame.clone())
+            .collect()
     }
 
     fn build_attach_session_snapshot(&self, self_peer_id: &str) -> Value {
@@ -996,6 +1089,9 @@ impl SessionInner {
             "queue": {
                 "items": queue_items,
             },
+            "agentRequests": {
+                "pending": self.in_flight_agent_request_summaries(),
+            },
             "replay": {
                 "order": replay_order_label(ReplayOrder::NewestTurnFirst),
                 "generation": self.replay_generation,
@@ -1004,7 +1100,30 @@ impl SessionInner {
         })
     }
 
+    fn newest_turn_first_plan(snapshot: Vec<ReplayEntry>) -> NewestTurnReplayPlan {
+        let mut segments = Self::newest_turn_first_segments(snapshot);
+        if segments.is_empty() {
+            return NewestTurnReplayPlan {
+                latest_segment: Vec::new(),
+                older_segments: Vec::new(),
+            };
+        }
+        let latest_segment = segments.remove(0);
+        NewestTurnReplayPlan {
+            latest_segment,
+            older_segments: segments,
+        }
+    }
+
     fn newest_turn_first_entries(snapshot: Vec<ReplayEntry>) -> Vec<ReplayEntry> {
+        let plan = Self::newest_turn_first_plan(snapshot);
+        std::iter::once(plan.latest_segment)
+            .chain(plan.older_segments)
+            .flat_map(Vec::into_iter)
+            .collect()
+    }
+
+    fn newest_turn_first_segments(snapshot: Vec<ReplayEntry>) -> Vec<Vec<ReplayEntry>> {
         let mut segments: Vec<Vec<ReplayEntry>> = Vec::new();
         let mut current: Option<Vec<ReplayEntry>> = None;
 
@@ -1038,10 +1157,23 @@ impl SessionInner {
             segments.push(segment);
         }
 
-        segments
+        segments.into_iter().rev().collect()
+    }
+
+    fn in_flight_agent_request_summaries(&self) -> Vec<Value> {
+        let mut pending: Vec<(&Id, &PendingAgentRequest)> = self
+            .agent_pending
+            .iter()
+            .filter_map(|(id, state)| match state {
+                AgentReqState::InFlight(request) => Some((id, request)),
+                AgentReqState::Consumed => None,
+            })
+            .collect();
+        pending.sort_by(|(a, _), (b, _)| format!("{a:?}").cmp(&format!("{b:?}")));
+
+        pending
             .into_iter()
-            .rev()
-            .flat_map(Vec::into_iter)
+            .map(|(id, request)| request.snapshot_summary(id))
             .collect()
     }
 
@@ -1347,7 +1479,7 @@ impl SessionInner {
             }
         };
         match self.agent_pending.get_mut(&request_id) {
-            Some(state @ AgentReqState::InFlight) => {
+            Some(state @ AgentReqState::InFlight(_)) => {
                 *state = AgentReqState::Consumed;
                 tracing::info!(
                     session = %self.session_id,
@@ -1433,7 +1565,7 @@ impl SessionInner {
             Passthrough,
         }
         let decision = match self.agent_pending.get_mut(&resp.id) {
-            Some(state @ AgentReqState::InFlight) => {
+            Some(state @ AgentReqState::InFlight(_)) => {
                 *state = AgentReqState::Consumed;
                 Decision::Forward
             }
@@ -1477,7 +1609,7 @@ impl SessionInner {
         let stale_ids: Vec<Id> = self
             .agent_pending
             .iter()
-            .filter(|(_, state)| matches!(state, AgentReqState::InFlight))
+            .filter(|(_, state)| matches!(state, AgentReqState::InFlight(_)))
             .map(|(id, _)| id.clone())
             .collect();
         if stale_ids.is_empty() {
@@ -2528,8 +2660,15 @@ impl SessionInner {
             );
             return None;
         }
-        self.agent_pending
-            .insert(id.clone(), AgentReqState::InFlight);
+        let frame = Bytes::from(line);
+        self.agent_pending.insert(
+            id.clone(),
+            AgentReqState::InFlight(PendingAgentRequest {
+                method: req.method.clone(),
+                frame: frame.clone(),
+                amux_turn_id: self.active_amux_turn_id,
+            }),
+        );
         let request_id_value = match serde_json::to_value(&id) {
             Ok(v) => v,
             Err(err) => {
@@ -2559,7 +2698,6 @@ impl SessionInner {
             amux_turn_id = ?self.active_amux_turn_id.map(|t| t.formatted()),
             "broadcasting agent-initiated request",
         );
-        let frame = Bytes::from(line);
         self.subscribers.retain(|peer_id, sub| {
             match sub.outbound.send(OutMsg::Frame(frame.clone())) {
                 Ok(()) => true,

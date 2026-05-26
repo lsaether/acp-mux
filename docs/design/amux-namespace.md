@@ -240,6 +240,16 @@ truth for mutable mux state before applying subsequent live events.
       "promptText": "optional text-only prompt"
     },
     "queue": { "items": [] },
+    "agentRequests": {
+      "pending": [
+        {
+          "requestId": 10001,
+          "method": "session/request_permission",
+          "amuxTurnId": "at-7",
+          "reofferable": true
+        }
+      ]
+    },
     "replay": {
       "order": "newest_turn_first",
       "generation": 0,
@@ -252,12 +262,15 @@ truth for mutable mux state before applying subsequent live events.
 `peers` includes the attaching subscriber and marks it with `isSelf`. The
 `busy` object reflects the active turn, if any. Queue entries are current
 pending items only; completed/removed/orphaned queue history is not part of the
-snapshot.
+snapshot. `agentRequests.pending` is a compact summary of currently in-flight
+agent-initiated requests. In Phase 2, only turn-scoped
+`session/request_permission` entries are `reofferable`; ambiguous non-turn
+raw request re-offer semantics are deferred to Phase 3.
 
 ### `amux/replay_started` / `amux/replay_complete`
 
-Sent directly to an attaching subscriber in `newest_turn_first` mode to bracket
-historical transcript backfill. They are unlogged attach metadata.
+Sent directly to an attaching subscriber in `newest_turn_first` mode to mark
+historical transcript backfill lifecycle. They are unlogged attach metadata.
 
 ```json
 {
@@ -271,9 +284,13 @@ historical transcript backfill. They are unlogged attach metadata.
 }
 ```
 
-`amux/replay_complete` has the same params and marks that this attach's
-historical backfill has finished. Replayed transcript frames between the
-markers still carry original `recordedAt` / `replaySeq` provenance.
+`amux/replay_complete` has the same params and marks that this attach's older
+historical backfill has finished. Newest-first mode sends the latest segment
+immediately and then drains older segments asynchronously, so live frames and
+attach-time pending permission re-offers may arrive before `replay_complete`.
+Replayed transcript frames still carry original `recordedAt` / `replaySeq`
+provenance under `_meta.amux`; live frames do not become historical merely
+because they arrived while backfill was in progress.
 
 ### `amux/session_busy`
 
@@ -533,6 +550,10 @@ it has no JSON-RPC `id` at the top level, clients must not answer it, and
 the raw ACP request remains the only frame that can be replied to. The
 purpose is durable replay/audit context for late joiners, which must not
 receive stale actionable requests after the agent has already moved on.
+If a newest-first late joiner attaches while a turn-scoped
+`session/request_permission` is still in flight, amux may re-offer the raw
+request immediately after this inert context; that is a current live request,
+not a replay of a stale historical one.
 
 ```json
 {
@@ -563,8 +584,11 @@ Fields:
   `amux/turn_complete` pair.
 
 Live subscribers receive `amux/agent_request_opened` plus the raw ACP
-request. Late joiners replay only the `amux/*` lifecycle (`opened` then
-`resolved`) and never receive the raw, already-stale request.
+request. Historical replay uses only the `amux/*` lifecycle (`opened` then
+`resolved`). Phase 2 adds one narrow attach-time exception: unresolved,
+turn-scoped `session/request_permission` requests are re-offered to
+newest-first late joiners so they can still answer before the agent times out.
+Non-turn raw request re-offer semantics are deferred to Phase 3.
 
 ### `amux/agent_request_resolved`
 
@@ -780,18 +804,27 @@ with the normal bad-query close code. In this opt-in mode:
 
 1. `amux/session_context` is sent first.
 2. `amux/session_snapshot` provides authoritative mutable state: current peers,
-   driving/self flags, busy/active turn state, and current queue items.
+   driving/self flags, busy/active turn state, current queue items, and compact
+   in-flight agent-request summaries.
 3. `amux/replay_started` marks the beginning of historical transcript backfill.
-4. Turn segments are delivered newest to oldest. Each segment remains internally
-   chronological: `amux/turn_started`, the ACP/amux transcript frames that
-   occurred during that turn, and `amux/turn_complete` when the turn has
+4. The newest turn segment is delivered immediately. Each segment remains
+   internally chronological: `amux/turn_started`, the ACP/amux transcript frames
+   that occurred during that turn, and `amux/turn_complete` when the turn has
    completed. An active/incomplete turn is the newest segment and is delivered
    first without a fabricated completion.
-5. Historical presence, busy, and queue lifecycle events are not used as the
+5. If the newest/active turn has a still-in-flight `session/request_permission`,
+   the raw actionable request is re-offered to the late joiner after its inert
+   `amux/agent_request_opened` lifecycle context. Non-turn agent-initiated raw
+   request re-offer semantics are intentionally deferred to Phase 3.
+6. Older turn segments are backfilled newest-to-oldest from a background task.
+   Live frames can interleave while this older tail drains; clients must use
+   `_meta.amux.replaySeq` / `recordedAt` provenance when they need historical
+   ordering rather than assuming delivery order is exclusively historical.
+7. Historical presence, busy, and queue lifecycle events are not used as the
    source of truth in this mode; clients use the snapshot plus subsequent live
    events for mutable state.
-6. `amux/replay_complete` marks that the historical backfill for this attach is
-   finished.
+8. `amux/replay_complete` marks that the older historical backfill for this
+   attach is finished.
 
 `recordedAt` and `replaySeq` remain provenance from the original log. Under
 `newest_turn_first`, their arrival order is intentionally non-monotonic; clients
@@ -919,7 +952,9 @@ A client consuming this protocol needs to:
    `agent_message_chunk` → response text, `agent_thought_chunk` →
    thinking buffer, `tool_call` / `tool_call_update` → tool call records,
    `plan` → plan, `usage_update` → context-window indicator.
-3. On live raw `session/request_permission`, show a reply affordance.
+3. On raw `session/request_permission`, show a reply affordance. In
+   newest-first attach, a raw permission can be a mux re-offer of a still
+   in-flight turn-scoped request; answer it exactly like a live request.
    On replayed `amux/agent_request_opened`, render only inert context:
    no top-level JSON-RPC `id`, no response should be sent. Use
    `amux/agent_request_resolved` to dismiss/annotate the request outcome.

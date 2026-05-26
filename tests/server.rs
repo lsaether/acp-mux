@@ -1256,6 +1256,187 @@ async fn newest_turn_first_snapshot_marks_active_turn_before_backfill() {
 }
 
 #[tokio::test]
+async fn newest_turn_first_reoffers_pending_permission_to_late_joiner() {
+    let (addr, _) = spawn_server_with_mock_env(&[
+        ("MOCK_ACP_EMIT_PERMISSION", "1"),
+        ("MOCK_ACP_ECHO_RESPONSES", "1"),
+        ("MOCK_ACP_PROMPT_DELAY_MS", "800"),
+    ])
+    .await;
+    let url_a = format!("ws://{addr}/acp?session=loop&peer_id=A&peer_name=Alice&role=driver");
+    let url_b = format!(
+        "ws://{addr}/acp?session=loop&peer_id=B&peer_name=Bob&role=observer&replay_order=newest_turn_first"
+    );
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"needs permission"}]}}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let perm_a = ws_next_method(&mut ws_a, "session/request_permission").await;
+    let perm_id = perm_a["id"].clone();
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let replay = drain_for(&mut ws_b, Duration::from_millis(500)).await;
+    let raw_perm_idx = replay
+        .iter()
+        .position(|v| {
+            v.get("method") == Some(&serde_json::json!("session/request_permission"))
+                && v.get("id") == Some(&perm_id)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "late joiner should receive actionable pending permission {perm_id:?}: {replay:?}"
+            )
+        });
+    let opened_idx = replay
+        .iter()
+        .position(|v| {
+            v.get("method") == Some(&serde_json::json!("amux/agent_request_opened"))
+                && v["params"]["requestId"] == perm_id
+        })
+        .unwrap_or_else(|| {
+            panic!("late joiner should receive inert opened lifecycle before re-offer: {replay:?}")
+        });
+    let complete_idx = replay
+        .iter()
+        .position(|v| v.get("method") == Some(&serde_json::json!("amux/replay_complete")))
+        .unwrap_or_else(|| panic!("missing replay_complete: {replay:?}"));
+    let snapshot = replay
+        .iter()
+        .find(|v| v.get("method") == Some(&serde_json::json!("amux/session_snapshot")))
+        .unwrap_or_else(|| panic!("missing session_snapshot: {replay:?}"));
+    let pending = snapshot["params"]["agentRequests"]["pending"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing pending agent request summary: {snapshot:?}"));
+    assert!(
+        pending.iter().any(|req| {
+            req["requestId"] == perm_id
+                && req["method"] == serde_json::json!("session/request_permission")
+                && req["reofferable"] == serde_json::json!(true)
+        }),
+        "session_snapshot should summarize the re-offerable pending request: {snapshot:?}"
+    );
+    assert!(
+        opened_idx < raw_perm_idx,
+        "opened lifecycle should precede actionable re-offer: {replay:?}"
+    );
+    assert!(
+        raw_perm_idx < complete_idx,
+        "pending permission should be re-offered before replay_complete: {replay:?}"
+    );
+
+    let reply_b = format!(
+        r#"{{"jsonrpc":"2.0","id":{perm_id},"result":{{"outcome":{{"outcome":"selected","optionId":"allow_once"}}}}}}"#,
+    );
+    ws_b.send(ClientMsg::Text(reply_b.into())).await.unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_echo = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(Ok(ClientMsg::Text(t)))) =
+            timeout(Duration::from_millis(120), ws_a.next()).await
+        {
+            let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+            if v.get("method") == Some(&serde_json::json!("mock/response_echo"))
+                && v["params"]["id"] == perm_id
+            {
+                saw_echo = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_echo,
+        "late joiner's permission response should reach the agent"
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn newest_turn_first_live_frames_can_precede_older_backfill_completion() {
+    let (addr, _) = spawn_server_with_mock().await;
+    let url_a = format!("ws://{addr}/acp?session=loop&peer_id=A&peer_name=Alice&role=driver");
+    let url_b = format!(
+        "ws://{addr}/acp?session=loop&peer_id=B&peer_name=Bob&role=observer&replay_order=newest_turn_first"
+    );
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    for i in 0..40_u64 {
+        run_prompt_to_completion(&mut ws_a, 100 + i, &format!("old-{i}")).await;
+    }
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    loop {
+        let frame = ws_next_method(&mut ws_b, "amux/turn_started").await;
+        if frame["params"]["content"][0]["text"] == serde_json::json!("old-39") {
+            break;
+        }
+    }
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":777,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"live-after-attach"}]}}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_live_before_complete = false;
+    let mut observed = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let Ok(Some(Ok(ClientMsg::Text(t)))) =
+            timeout(Duration::from_millis(120), ws_b.next()).await
+        else {
+            continue;
+        };
+        let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+        observed.push(v.clone());
+        if v.get("method") == Some(&serde_json::json!("amux/replay_complete")) {
+            break;
+        }
+        if v.get("method") == Some(&serde_json::json!("amux/turn_started"))
+            && v["params"]["content"][0]["text"] == serde_json::json!("live-after-attach")
+        {
+            saw_live_before_complete = true;
+            break;
+        }
+    }
+
+    assert!(
+        saw_live_before_complete,
+        "live turn should reach late joiner before older backfill completes; observed: {observed:?}",
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
 async fn replay_log_adds_mux_record_metadata_to_late_join_frames() {
     let (addr, _) = spawn_server_with_mock().await;
     let url_a = format!("ws://{addr}/acp?session=replay-meta&peer_id=A");
