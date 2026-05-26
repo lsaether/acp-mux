@@ -3,7 +3,8 @@
 //! amux handles these proxy-local methods itself. They are logical
 //! ACP handshakes layered on top of the existing WebSocket attach query:
 //! the transport peer already exists, and `session/attach` returns optional
-//! replay history shaped by `historyPolicy`. amux-specific peer metadata lives
+//! replay history shaped by `historyPolicy` and `_meta.amux.replayOrder`.
+//! amux-specific peer metadata lives
 //! under `result._meta.amux` so the top-level result remains standards-shaped.
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,14 @@ pub enum HistoryPolicy {
     AfterMessage,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayOrder {
+    #[default]
+    Chronological,
+    NewestTurnFirst,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachParams {
@@ -40,6 +49,22 @@ pub struct AttachParams {
     pub client_id: Option<String>,
     #[serde(default)]
     pub client_info: Option<ClientInfo>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<AttachParamsMeta>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachParamsMeta {
+    #[serde(default)]
+    pub amux: Option<AttachParamsAmuxMeta>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachParamsAmuxMeta {
+    #[serde(default)]
+    pub replay_order: Option<ReplayOrder>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +97,7 @@ pub struct AttachMeta {
 #[serde(rename_all = "camelCase")]
 pub struct AttachAmuxMeta {
     pub connected_clients: Vec<ConnectedClient>,
+    pub applied_replay_order: ReplayOrder,
 }
 
 #[derive(Debug, Clone, Serialize)]

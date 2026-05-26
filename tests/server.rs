@@ -382,6 +382,11 @@ async fn rfd533_attach_returns_roster_and_history_policy() {
                 && c["name"] == serde_json::json!("Alice")),
         "attach result should expose current peer roster under _meta.amux: {none:?}",
     );
+    assert_eq!(
+        none["result"]["_meta"]["amux"]["appliedReplayOrder"],
+        serde_json::json!("chronological"),
+        "attach should echo the effective amux replay order in extension metadata: {none:?}",
+    );
 
     let after_message = ws_request(
         &mut ws,
@@ -400,6 +405,90 @@ async fn rfd533_attach_returns_roster_and_history_policy() {
             .any(|entry| entry["method"] == serde_json::json!("session/update")),
         "full fallback history should include replayed broadcast frames: {after_message:?}",
     );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn rfd533_attach_full_history_can_be_returned_newest_turn_first_without_replay_markers() {
+    let (addr, _) = spawn_server_with_mock().await;
+    let url = format!("ws://{addr}/acp?session=replayorder&peer_id=A&peer_name=Alice");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"first turn"}]}}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"second turn"}]}}"#,
+    )
+    .await;
+
+    let attach = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":5,"method":"session/attach","params":{"sessionId":"sess-mock","historyPolicy":"full","_meta":{"amux":{"replayOrder":"newest_turn_first"}}}}"#,
+    )
+    .await;
+    assert_eq!(attach["result"]["historyPolicy"], serde_json::json!("full"));
+    assert_eq!(
+        attach["result"]["_meta"]["amux"]["appliedReplayOrder"],
+        serde_json::json!("newest_turn_first")
+    );
+    let history = attach["result"]["history"].as_array().unwrap();
+    assert!(
+        history.iter().all(|entry| {
+            !matches!(
+                entry["method"].as_str(),
+                Some("amux/session_snapshot" | "amux/replay_started" | "amux/replay_complete")
+            )
+        }),
+        "attach response history should not use streamed replay marker frames: {attach:?}",
+    );
+
+    let turn_starts: Vec<(usize, String)> = history
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry["method"] == serde_json::json!("amux/turn_started"))
+        .map(|(idx, entry)| {
+            (
+                idx,
+                entry["params"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        })
+        .collect();
+    let turn_start_texts: Vec<&str> = turn_starts.iter().map(|(_, text)| text.as_str()).collect();
+    assert_eq!(
+        turn_start_texts,
+        vec!["second turn", "first turn"],
+        "newest_turn_first should reverse turn groups while keeping prompts intact: {history:?}",
+    );
+
+    for (start_idx, _) in turn_starts {
+        let segment_methods: Vec<&str> = history[start_idx..start_idx + 4]
+            .iter()
+            .map(|entry| entry["method"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            segment_methods,
+            vec![
+                "amux/turn_started",
+                "session/update",
+                "session/update",
+                "amux/turn_complete",
+            ],
+            "within a newest-first turn segment, frames must remain chronological: {history:?}",
+        );
+    }
 
     let _ = ws.send(ClientMsg::Close(None)).await;
 }

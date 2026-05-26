@@ -82,7 +82,9 @@ over the existing mux state:
 - `session/attach` is answered by the mux, never forwarded to the wrapped
   agent. It returns the effective ACP `sessionId`, caller `clientId`, effective
   `historyPolicy`, optional `history`, and amux-specific roster metadata under
-  `result._meta.amux.connectedClients`.
+  `result._meta.amux.connectedClients`. Mux-owned replay ordering is requested
+  under `params._meta.amux.replayOrder` and echoed as
+  `result._meta.amux.appliedReplayOrder`.
 - `session/detach` is answered by the mux and then closes that WebSocket
   normally. Remaining peers receive `amux/peer_left`.
 
@@ -106,6 +108,17 @@ connected to amux.
 | `none` | Omits history from the attach result. |
 | `pending_only` | Returns unresolved actionable permission requests tracked by the mux. |
 | `after_message` | Accepted as provisional RFD #533 syntax, but currently falls back to `full` when `afterMessageId` cannot be resolved. Durable ACP message IDs are not yet available consistently enough for precise slicing. |
+
+`params._meta.amux.replayOrder` is optional and mux-owned:
+
+| Order | Behavior |
+|---|---|
+| `chronological` (default) | Return `history` in the same order as the durable replay log. |
+| `newest_turn_first` | Keep non-turn setup frames first, then return completed turn groups newest first. Frames inside each turn group remain chronological (`amux/turn_started`, agent updates, `amux/turn_complete`). |
+
+The applied value is reported as `result._meta.amux.appliedReplayOrder`. This is
+an attach-response history shape, not a URL/query replay mode and not a streamed
+`amux/replay_started` / snapshot / `amux/replay_complete` marker protocol.
 
 Unresolved `session/request_permission` requests are stored separately from the
 inert replay log. After a successful `session/attach`, the mux re-issues those
@@ -756,11 +769,22 @@ When a new subscriber attaches:
 
 If the newcomer then sends RFD #533-inspired `session/attach`, the response's
 `historyPolicy` shapes the returned `history` field over the same durable
-broadcast-tier data. `historyPolicy: "after_message"` is accepted for
-forward compatibility but falls back to `"full"` until stable ACP message IDs
-let amux resolve `afterMessageId` precisely. When unresolved permission
-requests exist, attach also re-issues those raw request frames after the attach
-response so the late client can answer them.
+broadcast-tier data. `params._meta.amux.replayOrder` can additionally shape
+that response history; `"newest_turn_first"` reverses completed turn groups
+while preserving chronological order within each turn. `historyPolicy:
+"after_message"` is accepted for forward compatibility but falls back to
+`"full"` until stable ACP message IDs let amux resolve `afterMessageId`
+precisely. When unresolved permission requests exist, attach also re-issues
+those raw request frames after the attach response so the late client can answer
+them.
+
+The legacy WebSocket attach path still auto-replays chronological history before
+the client can send `session/attach`. Attach-aware clients should pick one
+history source: consume the legacy pre-attach stream and request
+`historyPolicy: "none"`, or ignore pre-attach replay frames and use the
+`session/attach` response history (for example when they need
+`newest_turn_first`). This avoids rendering duplicate history while preserving
+backward compatibility for clients that do not call `session/attach`.
 
 This gives newcomers a complete reconstruction of session state — every
 peer that joined or left, every completed turn (with its prompt content via

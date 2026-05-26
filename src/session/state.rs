@@ -84,7 +84,7 @@ use crate::multiplex::subscriber::{OutMsg, Subscriber};
 use crate::protocol::amux::{self, AmuxTurnId};
 use crate::protocol::attach::{
     self, AttachAmuxMeta, AttachMeta, AttachParams, AttachResult, ConnectedClient, DetachParams,
-    DetachResult, HistoryEntry, HistoryPolicy,
+    DetachResult, HistoryEntry, HistoryPolicy, ReplayOrder,
 };
 use crate::protocol::jsonrpc::{
     Id, Incoming, IncomingRequest, IncomingResponse, JsonRpcError, JsonRpcVersion,
@@ -2307,6 +2307,12 @@ impl SessionInner {
             .unwrap_or_default();
 
         let requested_policy = params.history_policy.unwrap_or_default();
+        let requested_replay_order = params
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.amux.as_ref())
+            .and_then(|amux| amux.replay_order)
+            .unwrap_or_default();
         let effective_policy = match requested_policy {
             HistoryPolicy::AfterMessage => {
                 tracing::debug!(
@@ -2348,8 +2354,14 @@ impl SessionInner {
             .collect();
         let history = match effective_policy {
             HistoryPolicy::None => None,
-            HistoryPolicy::Full => Some(self.history_full()),
-            HistoryPolicy::PendingOnly => Some(self.history_pending_only()),
+            HistoryPolicy::Full => Some(Self::apply_history_replay_order(
+                self.history_full(),
+                requested_replay_order,
+            )),
+            HistoryPolicy::PendingOnly => Some(Self::apply_history_replay_order(
+                self.history_pending_only(),
+                requested_replay_order,
+            )),
             HistoryPolicy::AfterMessage => unreachable!("normalized above"),
         };
         let result = AttachResult {
@@ -2358,7 +2370,10 @@ impl SessionInner {
             history_policy: effective_policy,
             history,
             meta: AttachMeta {
-                amux: AttachAmuxMeta { connected_clients },
+                amux: AttachAmuxMeta {
+                    connected_clients,
+                    applied_replay_order: requested_replay_order,
+                },
             },
         };
         let result = match serde_json::to_value(result) {
@@ -2392,6 +2407,59 @@ impl SessionInner {
             .iter()
             .filter_map(|(_, frame)| Self::history_entry_from_frame(frame))
             .collect()
+    }
+
+    fn apply_history_replay_order(
+        history: Vec<HistoryEntry>,
+        replay_order: ReplayOrder,
+    ) -> Vec<HistoryEntry> {
+        match replay_order {
+            ReplayOrder::Chronological => history,
+            ReplayOrder::NewestTurnFirst => Self::newest_turn_first_history(history),
+        }
+    }
+
+    fn newest_turn_first_history(history: Vec<HistoryEntry>) -> Vec<HistoryEntry> {
+        let mut ambient = Vec::new();
+        let mut turns: Vec<Vec<HistoryEntry>> = Vec::new();
+        let mut current_turn: Option<Vec<HistoryEntry>> = None;
+
+        for entry in history {
+            match entry.method.as_str() {
+                "amux/turn_started" => {
+                    if let Some(turn) = current_turn.take()
+                        && !turn.is_empty()
+                    {
+                        turns.push(turn);
+                    }
+                    current_turn = Some(vec![entry]);
+                }
+                "amux/turn_complete" => {
+                    if let Some(mut turn) = current_turn.take() {
+                        turn.push(entry);
+                        turns.push(turn);
+                    } else {
+                        ambient.push(entry);
+                    }
+                }
+                _ => {
+                    if let Some(turn) = current_turn.as_mut() {
+                        turn.push(entry);
+                    } else {
+                        ambient.push(entry);
+                    }
+                }
+            }
+        }
+
+        if let Some(turn) = current_turn
+            && !turn.is_empty()
+        {
+            turns.push(turn);
+        }
+
+        ambient.extend(turns.into_iter().rev().flatten());
+        ambient
     }
 
     fn history_entry_from_frame(frame: &Bytes) -> Option<HistoryEntry> {
