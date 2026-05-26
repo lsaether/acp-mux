@@ -13,26 +13,37 @@ Clients own **ACP semantics** — assembling chunks into turns, rendering tool
 calls, tracking plan state, and everything else that depends on what ACP
 *means*.
 
-Concretely, the multiplexer MUST NOT fabricate frames in the ACP namespace.
-Any out-of-band signal it needs to publish — peer presence, turn boundaries,
-busy state, late-join history — goes under `amux/*` with explicit payload.
+Concretely, the multiplexer SHOULD NOT fabricate agent-owned frames in the ACP
+namespace. Its mux-native control plane remains `amux/*`: peer presence, turn
+boundaries, busy state, queue lifecycle, and replay-safe lifecycle metadata all
+go under `amux/*` with explicit payload.
 
-ACP frames flow byte-for-byte from agent to live clients; multiplex facts flow
-through their own namespace. Late-join replay is mux-owned state
-reconstruction, not a second chance to answer old ACP requests: replayed frames
-may gain `params._meta.amux` fields that describe when the mux originally
-recorded the frame, and resolved agent-initiated requests replay through inert
-`amux/*` lifecycle events rather than re-emitting actionable `session/*`
-requests. Clients receive distinguishable signals and demultiplex them.
+There is one narrow exception: ACP RFD #533 defines proxy-owned session
+attachment surfaces. amux treats `session/attach`, `session/detach`, and a small
+set of proxy-owned `session/update` siblings as a compatibility facade for
+generic ACP clients. These frames are emitted by the proxy, not the wrapped
+agent, and they do not replace the authoritative `amux/*` events.
+
+Agent-owned ACP frames flow byte-for-byte from agent to live clients; multiplex
+facts flow through `amux/*` plus the explicit RFD #533 proxy facade. Late-join
+replay is mux-owned state reconstruction, not a second chance to answer old ACP
+requests: replayed frames may gain `params._meta.amux` fields that describe
+when the mux originally recorded the frame, and resolved agent-initiated
+requests replay through inert `amux/*` lifecycle events rather than re-emitting
+stale actionable `session/*` requests. Unresolved permission requests are the
+exception: `session/attach` re-issues them after attach so the late client has a
+fresh actionable request to answer. Clients receive distinguishable signals and
+demultiplex them.
 
 Implementation rule: **the multiplexer parses JSON-RPC envelopes only, except
-for mux-owned `amux/*` control methods.** Everything past
-`{id, method, params, result, error}` is `serde_json::Value`. Policy hooks
-(response caching, request routing) key off the `method` string; ACP payload
-contents remain opaque passthrough. Active-turn steering/queueing is not inferred
-from ACP `session/prompt` text. Clients use explicit `amux/steer_active_turn`
-or `amux/queue_prompt` requests, whose small `params` payloads are parsed by
-the mux control plane.
+for mux-owned `amux/*` control methods and the RFD #533 proxy facade.**
+Everything past `{id, method, params, result, error}` is `serde_json::Value`
+unless the method is proxy-owned. Policy hooks (response caching, request
+routing) key off the `method` string; agent-owned ACP payload contents remain
+opaque passthrough. Active-turn steering/queueing is not inferred from ACP
+`session/prompt` text. Clients use explicit `amux/steer_active_turn` or
+`amux/queue_prompt` requests, whose small `params` payloads are parsed by the
+mux control plane.
 
 ## Why a separate namespace
 
@@ -58,9 +69,46 @@ Out-of-band wins for these reasons:
 - **Forward compatible.** New multiplex facts add new `amux/*` methods
   without touching the ACP surface.
 
-The cost: clients must demultiplex two channels. `amux/*` is a small
-namespace and clients already need to handle unknown methods gracefully, so
-this is cheap.
+The cost: mux-native clients must demultiplex two channels. `amux/*` is a small
+namespace and clients already need to handle unknown methods gracefully, so this
+is cheap. Generic ACP clients that only understand RFD #533 can consume the
+proxy facade, but they should expect less amux-specific attribution/detail than
+clients that understand `amux/*`.
+
+## RFD #533 ACP compatibility facade
+
+amux implements RFD #533 as a proxy-local facade over the existing mux state:
+
+- `session/attach` is answered by the mux, never forwarded to the wrapped
+  agent. It returns the effective ACP `sessionId`, caller `clientId`, current
+  `connectedClients`, the effective `historyPolicy`, and optional `history`.
+- `session/detach` is answered by the mux and then closes that WebSocket
+  normally. Remaining peers receive both `amux/peer_left` and
+  `session/update { update: { type: "client_disconnected", ... } }`.
+- The mux emits proxy-owned `session/update` siblings with `update.type` for
+  `prompt_received`, `turn_complete`, `permission_resolved`, and
+  `client_disconnected` while continuing to emit the richer `amux/*` events.
+
+This support is intentionally conservative: amux does **not** inject
+`agentCapabilities.sessionCapabilities.attach` into the upstream `initialize`
+response. The wrapped agent's capabilities are passed through honestly; callers
+that opt into the proxy facade discover it out of band or by knowing they are
+connected to amux.
+
+`historyPolicy` handling:
+
+| Policy | Behavior |
+|---|---|
+| `full` | Returns the current broadcast replay log as `{ method, params }` history entries. |
+| `none` | Omits history from the attach result. |
+| `pending_only` | Returns unresolved actionable permission requests tracked by the mux. |
+| `after_message` | Accepted as provisional RFD #533 syntax, but currently falls back to `full` when `afterMessageId` cannot be resolved. Durable ACP message IDs are not yet available consistently enough for precise slicing. |
+
+Unresolved `session/request_permission` requests are stored separately from the
+inert replay log. After a successful `session/attach`, the mux re-issues those
+raw request frames to the attaching subscriber so the UI can show an actionable
+permission prompt. The stored request is cleared on first winning reply, agent
+cancel, or stale-pending sweep.
 
 ## The `amux/*` namespace
 
@@ -662,11 +710,14 @@ protocol, timeout, or JSON-RPC errors return `502` with a small JSON error body.
 
 The multiplexer maintains a per-session event log: every broadcast-tier
 frame it has sent — its own `amux/*` notifications, including inert
-`amux/agent_request_opened` request context, and the agent's
-`session/update` notifications. Per-subscriber frames (responses to a
-specific subscriber's requests, raw actionable agent-initiated requests such as
-`session/request_permission`) are NOT logged; they're directed by definition
-and may already be resolved by the time a late joiner arrives.
+`amux/agent_request_opened` request context, the agent's `session/update`
+notifications, and proxy-owned RFD #533 `session/update` siblings.
+Per-subscriber frames (responses to a specific subscriber's requests, raw
+actionable agent-initiated requests such as `session/request_permission`) are
+NOT logged; they're directed by definition and may already be resolved by the
+time a late joiner arrives. Unresolved permission requests are tracked in a
+separate pending-permission store for `session/attach` reissue, not in the
+general replay log.
 
 When a new subscriber attaches:
 
@@ -681,7 +732,7 @@ When a new subscriber attaches:
      "method": "session/update",
      "params": {
        "sessionId": "work",
-       "update": {"kind": "..."},
+       "update": {"type": "..."},
        "_meta": {
          "amux": {
            "recordedAt": "2026-05-23T20:15:42.123456789Z",
@@ -697,6 +748,14 @@ When a new subscriber attaches:
 2. Live events that arrive during replay are queued for the newcomer and
    flushed after replay completes, preserving global ordering.
 3. Only then does the newcomer enter the live broadcast set.
+
+If the newcomer then sends RFD #533 `session/attach`, the response's
+`historyPolicy` shapes the returned `history` field over the same durable
+broadcast-tier data. `historyPolicy: "after_message"` is accepted for
+forward compatibility but falls back to `"full"` until stable ACP message IDs
+let amux resolve `afterMessageId` precisely. When unresolved permission
+requests exist, attach also re-issues those raw request frames after the attach
+response so the late client can answer them.
 
 This gives newcomers a complete reconstruction of session state — every
 peer that joined or left, every completed turn (with its prompt content via
@@ -826,10 +885,14 @@ A client consuming this protocol needs to:
    `agent_message_chunk` → response text, `agent_thought_chunk` →
    thinking buffer, `tool_call` / `tool_call_update` → tool call records,
    `plan` → plan, `usage_update` → context-window indicator.
-3. On live raw `session/request_permission`, show a reply affordance.
-   On replayed `amux/agent_request_opened`, render only inert context:
-   no top-level JSON-RPC `id`, no response should be sent. Use
-   `amux/agent_request_resolved` to dismiss/annotate the request outcome.
+3. On live raw `session/request_permission`, show a reply affordance. Late
+   joiners that use RFD #533 `session/attach` may receive unresolved
+   permissions re-issued after the attach response; those re-issued raw
+   requests are also actionable. On replayed `amux/agent_request_opened`, render
+   only inert context: no top-level JSON-RPC `id`, no response should be sent.
+   Use `amux/agent_request_resolved` and/or the RFD #533
+   `session/update { update: { type: "permission_resolved" } }` sibling to
+   dismiss/annotate the request outcome.
 4. On `amux/turn_complete`, close the Turn with `stopReason`.
 
 The `amux/*` bookends remove the need for client-side heuristics like
@@ -840,11 +903,12 @@ explicit boundaries.
 
 ## Tradeoffs
 
-- **Vanilla ACP clients pointed at the multiplexer lose peer visibility.**
-  They won't understand `amux/turn_started`, so peer prompts become
-  invisible to them. This is the correct cost: pretending multiplex facts
-  were agent facts produces subtle confusion downstream. Explicit
-  ignorance beats silent corruption.
+- **Vanilla ACP clients pointed at the multiplexer still lose amux-native
+  detail.** RFD #533 `session/update` siblings give generic clients a coarse
+  prompt/turn/permission/disconnect facade, but rich mux attribution, queues,
+  hard-steer state, and replay-safe lifecycle details remain in `amux/*`.
+  Pretending every multiplex fact is an agent fact would still produce subtle
+  confusion downstream; explicit partial support beats silent corruption.
 - **Two-channel mental model on clients.** Clients demultiplex ACP from
   `amux/*` rather than treating everything as `session/update`.
 - **Multiplexer models turn-of-conversation boundaries explicitly.** It
