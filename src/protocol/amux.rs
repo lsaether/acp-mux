@@ -19,6 +19,28 @@ const METHOD_SESSION_BUSY: &str = "amux/session_busy";
 const METHOD_AGENT_REQUEST_OPENED: &str = "amux/agent_request_opened";
 const METHOD_AGENT_REQUEST_RESOLVED: &str = "amux/agent_request_resolved";
 const METHOD_TURN_CANCELLED: &str = "amux/turn_cancelled";
+const METHOD_CONTROL_SUBMITTED: &str = "amux/control_submitted";
+const METHOD_QUEUE_ITEM_ADDED: &str = "amux/queue_item_added";
+const METHOD_QUEUE_ITEM_SUBMITTED: &str = "amux/queue_item_submitted";
+const METHOD_QUEUE_ITEM_COMPLETED: &str = "amux/queue_item_completed";
+const METHOD_QUEUE_ITEM_REMOVED: &str = "amux/queue_item_removed";
+const METHOD_QUEUE_ITEM_ORPHANED: &str = "amux/queue_item_orphaned";
+
+/// Method name for the amux extension that lets any attached peer steer the
+/// current composer state. If a turn is in flight, current mux-owned semantics
+/// cancel/supersede the active turn and submit a replacement prompt after the
+/// agent settles; if the mux is idle, the steer text is submitted immediately
+/// as the next prompt.
+pub const METHOD_STEER_ACTIVE_TURN: &str = "amux/steer_active_turn";
+
+/// Method name for the amux extension that asks the mux to enqueue text for
+/// the next turn while another turn is active.
+pub const METHOD_QUEUE_PROMPT: &str = "amux/queue_prompt";
+
+/// Method name for the amux extension that removes a queued prompt before it
+/// is submitted. The queue item must still be pending; active/already-complete
+/// items are not removable through this control path.
+pub const METHOD_UNQUEUE_PROMPT: &str = "amux/unqueue_prompt";
 
 /// Method name for the amux extension that lets any attached peer cancel
 /// the in-flight turn (not just the driver). Internally resolves to ACP
@@ -84,6 +106,8 @@ struct TurnStartedParams<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<&'a str>,
     content: &'a serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supersedes_turn_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -156,6 +180,81 @@ struct TurnCancelledParams<'a> {
     reason: Option<&'a str>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlSubmittedParams<'a> {
+    session_id: &'a str,
+    kind: &'a str,
+    mode: &'a str,
+    peer_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amux_turn_id: Option<&'a str>,
+    text: &'a str,
+}
+
+pub struct ControlSubmitted<'a> {
+    pub session_id: &'a str,
+    pub kind: &'a str,
+    pub mode: &'a str,
+    pub peer_id: &'a str,
+    pub peer_name: Option<&'a str>,
+    pub role: Option<&'a str>,
+    pub amux_turn_id: Option<AmuxTurnId>,
+    pub text: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueItemAddedParams<'a> {
+    session_id: &'a str,
+    queue_item_id: &'a str,
+    peer_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'a str>,
+    text: &'a str,
+    status: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueItemSubmittedParams<'a> {
+    session_id: &'a str,
+    queue_item_id: &'a str,
+    amux_turn_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueItemCompletedParams<'a> {
+    session_id: &'a str,
+    queue_item_id: &'a str,
+    amux_turn_id: &'a str,
+    stop_reason: &'a serde_json::Value,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueItemRemovedParams<'a> {
+    session_id: &'a str,
+    queue_item_id: &'a str,
+    removed_by: &'a str,
+    reason: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueItemOrphanedParams<'a> {
+    session_id: &'a str,
+    queue_item_id: &'a str,
+    peer_id: &'a str,
+}
+
 fn encode<P: Serialize>(method: &'static str, params: P) -> Vec<u8> {
     serde_json::to_vec(&Frame {
         jsonrpc: "2.0",
@@ -206,8 +305,10 @@ pub fn turn_started(
     peer_name: Option<&str>,
     role: Option<&str>,
     content: &serde_json::Value,
+    supersedes_turn_id: Option<AmuxTurnId>,
 ) -> Vec<u8> {
     let id = amux_turn_id.formatted();
+    let supersedes = supersedes_turn_id.map(AmuxTurnId::formatted);
     encode(
         METHOD_TURN_STARTED,
         TurnStartedParams {
@@ -217,6 +318,7 @@ pub fn turn_started(
             peer_name,
             role,
             content,
+            supersedes_turn_id: supersedes.as_deref(),
         },
     )
 }
@@ -264,6 +366,102 @@ pub fn turn_cancelled(
             cancelled_by,
             original_driver,
             reason,
+        },
+    )
+}
+
+pub fn control_submitted(event: ControlSubmitted<'_>) -> Vec<u8> {
+    let id = event.amux_turn_id.map(AmuxTurnId::formatted);
+    encode(
+        METHOD_CONTROL_SUBMITTED,
+        ControlSubmittedParams {
+            session_id: event.session_id,
+            kind: event.kind,
+            mode: event.mode,
+            peer_id: event.peer_id,
+            peer_name: event.peer_name,
+            role: event.role,
+            amux_turn_id: id.as_deref(),
+            text: event.text,
+        },
+    )
+}
+
+pub fn queue_item_added(
+    session_id: &str,
+    queue_item_id: &str,
+    peer_id: &str,
+    peer_name: Option<&str>,
+    role: Option<&str>,
+    text: &str,
+) -> Vec<u8> {
+    encode(
+        METHOD_QUEUE_ITEM_ADDED,
+        QueueItemAddedParams {
+            session_id,
+            queue_item_id,
+            peer_id,
+            peer_name,
+            role,
+            text,
+            status: "queued",
+        },
+    )
+}
+
+pub fn queue_item_submitted(
+    session_id: &str,
+    queue_item_id: &str,
+    amux_turn_id: AmuxTurnId,
+) -> Vec<u8> {
+    let id = amux_turn_id.formatted();
+    encode(
+        METHOD_QUEUE_ITEM_SUBMITTED,
+        QueueItemSubmittedParams {
+            session_id,
+            queue_item_id,
+            amux_turn_id: &id,
+        },
+    )
+}
+
+pub fn queue_item_completed(
+    session_id: &str,
+    queue_item_id: &str,
+    amux_turn_id: AmuxTurnId,
+    stop_reason: &serde_json::Value,
+) -> Vec<u8> {
+    let id = amux_turn_id.formatted();
+    encode(
+        METHOD_QUEUE_ITEM_COMPLETED,
+        QueueItemCompletedParams {
+            session_id,
+            queue_item_id,
+            amux_turn_id: &id,
+            stop_reason,
+        },
+    )
+}
+
+pub fn queue_item_removed(session_id: &str, queue_item_id: &str, removed_by: &str) -> Vec<u8> {
+    encode(
+        METHOD_QUEUE_ITEM_REMOVED,
+        QueueItemRemovedParams {
+            session_id,
+            queue_item_id,
+            removed_by,
+            reason: "unqueued",
+        },
+    )
+}
+
+pub fn queue_item_orphaned(session_id: &str, queue_item_id: &str, peer_id: &str) -> Vec<u8> {
+    encode(
+        METHOD_QUEUE_ITEM_ORPHANED,
+        QueueItemOrphanedParams {
+            session_id,
+            queue_item_id,
+            peer_id,
         },
     )
 }
@@ -361,6 +559,7 @@ mod tests {
             Some("phone"),
             None,
             &content,
+            None,
         ));
         assert_eq!(v["method"], json!("amux/turn_started"));
         assert_eq!(v["params"]["amuxTurnId"], json!("at-7"));
