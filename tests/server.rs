@@ -1635,6 +1635,97 @@ async fn amux_queue_prompt_is_mux_owned_and_replays_lifecycle() {
 }
 
 #[tokio::test]
+async fn amux_queue_prompt_without_active_turn_submits_immediately() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "10")]).await;
+    let url_a = format!("ws://{addr}/acp?session=queue_idle&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=queue_idle&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    ws_b.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":200,"method":"amux/queue_prompt","params":{"sessionId":"sess-mock","text":"start from idle"}}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let (a_frames, b_frames) = collect_frames(&mut ws_a, &mut ws_b, Duration::from_secs(3)).await;
+    let control_response = b_frames
+        .iter()
+        .find(|v| v.get("id") == Some(&serde_json::json!(200)))
+        .unwrap_or_else(|| panic!("B should receive immediate queue submission ack: {b_frames:?}"));
+    assert_eq!(
+        control_response["result"]["queueItemId"],
+        serde_json::json!("q-1")
+    );
+    assert_eq!(
+        control_response["result"]["status"],
+        serde_json::json!("submitted")
+    );
+
+    for (label, frames) in [("A", &a_frames), ("B", &b_frames)] {
+        let added = frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/queue_item_added")))
+            .unwrap_or_else(|| panic!("{label} should see queue item added: {frames:?}"));
+        assert_eq!(added["params"]["queueItemId"], serde_json::json!("q-1"));
+        assert_eq!(added["params"]["peerId"], serde_json::json!("B"));
+        assert_eq!(
+            added["params"]["text"],
+            serde_json::json!("start from idle")
+        );
+
+        let turn_started = frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/turn_started")))
+            .unwrap_or_else(|| {
+                panic!("{label} should see immediate queued turn start: {frames:?}")
+            });
+        assert_eq!(
+            turn_started["params"]["amuxTurnId"],
+            serde_json::json!("at-1")
+        );
+        assert_eq!(turn_started["params"]["peerId"], serde_json::json!("B"));
+        assert_eq!(
+            turn_started["params"]["content"],
+            serde_json::json!([{ "type": "text", "text": "start from idle" }])
+        );
+
+        let submitted = frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/queue_item_submitted")))
+            .unwrap_or_else(|| panic!("{label} should see queue item submitted: {frames:?}"));
+        assert_eq!(submitted["params"]["queueItemId"], serde_json::json!("q-1"));
+        assert_eq!(submitted["params"]["amuxTurnId"], serde_json::json!("at-1"));
+
+        let completed = frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/queue_item_completed")))
+            .unwrap_or_else(|| panic!("{label} should see queue item completed: {frames:?}"));
+        assert_eq!(completed["params"]["queueItemId"], serde_json::json!("q-1"));
+        assert_eq!(completed["params"]["amuxTurnId"], serde_json::json!("at-1"));
+    }
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
 async fn busy_multimodal_control_prompt_still_rejected() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "300")]).await;
     let url_a = format!("ws://{addr}/acp?session=busy-control&peer_id=A");

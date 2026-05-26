@@ -252,9 +252,9 @@ the existing active turn without cancelling it.
 
 ### `amux/queue_prompt`
 
-Subscriber → proxy JSON-RPC request. Mux-owned queue: stores text as the next
-turn while the current turn continues. The queue item is visible to every peer
-and replayed to late joiners.
+Subscriber → proxy JSON-RPC request. Mux-owned queue/send primitive: stores text
+as the next turn when a turn is active, or submits it immediately when idle.
+The queue item is visible to every peer and replayed to late joiners.
 
 ```json
 {
@@ -268,16 +268,20 @@ and replayed to late joiners.
 }
 ```
 
-Shared validation semantics for both active-turn controls:
+Control validation semantics:
 
-- They require an active turn. If no prompt is in flight, the requester gets
-  JSON-RPC `-32002` (`amux active-turn control requires an active turn`).
+- `amux/steer_active_turn` requires an active turn. If no prompt is in flight,
+  the requester gets JSON-RPC `-32002` (`amux active-turn control requires an
+  active turn`).
+- `amux/queue_prompt` accepts both states. If a prompt is active, the item is
+  held until that turn settles; if the mux is idle, the item is submitted
+  immediately and the acknowledgement reports `status: "submitted"`.
 - `params.text` is the preferred payload. A text-only ACP-style
   `params.prompt` array is also accepted for clients that already model
   composer content as blocks. Empty text, non-text blocks, or non-string
   `sessionId` values receive JSON-RPC `-32602`.
-- `params.sessionId` is optional when the mux already knows the active turn's
-  ACP session id. When present, it must match the active turn.
+- `params.sessionId` is optional when the mux already knows the active or
+  canonical ACP session id. When present, it must match that known session id.
 - Accepted controls never reuse the generic busy prompt path. The JSON-RPC
   response returns only to the requester; mux-owned lifecycle notifications
   broadcast and replay to every peer.
@@ -299,10 +303,17 @@ Queue acceptance flow:
 
 1. Broadcast `amux/queue_item_added { queueItemId, peerId, text, status:
    "queued" }`.
-2. When the active turn settles, submit the queued item as a normal downstream
-   `session/prompt`, allocate a new `amuxTurnId`, and broadcast
+2. If the mux is idle, immediately submit the item as a downstream
+   `session/prompt`, allocate a new `amuxTurnId`, broadcast
+   `amux/turn_started` and `amux/queue_item_submitted`, and return an ack with
+   `status: "submitted"`.
+3. If another turn is active, leave the item pending and return an ack with
+   `status: "queued"`; when the active turn settles, pop the next queue item,
+   submit it as a normal downstream `session/prompt`, allocate a new
+   `amuxTurnId`, and broadcast `amux/turn_started` plus
    `amux/queue_item_submitted`.
-3. When that queued prompt completes, broadcast `amux/queue_item_completed`.
+4. When that queued prompt completes, broadcast `amux/turn_complete` and
+   `amux/queue_item_completed`.
 
 ### `amux/control_submitted`
 

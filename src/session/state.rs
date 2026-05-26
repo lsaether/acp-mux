@@ -143,7 +143,7 @@ const FIRST_MUX_ID: u64 = 1;
 /// defined errors; -32001 was chosen by the ROADMAP.
 const SESSION_BUSY_ERROR_CODE: i64 = -32001;
 
-/// JSON-RPC error code returned for amux active-turn control requests
+/// JSON-RPC error code returned for strict amux active-turn controls
 /// that cannot be applied because there is no turn to control.
 const NO_ACTIVE_TURN_ERROR_CODE: i64 = -32002;
 
@@ -1377,8 +1377,9 @@ impl SessionInner {
         &mut self,
         peer_id: &str,
         req: &IncomingRequest,
+        require_active_turn: bool,
     ) -> Option<ActiveControlParams> {
-        if self.active_turn_mux_id.is_none() {
+        if require_active_turn && self.active_turn_mux_id.is_none() {
             self.send_error_response(
                 peer_id,
                 req.id.clone(),
@@ -1457,7 +1458,7 @@ impl SessionInner {
                 peer_id,
                 req.id.clone(),
                 INVALID_PARAMS_ERROR_CODE,
-                "amux control params.sessionId must match the active turn sessionId",
+                "amux control params.sessionId must match the active or canonical sessionId",
             );
             return None;
         }
@@ -1477,10 +1478,13 @@ impl SessionInner {
         })
     }
 
-    fn handle_amux_queue_prompt_request(&mut self, peer_id: &str, req: IncomingRequest) {
-        let Some(control) = self.parse_amux_active_turn_control_params(peer_id, &req) else {
-            return;
-        };
+    fn handle_amux_queue_prompt_request(
+        &mut self,
+        peer_id: &str,
+        req: IncomingRequest,
+    ) -> Option<Vec<u8>> {
+        let control = self.parse_amux_active_turn_control_params(peer_id, &req, false)?;
+        let submit_immediately = self.active_turn_mux_id.is_none();
         let queue_item_id = format!("q-{}", self.next_queue_item_id);
         self.next_queue_item_id += 1;
         let (peer_name, role) = self
@@ -1503,11 +1507,20 @@ impl SessionInner {
             role,
             &control.text,
         ));
+        let write_to_agent = submit_immediately
+            .then(|| self.submit_next_queued_prompt())
+            .flatten();
+        let status = if write_to_agent.is_some() {
+            "submitted"
+        } else {
+            "queued"
+        };
         self.send_result_response(
             peer_id,
             req.id,
-            json!({ "queueItemId": queue_item_id, "status": "queued" }),
+            json!({ "queueItemId": queue_item_id, "status": status }),
         );
+        write_to_agent
     }
 
     fn handle_amux_hard_steer_request(
@@ -1515,7 +1528,7 @@ impl SessionInner {
         peer_id: &str,
         req: IncomingRequest,
     ) -> Option<Vec<u8>> {
-        let control = self.parse_amux_active_turn_control_params(peer_id, &req)?;
+        let control = self.parse_amux_active_turn_control_params(peer_id, &req, true)?;
         let active_mux_id = self.active_turn_mux_id?;
         let supersedes_turn_id = self.active_amux_turn_id?;
         let Some(active_session_id) = self.active_turn_session_id.clone() else {
@@ -1604,8 +1617,7 @@ impl SessionInner {
                 return self.handle_amux_hard_steer_request(peer_id, req);
             }
             amux::METHOD_QUEUE_PROMPT => {
-                self.handle_amux_queue_prompt_request(peer_id, req);
-                return None;
+                return self.handle_amux_queue_prompt_request(peer_id, req);
             }
             _ => {}
         };
