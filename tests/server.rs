@@ -1623,6 +1623,87 @@ async fn amux_steer_active_turn_without_active_turn_submits_prompt() {
 }
 
 #[tokio::test]
+async fn amux_steer_active_turn_rejects_second_pending_hard_steer_until_replacement_pops() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "350")]).await;
+    let url_a = format!("ws://{addr}/acp?session=busy-fixes&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=busy-fixes&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":100,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"original"}]}}"#.into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let first = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":200,"method":"amux/steer_active_turn","params":{"sessionId":"sess-mock","text":"first steer"}}"#,
+    )
+    .await;
+    assert_eq!(first["result"]["mode"], serde_json::json!("hard"));
+    assert_eq!(
+        first["result"]["supersedesTurnId"],
+        serde_json::json!("at-1")
+    );
+
+    let second = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":201,"method":"amux/steer_active_turn","params":{"sessionId":"sess-mock","text":"second steer too soon"}}"#,
+    )
+    .await;
+    assert_eq!(second["error"]["code"], serde_json::json!(-32002));
+    assert_eq!(
+        second["error"]["message"],
+        serde_json::json!("a hard steer is already pending for this turn")
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for hard-steer replacement turn to pop"
+        );
+        let started = ws_next_method(&mut ws_b, "amux/turn_started").await;
+        if started["params"]["amuxTurnId"] == serde_json::json!("at-2") {
+            break;
+        }
+    }
+
+    let third = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":202,"method":"amux/steer_active_turn","params":{"sessionId":"sess-mock","text":"steer replacement"}}"#,
+    )
+    .await;
+    assert_eq!(third["result"]["mode"], serde_json::json!("hard"));
+    assert_eq!(
+        third["result"]["supersedesTurnId"],
+        serde_json::json!("at-2"),
+        "pending-hard-steer guard should clear when the replacement prompt pops"
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
 async fn amux_queue_prompt_is_mux_owned_and_replays_lifecycle() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "120")]).await;
     let url_a = format!("ws://{addr}/acp?session=mux-owned-queue&peer_id=A");
@@ -1846,6 +1927,239 @@ async fn amux_queue_prompt_without_active_turn_submits_immediately() {
 
     let _ = ws_a.send(ClientMsg::Close(None)).await;
     let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn amux_queue_prompt_rejects_seventh_pending_item() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "2000")]).await;
+    let url_a = format!("ws://{addr}/acp?session=busy-fixes&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=busy-fixes&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":100,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"hold active"}]}}"#.into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    for i in 1..=6 {
+        let payload = format!(
+            r#"{{"jsonrpc":"2.0","id":{},"method":"amux/queue_prompt","params":{{"sessionId":"sess-mock","text":"queued {i}"}}}}"#,
+            200 + i
+        );
+        let response = ws_request(&mut ws_b, &payload).await;
+        assert_eq!(response["result"]["status"], serde_json::json!("queued"));
+        assert_eq!(
+            response["result"]["queueItemId"],
+            serde_json::json!(format!("q-{i}"))
+        );
+    }
+
+    let seventh = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":300,"method":"amux/queue_prompt","params":{"sessionId":"sess-mock","text":"queued 7"}}"#,
+    )
+    .await;
+    assert_eq!(seventh["error"]["code"], serde_json::json!(-32003));
+    assert_eq!(seventh["error"]["message"], serde_json::json!("queue full"));
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn amux_unqueue_prompt_removes_pending_item_and_replays_removal() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "600")]).await;
+    let url_a = format!("ws://{addr}/acp?session=busy-fixes&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=busy-fixes&peer_id=B");
+    let url_c = format!("ws://{addr}/acp?session=busy-fixes&peer_id=C");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":100,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"active"}]}}"#.into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let queued = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":200,"method":"amux/queue_prompt","params":{"sessionId":"sess-mock","text":"do not run"}}"#,
+    )
+    .await;
+    assert_eq!(queued["result"]["queueItemId"], serde_json::json!("q-1"));
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":300,"method":"amux/unqueue_prompt","params":{"queueItemId":"q-1"}}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let (a_frames, b_frames) =
+        collect_frames(&mut ws_a, &mut ws_b, Duration::from_millis(900)).await;
+    let removed = a_frames
+        .iter()
+        .find(|v| v.get("id") == Some(&serde_json::json!(300)))
+        .unwrap_or_else(|| panic!("A should receive unqueue response: {a_frames:?}"));
+    assert_eq!(removed["result"]["queueItemId"], serde_json::json!("q-1"));
+    assert_eq!(removed["result"]["status"], serde_json::json!("removed"));
+
+    for (label, frames) in [("A", &a_frames), ("B", &b_frames)] {
+        assert!(
+            frames.iter().any(|v| {
+                v.get("method") == Some(&serde_json::json!("amux/queue_item_removed"))
+                    && v["params"]["queueItemId"] == serde_json::json!("q-1")
+                    && v["params"]["removedBy"] == serde_json::json!("A")
+            }),
+            "{label} should see queue item removal: {frames:?}"
+        );
+        assert!(
+            frames.iter().all(|v| {
+                !(v.get("method") == Some(&serde_json::json!("amux/queue_item_submitted"))
+                    && v["params"]["queueItemId"] == serde_json::json!("q-1"))
+            }),
+            "removed queue item must not submit: {frames:?}"
+        );
+    }
+
+    let (mut ws_c, _) = tokio_tungstenite::connect_async(url_c).await.unwrap();
+    let replay = drain_for(&mut ws_c, Duration::from_millis(400)).await;
+    assert!(
+        replay.iter().any(|v| {
+            v.get("method") == Some(&serde_json::json!("amux/queue_item_removed"))
+                && v["params"]["queueItemId"] == serde_json::json!("q-1")
+        }),
+        "late joiner should replay queue removal: {replay:?}"
+    );
+    assert!(
+        replay.iter().all(|v| {
+            !(v.get("method") == Some(&serde_json::json!("amux/queue_item_submitted"))
+                && v["params"]["queueItemId"] == serde_json::json!("q-1"))
+        }),
+        "late replay must not include submission for removed queue item: {replay:?}"
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+    let _ = ws_c.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn amux_disconnected_queue_owner_persists_without_becoming_driver() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "500")]).await;
+    let url_a = format!("ws://{addr}/acp?session=busy-fixes&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=busy-fixes&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":100,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"active"}]}}"#.into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let queued = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":200,"method":"amux/queue_prompt","params":{"sessionId":"sess-mock","text":"queued after disconnect"}}"#,
+    )
+    .await;
+    assert_eq!(queued["result"]["queueItemId"], serde_json::json!("q-1"));
+
+    ws_b.send(ClientMsg::Close(None)).await.unwrap();
+    drop(ws_b);
+    let after_detach = drain_for(&mut ws_a, Duration::from_millis(200)).await;
+    assert!(
+        after_detach.iter().any(|v| {
+            v.get("method") == Some(&serde_json::json!("amux/queue_item_orphaned"))
+                && v["params"]["queueItemId"] == serde_json::json!("q-1")
+                && v["params"]["peerId"] == serde_json::json!("B")
+        }),
+        "remaining peer should see orphaned queued item when owner disconnects: {after_detach:?}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for disconnected owner's queued prompt to submit"
+        );
+        let started = ws_next_method(&mut ws_a, "amux/turn_started").await;
+        if started["params"]["amuxTurnId"] == serde_json::json!("at-2") {
+            assert_eq!(started["params"]["peerId"], serde_json::json!("B"));
+            break;
+        }
+    }
+
+    let body = http_get(&format!("http://{addr}/debug/sessions")).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let session = &v["sessions"][0];
+    assert_ne!(
+        session["drivingSubscriber"],
+        serde_json::json!("B"),
+        "disconnected queued owner must not become the driving subscriber ghost: {session:?}"
+    );
+    assert!(
+        session["subscribers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|sub| sub["peerId"] != serde_json::json!("B")),
+        "B should be detached in debug state: {session:?}"
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
 }
 
 #[tokio::test]

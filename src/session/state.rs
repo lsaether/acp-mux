@@ -133,6 +133,7 @@ impl SessionListMetadataIndex {
 }
 
 const SESSION_QUEUE_CAPACITY: usize = 256;
+const MAX_MUX_QUEUE_PROMPTS: usize = 6;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Mux ids start at 1; 0 is reserved as a sentinel.
@@ -145,8 +146,13 @@ const FIRST_MUX_ID: u64 = 1;
 const SESSION_BUSY_ERROR_CODE: i64 = -32001;
 
 /// JSON-RPC error code returned for strict amux active-turn controls
-/// that cannot be applied because there is no turn to control.
+/// that cannot be applied to the current turn state.
 const NO_ACTIVE_TURN_ERROR_CODE: i64 = -32002;
+
+/// JSON-RPC error code returned when the mux-owned prompt queue is at
+/// capacity. Kept distinct from ordinary `session/prompt` busy errors so
+/// clients can render "queue full" rather than generic turn serialization.
+const QUEUE_FULL_ERROR_CODE: i64 = -32003;
 
 /// Standard JSON-RPC invalid params code used when an amux control request
 /// is missing its text/session payload.
@@ -638,6 +644,10 @@ fn build_hard_steer_prompt(
     steering_text: &str,
 ) -> String {
     let original_prompt = original_prompt.unwrap_or("(unavailable/non-text)");
+    // SAFETY: This prompt-injection template is only for trusted attached
+    // peers in a private mux session. If acp-mux ever exposes steer text to
+    // untrusted/public clients, revisit this plain format! construction and
+    // add explicit quoting/sandboxing for peer-controlled text.
     format!(
         "Active turn steered by peer `{peer_id}` (supersedes {supersedes}). Use the steer below to answer the original prompt.\n\nOriginal:\n{original_prompt}\n\nSteer:\n{steering_text}",
         supersedes = supersedes_turn_id.formatted(),
@@ -943,6 +953,19 @@ impl SessionInner {
             tracing::info!(session = %self.session_id, %peer_id, "subscriber detached");
             let frame = amux::peer_left(&self.session_id, peer_id);
             self.broadcast(frame);
+            let orphaned_queue_item_ids: Vec<String> = self
+                .queued_prompts
+                .iter()
+                .filter(|item| item.peer_id == peer_id)
+                .filter_map(|item| item.queue_item_id.clone())
+                .collect();
+            for queue_item_id in orphaned_queue_item_ids {
+                self.broadcast(amux::queue_item_orphaned(
+                    &self.session_id,
+                    &queue_item_id,
+                    peer_id,
+                ));
+            }
         }
         if self.driving_subscriber_peer_id.as_deref() == Some(peer_id) {
             self.driving_subscriber_peer_id = None;
@@ -1480,12 +1503,29 @@ impl SessionInner {
         })
     }
 
+    fn pending_queue_prompt_count(&self) -> usize {
+        self.queued_prompts
+            .iter()
+            .filter(|item| matches!(item.kind, QueuedPromptKind::Queue))
+            .count()
+    }
+
+    fn has_pending_hard_steer(&self) -> bool {
+        self.queued_prompts
+            .iter()
+            .any(|item| matches!(item.kind, QueuedPromptKind::HardSteer { .. }))
+    }
+
     fn handle_amux_queue_prompt_request(
         &mut self,
         peer_id: &str,
         req: IncomingRequest,
     ) -> Option<Vec<u8>> {
         let control = self.parse_amux_active_turn_control_params(peer_id, &req, false)?;
+        if self.pending_queue_prompt_count() >= MAX_MUX_QUEUE_PROMPTS {
+            self.send_error_response(peer_id, req.id, QUEUE_FULL_ERROR_CODE, "queue full");
+            return None;
+        }
         let submit_immediately = self.active_turn_mux_id.is_none();
         let queue_item_id = format!("q-{}", self.next_queue_item_id);
         self.next_queue_item_id += 1;
@@ -1525,6 +1565,67 @@ impl SessionInner {
         write_to_agent
     }
 
+    fn handle_amux_unqueue_prompt_request(
+        &mut self,
+        peer_id: &str,
+        req: IncomingRequest,
+    ) -> Option<Vec<u8>> {
+        let Some(Value::Object(params)) = req.params.as_ref() else {
+            self.send_error_response(
+                peer_id,
+                req.id,
+                INVALID_PARAMS_ERROR_CODE,
+                "amux/unqueue_prompt params must be an object",
+            );
+            return None;
+        };
+        let Some(queue_item_id) = params.get("queueItemId").and_then(Value::as_str) else {
+            self.send_error_response(
+                peer_id,
+                req.id,
+                INVALID_PARAMS_ERROR_CODE,
+                "amux/unqueue_prompt params.queueItemId must be a string",
+            );
+            return None;
+        };
+        let queue_item_id = queue_item_id.trim().to_string();
+        if queue_item_id.is_empty() {
+            self.send_error_response(
+                peer_id,
+                req.id,
+                INVALID_PARAMS_ERROR_CODE,
+                "amux/unqueue_prompt params.queueItemId must be non-empty",
+            );
+            return None;
+        }
+
+        let Some(position) = self
+            .queued_prompts
+            .iter()
+            .position(|item| item.queue_item_id.as_deref() == Some(queue_item_id.as_str()))
+        else {
+            self.send_error_response(
+                peer_id,
+                req.id,
+                INVALID_PARAMS_ERROR_CODE,
+                "queue item not found",
+            );
+            return None;
+        };
+        self.queued_prompts.remove(position);
+        self.broadcast(amux::queue_item_removed(
+            &self.session_id,
+            queue_item_id.as_str(),
+            peer_id,
+        ));
+        self.send_result_response(
+            peer_id,
+            req.id,
+            json!({ "queueItemId": queue_item_id, "status": "removed" }),
+        );
+        None
+    }
+
     fn handle_amux_steer_request(
         &mut self,
         peer_id: &str,
@@ -1533,6 +1634,15 @@ impl SessionInner {
         let control = self.parse_amux_active_turn_control_params(peer_id, &req, false)?;
         if self.active_turn_mux_id.is_none() {
             return self.handle_amux_idle_steer_request(peer_id, req.id, control);
+        }
+        if self.has_pending_hard_steer() {
+            self.send_error_response(
+                peer_id,
+                req.id,
+                NO_ACTIVE_TURN_ERROR_CODE,
+                "a hard steer is already pending for this turn",
+            );
+            return None;
         }
         let active_mux_id = self.active_turn_mux_id?;
         let supersedes_turn_id = self.active_amux_turn_id?;
@@ -1667,6 +1777,9 @@ impl SessionInner {
             }
             amux::METHOD_QUEUE_PROMPT => {
                 return self.handle_amux_queue_prompt_request(peer_id, req);
+            }
+            amux::METHOD_UNQUEUE_PROMPT => {
+                return self.handle_amux_unqueue_prompt_request(peer_id, req);
             }
             _ => {}
         };
@@ -1998,6 +2111,9 @@ impl SessionInner {
                 );
             }
         }
+        for item in &mut self.queued_prompts {
+            item.session_id = loaded.to_string();
+        }
     }
 
     fn reset_replay_generation_after_load(&mut self, loaded: &str, replay_start_len: usize) {
@@ -2061,6 +2177,14 @@ impl SessionInner {
     }
 
     fn note_driving_subscriber(&mut self, peer_id: &str) {
+        if !self.subscribers.contains_key(peer_id) {
+            tracing::debug!(
+                session = %self.session_id,
+                %peer_id,
+                "skipping driving subscriber update for detached peer",
+            );
+            return;
+        }
         if self.driving_subscriber_peer_id.as_deref() != Some(peer_id) {
             tracing::debug!(session = %self.session_id, %peer_id, "driving subscriber updated");
             self.driving_subscriber_peer_id = Some(peer_id.to_string());
@@ -2419,6 +2543,53 @@ impl SessionInner {
             return true;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_inner() -> SessionInner {
+        SessionInner::new(
+            "test-room".to_string(),
+            "/tmp".to_string(),
+            ReplayTurns::Disabled,
+            false,
+            ClientToolPolicy::default(),
+            Arc::new(SessionListMetadataIndex::new()),
+        )
+    }
+
+    #[test]
+    fn rebind_canonical_session_rewrites_queued_prompt_session_ids() {
+        let mut inner = test_inner();
+        inner.queued_prompts.push_back(QueuedPrompt {
+            queue_item_id: Some("q-1".to_string()),
+            peer_id: "A".to_string(),
+            session_id: "sess-old".to_string(),
+            prompt_text: "queued".to_string(),
+            kind: QueuedPromptKind::Queue,
+        });
+        inner.queued_prompts.push_back(QueuedPrompt {
+            queue_item_id: None,
+            peer_id: "B".to_string(),
+            session_id: "sess-old".to_string(),
+            prompt_text: "steered".to_string(),
+            kind: QueuedPromptKind::HardSteer {
+                supersedes_turn_id: AmuxTurnId(1),
+            },
+        });
+
+        inner.rebind_canonical_session("sess-loaded");
+
+        assert!(
+            inner
+                .queued_prompts
+                .iter()
+                .all(|item| item.session_id == "sess-loaded"),
+            "session/load must retarget queued prompts to the newly loaded canonical session"
+        );
     }
 }
 
