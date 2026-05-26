@@ -25,8 +25,9 @@
 //!   locally with JSON-RPC error code `-32001` ("session busy"). Active-turn
 //!   steering/queueing uses explicit `amux/steer_active_turn` and
 //!   `amux/queue_prompt` requests. Hard steer is mux-owned cancel-and-
-//!   replace; queue is mux-owned queued prompt submission. The active turn
-//!   clears when the matching response returns from the agent.
+//!   replace when a turn is active; idle steer becomes an immediate prompt;
+//!   queue is mux-owned queued prompt submission. The active turn clears when
+//!   the matching response returns from the agent.
 //! - `response` → forward unchanged. Subscriber-originated responses only
 //!   show up as replies to agent-initiated requests, whose ids belong to
 //!   the agent's own id space (never our `mux_id` space), so they round
@@ -566,6 +567,7 @@ enum AgentReqState {
 
 #[derive(Debug, Clone)]
 enum QueuedPromptKind {
+    Prompt,
     Queue,
     HardSteer { supersedes_turn_id: AmuxTurnId },
 }
@@ -1523,12 +1525,15 @@ impl SessionInner {
         write_to_agent
     }
 
-    fn handle_amux_hard_steer_request(
+    fn handle_amux_steer_request(
         &mut self,
         peer_id: &str,
         req: IncomingRequest,
     ) -> Option<Vec<u8>> {
-        let control = self.parse_amux_active_turn_control_params(peer_id, &req, true)?;
+        let control = self.parse_amux_active_turn_control_params(peer_id, &req, false)?;
+        if self.active_turn_mux_id.is_none() {
+            return self.handle_amux_idle_steer_request(peer_id, req.id, control);
+        }
         let active_mux_id = self.active_turn_mux_id?;
         let supersedes_turn_id = self.active_amux_turn_id?;
         let Some(active_session_id) = self.active_turn_session_id.clone() else {
@@ -1590,6 +1595,50 @@ impl SessionInner {
         Some(build_session_cancel(&active_session_id))
     }
 
+    fn handle_amux_idle_steer_request(
+        &mut self,
+        peer_id: &str,
+        req_id: Id,
+        control: ActiveControlParams,
+    ) -> Option<Vec<u8>> {
+        let turn_id = AmuxTurnId(self.next_amux_turn_id);
+        let (peer_name, role) = self
+            .subscribers
+            .get(peer_id)
+            .map(|s| (s.peer_name.as_deref(), s.role.as_deref()))
+            .unwrap_or((None, None));
+
+        self.broadcast(amux::control_submitted(amux::ControlSubmitted {
+            session_id: &self.session_id,
+            kind: "steer",
+            mode: "prompt",
+            peer_id,
+            peer_name,
+            role,
+            amux_turn_id: Some(turn_id),
+            text: &control.text,
+        }));
+        self.queued_prompts.push_front(QueuedPrompt {
+            queue_item_id: None,
+            peer_id: peer_id.to_string(),
+            session_id: control.session_id,
+            prompt_text: control.text,
+            kind: QueuedPromptKind::Prompt,
+        });
+        let write_to_agent = self.submit_next_queued_prompt();
+        self.send_result_response(
+            peer_id,
+            req_id,
+            json!({
+                "accepted": true,
+                "mode": "prompt",
+                "status": "submitted",
+                "amuxTurnId": turn_id.formatted(),
+            }),
+        );
+        write_to_agent
+    }
+
     fn translate_outbound_request(
         &mut self,
         peer_id: &str,
@@ -1614,7 +1663,7 @@ impl SessionInner {
 
         match req.method.as_str() {
             amux::METHOD_STEER_ACTIVE_TURN => {
-                return self.handle_amux_hard_steer_request(peer_id, req);
+                return self.handle_amux_steer_request(peer_id, req);
             }
             amux::METHOD_QUEUE_PROMPT => {
                 return self.handle_amux_queue_prompt_request(peer_id, req);
@@ -1816,6 +1865,7 @@ impl SessionInner {
         let turn_id = AmuxTurnId(self.next_amux_turn_id);
         self.next_amux_turn_id += 1;
         let supersedes_turn_id = match item.kind {
+            QueuedPromptKind::Prompt => None,
             QueuedPromptKind::Queue => None,
             QueuedPromptKind::HardSteer { supersedes_turn_id } => Some(supersedes_turn_id),
         };

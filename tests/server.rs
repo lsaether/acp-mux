@@ -1500,6 +1500,125 @@ async fn amux_steer_active_turn_hard_replaces_after_cancel() {
 }
 
 #[tokio::test]
+async fn amux_steer_active_turn_without_active_turn_submits_prompt() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "10")]).await;
+    let url_a = format!("ws://{addr}/acp?session=idle-steer&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=idle-steer&peer_id=B");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    ws_b.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":200,"method":"amux/steer_active_turn","params":{"sessionId":"sess-mock","text":"start from idle steer"}}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let (a_frames, b_frames) = collect_frames(&mut ws_a, &mut ws_b, Duration::from_secs(3)).await;
+    let control_response = b_frames
+        .iter()
+        .find(|v| v.get("id") == Some(&serde_json::json!(200)))
+        .unwrap_or_else(|| panic!("B should receive idle-steer submission ack: {b_frames:?}"));
+    assert_eq!(
+        control_response["result"]["accepted"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        control_response["result"]["mode"],
+        serde_json::json!("prompt")
+    );
+    assert_eq!(
+        control_response["result"]["status"],
+        serde_json::json!("submitted")
+    );
+    assert_eq!(
+        control_response["result"]["amuxTurnId"],
+        serde_json::json!("at-1")
+    );
+    assert!(
+        control_response["result"].get("supersedesTurnId").is_none(),
+        "idle steer should not claim to supersede a turn: {control_response:?}"
+    );
+
+    for (label, frames) in [("A", &a_frames), ("B", &b_frames)] {
+        let control = frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/control_submitted")))
+            .unwrap_or_else(|| panic!("{label} should see idle steer control event: {frames:?}"));
+        assert_eq!(control["params"]["kind"], serde_json::json!("steer"));
+        assert_eq!(control["params"]["mode"], serde_json::json!("prompt"));
+        assert_eq!(control["params"]["amuxTurnId"], serde_json::json!("at-1"));
+        assert_eq!(
+            control["params"]["text"],
+            serde_json::json!("start from idle steer")
+        );
+
+        assert!(
+            frames
+                .iter()
+                .all(|v| v.get("method") != Some(&serde_json::json!("amux/turn_cancelled"))),
+            "idle steer must not emit cancellation: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|v| v.get("method") != Some(&serde_json::json!("mock/session_cancel_echo"))),
+            "idle steer must not send ACP session/cancel: {frames:?}"
+        );
+        assert!(
+            frames.iter().all(|v| {
+                v.get("method") != Some(&serde_json::json!("amux/queue_item_added"))
+                    && v.get("method") != Some(&serde_json::json!("amux/queue_item_submitted"))
+                    && v.get("method") != Some(&serde_json::json!("amux/queue_item_completed"))
+            }),
+            "idle steer should not use public queue lifecycle: {frames:?}"
+        );
+
+        let turn_started = frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/turn_started")))
+            .unwrap_or_else(|| panic!("{label} should see idle steer turn start: {frames:?}"));
+        assert_eq!(
+            turn_started["params"]["amuxTurnId"],
+            serde_json::json!("at-1")
+        );
+        assert_eq!(turn_started["params"]["peerId"], serde_json::json!("B"));
+        assert_eq!(
+            turn_started["params"]["content"],
+            serde_json::json!([{ "type": "text", "text": "start from idle steer" }])
+        );
+        assert!(
+            turn_started["params"].get("supersedesTurnId").is_none(),
+            "idle steer turn should not include supersedesTurnId: {turn_started:?}"
+        );
+
+        let completed = frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/turn_complete")))
+            .unwrap_or_else(|| panic!("{label} should see idle steer completion: {frames:?}"));
+        assert_eq!(completed["params"]["amuxTurnId"], serde_json::json!("at-1"));
+    }
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
 async fn amux_queue_prompt_is_mux_owned_and_replays_lifecycle() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "120")]).await;
     let url_a = format!("ws://{addr}/acp?session=mux-owned-queue&peer_id=A");

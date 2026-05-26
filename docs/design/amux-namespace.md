@@ -214,9 +214,10 @@ turn is already in flight. The rejected subscriber also gets a JSON-RPC
 error response with code `-32001`. Active-turn control does not rely on
 slash-command text inside `session/prompt`: clients use explicit
 `amux/steer_active_turn` or `amux/queue_prompt` requests instead. Accepted
-amux control requests are mux-owned and replay-visible: hard steer cancels
-and replaces the active turn; queue stores a queue item and submits it after
-the active turn settles.
+amux control requests are mux-owned and replay-visible: active steer cancels
+and replaces the active turn, idle steer submits immediately as the next
+prompt, and queue stores a queue item and submits it after the active turn
+settles.
 
 ```json
 {
@@ -232,11 +233,13 @@ the active turn settles.
 
 ### `amux/steer_active_turn`
 
-Subscriber → proxy JSON-RPC request. Mux-owned **hard steer**: any attached
-peer can interrupt the active turn, then start a replacement turn that carries
-prompt-injected steering context. This is intentionally distinct from future
-native/soft steer support, where a compatible agent may inject guidance into
-the existing active turn without cancelling it.
+Subscriber → proxy JSON-RPC request. Mux-owned steer/send primitive: if a turn
+is active, any attached peer can interrupt it, then start a replacement turn
+that carries prompt-injected steering context. If no turn is active, the steer
+text is submitted immediately as the next normal prompt with `mode: "prompt"`.
+This is intentionally distinct from future native/soft steer support, where a
+compatible agent may inject guidance into the existing active turn without
+cancelling it.
 
 ```json
 {
@@ -270,9 +273,11 @@ The queue item is visible to every peer and replayed to late joiners.
 
 Control validation semantics:
 
-- `amux/steer_active_turn` requires an active turn. If no prompt is in flight,
-  the requester gets JSON-RPC `-32002` (`amux active-turn control requires an
-  active turn`).
+- `amux/steer_active_turn` accepts both states. If a prompt is active, it
+  performs hard cancel-and-replace. If the mux is idle, it submits the steer
+  text immediately as a normal next prompt, returns `mode: "prompt"` plus
+  `status: "submitted"`, and does not emit cancellation or queue lifecycle
+  events.
 - `amux/queue_prompt` accepts both states. If a prompt is active, the item is
   held until that turn settles; if the mux is idle, the item is submitted
   immediately and the acknowledgement reports `status: "submitted"`.
@@ -299,6 +304,17 @@ Hard-steer acceptance flow:
    plaintext context block naming the superseded turn, original prompt text
    when available, and the new steering instruction.
 
+Idle steer acceptance flow:
+
+1. Broadcast `amux/control_submitted { kind: "steer", mode: "prompt", ... }`
+   with the new `amuxTurnId`.
+2. Submit the steer text directly as a downstream `session/prompt`; do not send
+   `session/cancel`, do not emit `amux/turn_cancelled`, and do not create
+   public queue-item lifecycle events.
+3. Broadcast `amux/turn_started` / `amux/turn_complete` for the submitted
+   prompt like any other mux-owned turn. The control response is an ack only;
+   the agent result is represented by normal turn lifecycle/update traffic.
+
 Queue acceptance flow:
 
 1. Broadcast `amux/queue_item_added { queueItemId, peerId, text, status:
@@ -317,7 +333,9 @@ Queue acceptance flow:
 
 ### `amux/control_submitted`
 
-Replay-safe accepted-control intent. Currently emitted for hard steer.
+Replay-safe accepted-control intent. Currently emitted for steer controls:
+`mode: "hard"` when replacing an active turn and `mode: "prompt"` when idle
+steer submits as the next prompt.
 
 ```json
 {

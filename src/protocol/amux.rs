@@ -24,9 +24,11 @@ const METHOD_QUEUE_ITEM_ADDED: &str = "amux/queue_item_added";
 const METHOD_QUEUE_ITEM_SUBMITTED: &str = "amux/queue_item_submitted";
 const METHOD_QUEUE_ITEM_COMPLETED: &str = "amux/queue_item_completed";
 
-/// Method name for the amux extension that lets any attached peer hard-steer
-/// the in-flight turn. Current mux-owned semantics cancel/supersede the
-/// active turn and submit a replacement prompt after the agent settles.
+/// Method name for the amux extension that lets any attached peer steer the
+/// current composer state. If a turn is in flight, current mux-owned semantics
+/// cancel/supersede the active turn and submit a replacement prompt after the
+/// agent settles; if the mux is idle, the steer text is submitted immediately
+/// as the next prompt.
 pub const METHOD_STEER_ACTIVE_TURN: &str = "amux/steer_active_turn";
 
 /// Method name for the amux extension that asks the mux to enqueue text for
