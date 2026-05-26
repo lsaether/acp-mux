@@ -120,6 +120,16 @@ The applied value is reported as `result._meta.amux.appliedReplayOrder`. This is
 an attach-response history shape, not a URL/query replay mode and not a streamed
 `amux/replay_started` / snapshot / `amux/replay_complete` marker protocol.
 
+The transport-level legacy WebSocket replay is controlled separately. Existing
+clients keep the default chronological auto-replay on connect. Attach-aware
+clients that want `session/attach.result.history` as their only bootstrap source
+can connect with `replay=skip` on the `/acp` query, then immediately send
+`session/attach` with their desired `historyPolicy` and
+`params._meta.amux.replayOrder`. This suppresses only the pre-attach replay
+snapshot for that connection; direct connection context such as
+`amux/session_context`, peer lifecycle for other subscribers, and all later live
+frames are still delivered normally.
+
 Unresolved `session/request_permission` requests are stored separately from the
 inert replay log. After a successful `session/attach`, the mux re-issues those
 raw request frames to the attaching subscriber so the UI can show an actionable

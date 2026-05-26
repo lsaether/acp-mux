@@ -7,6 +7,8 @@
 //! - `GET /debug/sessions` → live mux session snapshot
 //!
 //! Subscriber attach query: `session`, `peer_id`, `peer_name?`, `role?`.
+//! `replay=skip` suppresses the legacy transport replay for attach-aware
+//! clients that will use `session/attach.result.history` instead.
 //! `session` is validated against `^[A-Za-z0-9_-]{1,128}$`. Missing required
 //! fields or invalid session ids cause the upgraded socket to close with
 //! application code 4400. `peer_id` already in use on a session closes with
@@ -61,6 +63,7 @@ pub struct AttachQuery {
     pub peer_id: Option<String>,
     pub peer_name: Option<String>,
     pub role: Option<String>,
+    pub replay: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,10 +155,17 @@ async fn handle_attach(state: AppState, q: AttachQuery, mut socket: WebSocket) {
         peer_id,
         peer_name,
         role,
+        skip_legacy_replay,
     } = validated;
 
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutMsg>();
-    let subscriber = Subscriber::new(peer_id.clone(), peer_name, role, outbound_tx);
+    let subscriber = Subscriber::new(
+        peer_id.clone(),
+        peer_name,
+        role,
+        skip_legacy_replay,
+        outbound_tx,
+    );
 
     let handle = match state.registry.attach(&session, subscriber).await {
         Ok(h) => h,
@@ -304,6 +314,7 @@ struct ValidatedAttach {
     peer_id: String,
     peer_name: Option<String>,
     role: Option<String>,
+    skip_legacy_replay: bool,
 }
 
 fn validate(q: &AttachQuery) -> Result<ValidatedAttach, &'static str> {
@@ -315,11 +326,17 @@ fn validate(q: &AttachQuery) -> Result<ValidatedAttach, &'static str> {
     if peer_id.is_empty() {
         return Err("empty ?peer_id");
     }
+    let skip_legacy_replay = match q.replay.as_deref() {
+        None => false,
+        Some("skip") => true,
+        Some(_) => return Err("invalid ?replay (expected 'skip')"),
+    };
     Ok(ValidatedAttach {
         session: session.to_string(),
         peer_id: peer_id.to_string(),
         peer_name: q.peer_name.clone(),
         role: q.role.clone(),
+        skip_legacy_replay,
     })
 }
 
@@ -390,6 +407,7 @@ mod tests {
             peer_id: Some("p1".into()),
             peer_name: None,
             role: None,
+            replay: None,
         };
         assert!(validate(&q).is_err());
 
@@ -398,11 +416,13 @@ mod tests {
             peer_id: Some("p1".into()),
             peer_name: Some("Alice".into()),
             role: Some("driver".into()),
+            replay: Some("skip".into()),
         };
         let v = validate(&q).unwrap();
         assert_eq!(v.session, "ok");
         assert_eq!(v.peer_id, "p1");
         assert_eq!(v.peer_name.as_deref(), Some("Alice"));
         assert_eq!(v.role.as_deref(), Some("driver"));
+        assert!(v.skip_legacy_replay);
     }
 }

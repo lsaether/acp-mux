@@ -1366,6 +1366,58 @@ async fn replay_log_delivers_history_to_late_joiner() {
 }
 
 #[tokio::test]
+async fn replay_skip_suppresses_legacy_history_but_keeps_context_and_live_frames() {
+    let (addr, _) = spawn_server_with_cat().await;
+    let url_a = format!("ws://{addr}/acp?session=replay-skip&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=replay-skip&peer_id=B&replay=skip");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = drain_for(&mut ws_a, Duration::from_millis(100)).await;
+
+    let seed = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-skip","update":{"kind":"seed"}}}"#;
+    ws_a.send(ClientMsg::Text(seed.into())).await.unwrap();
+    let a_seed = drain_for(&mut ws_a, Duration::from_millis(200)).await;
+    assert!(
+        a_seed.iter().any(|v| {
+            v.get("method") == Some(&serde_json::json!("session/update"))
+                && v["params"]["update"]["kind"] == serde_json::json!("seed")
+        }),
+        "seed update should be observed before B joins so it is eligible for legacy replay: {a_seed:?}",
+    );
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let b_bootstrap = drain_for(&mut ws_b, Duration::from_millis(300)).await;
+    assert!(
+        b_bootstrap
+            .iter()
+            .any(|v| v.get("method") == Some(&serde_json::json!("amux/session_context"))),
+        "replay=skip should still receive direct session context: {b_bootstrap:?}",
+    );
+    assert!(
+        b_bootstrap.iter().all(|v| {
+            v.get("method") != Some(&serde_json::json!("session/update"))
+                && !(v.get("method") == Some(&serde_json::json!("amux/peer_joined"))
+                    && v["params"]["peerId"] == serde_json::json!("A"))
+        }),
+        "replay=skip should suppress pre-connect legacy replay frames: {b_bootstrap:?}",
+    );
+
+    let live = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-skip","update":{"kind":"live"}}}"#;
+    ws_a.send(ClientMsg::Text(live.into())).await.unwrap();
+    let b_live = drain_for(&mut ws_b, Duration::from_millis(300)).await;
+    assert!(
+        b_live.iter().any(|v| {
+            v.get("method") == Some(&serde_json::json!("session/update"))
+                && v["params"]["update"]["kind"] == serde_json::json!("live")
+        }),
+        "replay=skip must not suppress live frames after connect: {b_live:?}",
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
 async fn replay_log_adds_mux_record_metadata_to_late_join_frames() {
     let (addr, _) = spawn_server_with_mock().await;
     let url_a = format!("ws://{addr}/acp?session=replay-meta&peer_id=A");
