@@ -1382,24 +1382,14 @@ async fn assert_busy_session_prompt_rejected(control_prompt: &str) {
 }
 
 #[tokio::test]
-async fn amux_steer_active_turn_forwards_without_new_turn() {
-    assert_amux_control_request_forwards_without_new_turn(
-        "amux/steer_active_turn",
-        "revise the approach",
-    )
+async fn amux_steer_active_turn_hard_replaces_after_cancel() {
+    let (addr, _) = spawn_server_with_mock_env(&[
+        ("MOCK_ACP_PROMPT_DELAY_MS", "120"),
+        ("MOCK_ACP_ECHO_SESSION_CANCELS", "1"),
+    ])
     .await;
-}
-
-#[tokio::test]
-async fn amux_queue_prompt_forwards_without_new_turn() {
-    assert_amux_control_request_forwards_without_new_turn("amux/queue_prompt", "do this next")
-        .await;
-}
-
-async fn assert_amux_control_request_forwards_without_new_turn(method: &str, control_text: &str) {
-    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "150")]).await;
-    let url_a = format!("ws://{addr}/acp?session=busy-control&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=busy-control&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?session=hard-steer&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=hard-steer&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -1420,100 +1410,101 @@ async fn assert_amux_control_request_forwards_without_new_turn(method: &str, con
     .await;
 
     ws_a.send(ClientMsg::Text(
-        r#"{"jsonrpc":"2.0","id":100,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"hi"}]}}"#.into(),
+        r#"{"jsonrpc":"2.0","id":100,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"original mission"}]}}"#.into(),
     ))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
 
-    let method_json = serde_json::to_string(method).unwrap();
-    let control_text = serde_json::to_string(control_text).unwrap();
-    let control_request = format!(
-        r#"{{"jsonrpc":"2.0","id":200,"method":{method_json},"params":{{"sessionId":"sess-mock","text":{control_text}}}}}"#,
-    );
-    ws_b.send(ClientMsg::Text(control_request.into()))
-        .await
-        .unwrap();
+    ws_b.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":200,"method":"amux/steer_active_turn","params":{"sessionId":"sess-mock","text":"revise the approach"}}"#.into(),
+    ))
+    .await
+    .unwrap();
 
-    let (a_frames, b_frames) = collect_frames(&mut ws_a, &mut ws_b, Duration::from_secs(2)).await;
+    let (a_frames, b_frames) = collect_frames(&mut ws_a, &mut ws_b, Duration::from_secs(3)).await;
     let control_response = b_frames
         .iter()
         .find(|v| v.get("id") == Some(&serde_json::json!(200)))
-        .unwrap_or_else(|| {
-            panic!("B should receive the amux control response, frames: {b_frames:?}")
-        });
-    assert!(
-        control_response.get("result").is_some(),
-        "amux control request should be forwarded, not rejected: {control_response:?}"
+        .unwrap_or_else(|| panic!("B should receive hard-steer acceptance response: {b_frames:?}"));
+    assert_eq!(
+        control_response["result"]["mode"],
+        serde_json::json!("hard")
     );
     assert_eq!(
-        control_response["result"]["_invocation"],
-        serde_json::json!(2),
-        "mock agent should have processed the original prompt plus the amux control request"
-    );
-    assert!(
-        b_frames.iter().all(|v| v.get("error").and_then(|e| e.get("code"))
-            != Some(&serde_json::json!(-32001))),
-        "amux control request must not get session-busy -32001, frames: {b_frames:?}"
+        control_response["result"]["supersedesTurnId"],
+        serde_json::json!("at-1")
     );
 
     for (label, frames) in [("A", &a_frames), ("B", &b_frames)] {
+        assert!(
+            frames
+                .iter()
+                .any(|v| v.get("method") == Some(&serde_json::json!("mock/session_cancel_echo"))),
+            "{label} should observe ACP-native session/cancel for hard steer: {frames:?}"
+        );
+        let cancelled = frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/turn_cancelled")))
+            .unwrap_or_else(|| panic!("{label} should see cancelled original turn: {frames:?}"));
+        assert_eq!(cancelled["params"]["cancelledBy"], serde_json::json!("B"));
+        assert_eq!(
+            cancelled["params"]["reason"],
+            serde_json::json!("hard_steer")
+        );
+
+        let control = frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/control_submitted")))
+            .unwrap_or_else(|| panic!("{label} should see hard-steer control event: {frames:?}"));
+        assert_eq!(control["params"]["kind"], serde_json::json!("steer"));
+        assert_eq!(control["params"]["mode"], serde_json::json!("hard"));
+
         let turn_started: Vec<_> = frames
             .iter()
             .filter(|v| v.get("method") == Some(&serde_json::json!("amux/turn_started")))
             .collect();
         assert_eq!(
             turn_started.len(),
-            1,
-            "{label} should see only the original turn_started, not a second control turn: {frames:?}"
+            2,
+            "{label} should see original plus replacement turns: {frames:?}"
         );
         assert_eq!(turn_started[0]["params"]["peerId"], serde_json::json!("A"));
+        assert_eq!(turn_started[1]["params"]["peerId"], serde_json::json!("B"));
+        assert_eq!(
+            turn_started[1]["params"]["supersedesTurnId"],
+            serde_json::json!("at-1")
+        );
+        let replacement_text = turn_started[1]["params"]["content"][0]["text"]
+            .as_str()
+            .expect("replacement prompt is text");
+        assert!(
+            replacement_text.contains("Previous active turn was interrupted"),
+            "replacement prompt should include mux prompt-injection context: {replacement_text}"
+        );
+        assert!(replacement_text.contains("original mission"));
+        assert!(replacement_text.contains("revise the approach"));
 
         let turn_complete_count = frames
             .iter()
             .filter(|v| v.get("method") == Some(&serde_json::json!("amux/turn_complete")))
             .count();
         assert_eq!(
-            turn_complete_count, 1,
-            "{label} should see only the original turn_complete, not a second control turn: {frames:?}"
-        );
-
-        let session_update_count = frames
-            .iter()
-            .filter(|v| v.get("method") == Some(&serde_json::json!("session/update")))
-            .count();
-        assert!(
-            session_update_count >= 4,
-            "{label} should still receive agent notifications produced by the sideband control prompt: {frames:?}"
+            turn_complete_count, 2,
+            "{label} should see completion for cancelled turn settlement and replacement: {frames:?}"
         );
     }
-
-    let body = http_get(&format!("http://{addr}/debug/sessions")).await;
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let session = v["sessions"]
-        .as_array()
-        .and_then(|sessions| {
-            sessions
-                .iter()
-                .find(|s| s["sessionId"] == serde_json::json!("busy-control"))
-        })
-        .unwrap_or_else(|| panic!("debug/sessions should include busy-control room: {v:?}"));
-    assert_eq!(
-        session["drivingSubscriber"],
-        serde_json::json!("A"),
-        "amux control requests must not steal the active turn driver"
-    );
 
     let _ = ws_a.send(ClientMsg::Close(None)).await;
     let _ = ws_b.send(ClientMsg::Close(None)).await;
 }
 
 #[tokio::test]
-async fn amux_queue_prompt_notifications_replay_to_late_joiner() {
-    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "150")]).await;
-    let url_a = format!("ws://{addr}/acp?session=busy-control-replay&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=busy-control-replay&peer_id=B");
-    let url_c = format!("ws://{addr}/acp?session=busy-control-replay&peer_id=C");
+async fn amux_queue_prompt_is_mux_owned_and_replays_lifecycle() {
+    let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "120")]).await;
+    let url_a = format!("ws://{addr}/acp?session=mux-owned-queue&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?session=mux-owned-queue&peer_id=B");
+    let url_c = format!("ws://{addr}/acp?session=mux-owned-queue&peer_id=C");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -1538,31 +1529,63 @@ async fn amux_queue_prompt_notifications_replay_to_late_joiner() {
     ))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
     ws_b.send(ClientMsg::Text(
         r#"{"jsonrpc":"2.0","id":200,"method":"amux/queue_prompt","params":{"sessionId":"sess-mock","text":"do this next"}}"#.into(),
     ))
     .await
     .unwrap();
 
-    let (a_frames, b_frames) = collect_frames(&mut ws_a, &mut ws_b, Duration::from_secs(2)).await;
+    let (a_frames, b_frames) = collect_frames(&mut ws_a, &mut ws_b, Duration::from_secs(3)).await;
     let control_response = b_frames
         .iter()
         .find(|v| v.get("id") == Some(&serde_json::json!(200)))
-        .unwrap_or_else(|| panic!("B should receive queue control response: {b_frames:?}"));
-    assert!(
-        control_response.get("result").is_some(),
-        "queue control request should be forwarded, not rejected: {control_response:?}"
+        .unwrap_or_else(|| panic!("B should receive mux queue acceptance response: {b_frames:?}"));
+    assert_eq!(
+        control_response["result"]["queueItemId"],
+        serde_json::json!("q-1")
+    );
+    assert_eq!(
+        control_response["result"]["status"],
+        serde_json::json!("queued")
     );
 
     for (label, frames) in [("A", &a_frames), ("B", &b_frames)] {
-        let update_count = frames
+        let added = frames
             .iter()
-            .filter(|v| v.get("method") == Some(&serde_json::json!("session/update")))
-            .count();
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/queue_item_added")))
+            .unwrap_or_else(|| panic!("{label} should see queue item added: {frames:?}"));
+        assert_eq!(added["params"]["queueItemId"], serde_json::json!("q-1"));
+        assert_eq!(added["params"]["peerId"], serde_json::json!("B"));
+        assert_eq!(added["params"]["text"], serde_json::json!("do this next"));
+
+        let submitted = frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/queue_item_submitted")))
+            .unwrap_or_else(|| panic!("{label} should see queue item submitted: {frames:?}"));
+        assert_eq!(submitted["params"]["queueItemId"], serde_json::json!("q-1"));
+        assert_eq!(submitted["params"]["amuxTurnId"], serde_json::json!("at-2"));
+
+        let completed = frames
+            .iter()
+            .find(|v| v.get("method") == Some(&serde_json::json!("amux/queue_item_completed")))
+            .unwrap_or_else(|| panic!("{label} should see queue item completed: {frames:?}"));
+        assert_eq!(completed["params"]["queueItemId"], serde_json::json!("q-1"));
+        assert_eq!(completed["params"]["amuxTurnId"], serde_json::json!("at-2"));
+
+        let turn_started: Vec<_> = frames
+            .iter()
+            .filter(|v| v.get("method") == Some(&serde_json::json!("amux/turn_started")))
+            .collect();
         assert_eq!(
-            update_count, 4,
-            "{label} should see original-turn updates plus queue acknowledgement/update frames: {frames:?}"
+            turn_started.len(),
+            2,
+            "{label} should see original and queued turns: {frames:?}"
+        );
+        assert_eq!(turn_started[1]["params"]["peerId"], serde_json::json!("B"));
+        assert_eq!(
+            turn_started[1]["params"]["content"],
+            serde_json::json!([{ "type": "text", "text": "do this next" }])
         );
     }
 
@@ -1573,41 +1596,37 @@ async fn amux_queue_prompt_notifications_replay_to_late_joiner() {
         .filter_map(|v| v.get("method").and_then(|m| m.as_str()))
         .collect();
 
+    for expected in [
+        "amux/queue_item_added",
+        "amux/queue_item_submitted",
+        "amux/queue_item_completed",
+    ] {
+        assert!(
+            methods.contains(&expected),
+            "late joiner should replay {expected}: {replay:?}"
+        );
+    }
     assert_eq!(
         methods
             .iter()
             .filter(|method| **method == "amux/turn_started")
             .count(),
-        1,
-        "late joiner should replay only the original mux turn start: {replay:?}"
+        2,
+        "late joiner should replay original and queued turn starts: {replay:?}"
     );
     assert_eq!(
         methods
             .iter()
             .filter(|method| **method == "amux/turn_complete")
             .count(),
-        1,
-        "late joiner should replay only the original mux turn completion: {replay:?}"
-    );
-    assert_eq!(
-        methods
-            .iter()
-            .filter(|method| **method == "session/update")
-            .count(),
-        4,
-        "late joiner should replay agent-emitted queue acknowledgement/update frames: {replay:?}"
-    );
-    assert!(
-        replay
-            .iter()
-            .all(|v| v.get("method") != Some(&serde_json::json!("amux/session_busy"))),
-        "allowed amux queue prompt should not produce replayed session_busy: {replay:?}"
+        2,
+        "late joiner should replay original and queued turn completions: {replay:?}"
     );
     assert!(
         replay
             .iter()
             .all(|v| v.get("id") != Some(&serde_json::json!(200))),
-        "late joiner must not replay B's per-subscriber queue prompt response: {replay:?}"
+        "late joiner must not replay B's per-subscriber queue response: {replay:?}"
     );
 
     let _ = ws_a.send(ClientMsg::Close(None)).await;

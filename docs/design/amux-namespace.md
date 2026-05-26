@@ -81,13 +81,16 @@ clients can render it without a separate notification.
     "peerId": "phone-1",
     "peerName": "phone",
     "role": "default",
-    "content": [{"type": "text", "text": "..."}]
+    "content": [{"type": "text", "text": "..."}],
+    "supersedesTurnId": "at-41"
   }
 }
 ```
 
 - `content` is the originator's `session/prompt` `prompt` array, mirrored
   verbatim — opaque to the multiplexer, byte-passthrough.
+- `supersedesTurnId` is optional and present when a mux-owned replacement
+  turn supersedes an earlier turn (currently hard steer).
 - Originator branches on `peerId == self.peerId` to skip rendering. It
   already rendered locally.
 - Emitted *before* forwarding the request to the subprocess, so peers see
@@ -209,13 +212,11 @@ tools/terminal work even if a client connected from a different local cwd.
 Broadcast when a plain ACP `session/prompt` is rejected because another
 turn is already in flight. The rejected subscriber also gets a JSON-RPC
 error response with code `-32001`. Active-turn control does not rely on
-slash-command text inside `session/prompt`: clients use `amux/steer_active_turn`
-or `amux/queue_prompt` instead. Accepted amux control requests are forwarded
-southbound with id translation, but do not update the active driver, allocate
-an `amuxTurnId`, or emit turn bookends. Any downstream `session/update`
-acknowledgement the agent emits for the control command (for example Hermes'
-`/queue` depth text) is still broadcast and replayed like every other agent
-notification.
+slash-command text inside `session/prompt`: clients use explicit
+`amux/steer_active_turn` or `amux/queue_prompt` requests instead. Accepted
+amux control requests are mux-owned and replay-visible: hard steer cancels
+and replaces the active turn; queue stores a queue item and submits it after
+the active turn settles.
 
 ```json
 {
@@ -231,8 +232,11 @@ notification.
 
 ### `amux/steer_active_turn`
 
-Subscriber → proxy JSON-RPC request. Lets any attached peer steer the active
-turn without sending a second ordinary ACP prompt.
+Subscriber → proxy JSON-RPC request. Mux-owned **hard steer**: any attached
+peer can interrupt the active turn, then start a replacement turn that carries
+prompt-injected steering context. This is intentionally distinct from future
+native/soft steer support, where a compatible agent may inject guidance into
+the existing active turn without cancelling it.
 
 ```json
 {
@@ -248,8 +252,9 @@ turn without sending a second ordinary ACP prompt.
 
 ### `amux/queue_prompt`
 
-Subscriber → proxy JSON-RPC request. Queues text for a compatible downstream
-agent while the current turn continues.
+Subscriber → proxy JSON-RPC request. Mux-owned queue: stores text as the next
+turn while the current turn continues. The queue item is visible to every peer
+and replayed to late joiners.
 
 ```json
 {
@@ -263,7 +268,7 @@ agent while the current turn continues.
 }
 ```
 
-Shared semantics for both active-turn controls:
+Shared validation semantics for both active-turn controls:
 
 - They require an active turn. If no prompt is in flight, the requester gets
   JSON-RPC `-32002` (`amux active-turn control requires an active turn`).
@@ -273,15 +278,95 @@ Shared semantics for both active-turn controls:
   `sessionId` values receive JSON-RPC `-32602`.
 - `params.sessionId` is optional when the mux already knows the active turn's
   ACP session id. When present, it must match the active turn.
-- Accepted controls are translated to compatible downstream `session/prompt`
-  sideband requests. The current bridge renders Hermes-compatible text
-  (`/steer …` or `/queue …`) for the agent, but that compatibility is reached
-  through explicit `amux/*` methods rather than by inspecting generic ACP
-  prompt text.
-- They do **not** update `drivingSubscriber`, allocate a new `amuxTurnId`, or
-  emit `amux/turn_started` / `amux/turn_complete` bookends. The JSON-RPC
-  response returns only to the requester; agent-emitted notifications still
-  broadcast and replay normally.
+- Accepted controls never reuse the generic busy prompt path. The JSON-RPC
+  response returns only to the requester; mux-owned lifecycle notifications
+  broadcast and replay to every peer.
+
+Hard-steer acceptance flow:
+
+1. Broadcast `amux/control_submitted { kind: "steer", mode: "hard", ... }`.
+2. Broadcast `amux/turn_cancelled { reason: "hard_steer" }` for immediate
+   peer-visible intent.
+3. Send ACP-native `session/cancel { sessionId }` southbound and wait for the
+   active prompt response / `amux/turn_complete` settlement.
+4. Submit a replacement `session/prompt` with a new `amuxTurnId` and
+   `supersedesTurnId` on `amux/turn_started`. Because Hermes does not yet
+   consume mux `_meta` for this, the replacement prompt includes a small
+   plaintext context block naming the superseded turn, original prompt text
+   when available, and the new steering instruction.
+
+Queue acceptance flow:
+
+1. Broadcast `amux/queue_item_added { queueItemId, peerId, text, status:
+   "queued" }`.
+2. When the active turn settles, submit the queued item as a normal downstream
+   `session/prompt`, allocate a new `amuxTurnId`, and broadcast
+   `amux/queue_item_submitted`.
+3. When that queued prompt completes, broadcast `amux/queue_item_completed`.
+
+### `amux/control_submitted`
+
+Replay-safe accepted-control intent. Currently emitted for hard steer.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "amux/control_submitted",
+  "params": {
+    "sessionId": "work",
+    "kind": "steer",
+    "mode": "hard",
+    "peerId": "phone-1",
+    "amuxTurnId": "at-42",
+    "text": "focus on the migration path"
+  }
+}
+```
+
+### `amux/queue_item_added` / `amux/queue_item_submitted` / `amux/queue_item_completed`
+
+Replay-safe mux-owned queue lifecycle. `queue_item_added` records accepted
+pending work, `queue_item_submitted` ties it to the real turn id, and
+`queue_item_completed` records terminal settlement.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "amux/queue_item_added",
+  "params": {
+    "sessionId": "work",
+    "queueItemId": "q-1",
+    "peerId": "phone-1",
+    "text": "after that, update the docs",
+    "status": "queued"
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "amux/queue_item_submitted",
+  "params": {
+    "sessionId": "work",
+    "queueItemId": "q-1",
+    "amuxTurnId": "at-43"
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "amux/queue_item_completed",
+  "params": {
+    "sessionId": "work",
+    "queueItemId": "q-1",
+    "amuxTurnId": "at-43",
+    "stopReason": "end_turn"
+  }
+}
+```
 
 ### `amux/agent_request_opened`
 

@@ -25,7 +25,7 @@ implementation lands.
 - Driving-subscriber tracking for agent-initiated request routing
 - Turn serialization (one in-flight `session/prompt` per session, reject concurrents with `-32001`)
 - TTL reconnect grace on last-subscriber-leave
-- Full `amux/*` namespace (turn_started, turn_complete, peer_joined, peer_left, session_busy)
+- Full `amux/*` namespace (turn_started, turn_complete, peer_joined, peer_left, session_busy, cancel/steer/queue lifecycle events)
 - Unbounded broadcast-tier replay log with attach-time playback
 - `/debug/sessions` introspection endpoint
 
