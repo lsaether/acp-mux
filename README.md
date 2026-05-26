@@ -146,6 +146,7 @@ Detailed shape and semantics: [`docs/design/amux-namespace.md`](docs/design/amux
 ## Docs
 
 - Protocol spec: [`docs/design/amux-namespace.md`](docs/design/amux-namespace.md)
+- Client migration guide: [`docs/client-migration-rfd533-attach.md`](docs/client-migration-rfd533-attach.md)
 - Build plan: [`ROADMAP.md`](ROADMAP.md)
 - Release notes: [`CHANGELOG.md`](CHANGELOG.md)
 
