@@ -118,7 +118,9 @@ connected to amux.
 
 The applied value is reported as `result._meta.amux.appliedReplayOrder`. This is
 an attach-response history shape, not a URL/query replay mode and not a streamed
-`amux/replay_started` / snapshot / `amux/replay_complete` marker protocol.
+`amux/replay_started` / snapshot / `amux/replay_complete` marker protocol. See
+[`../client-migration-rfd533-attach.md`](../client-migration-rfd533-attach.md)
+for client migration guidance and duplicate legacy-replay handling.
 
 The transport-level legacy WebSocket replay is controlled separately. Existing
 clients keep the default chronological auto-replay on connect. Attach-aware
