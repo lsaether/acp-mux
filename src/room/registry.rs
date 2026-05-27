@@ -19,9 +19,9 @@ use crate::agent::process::AgentProcess;
 use crate::cli::{ClientToolPolicy, ReplayTurns};
 use crate::multiplex::subscriber::Subscriber;
 use crate::protocol::jsonrpc::{Id, Incoming, JsonRpcError, ParseError};
-use crate::session::state::{
-    AttachError, SessionHandle, SessionListMetadataIndex, SessionMsg, SessionOptions,
-    SessionSnapshot, spawn_session,
+use crate::room::state::{
+    AttachError, RoomHandle, RoomMsg, RoomOptions, RoomSnapshot, SessionListMetadataIndex,
+    spawn_room,
 };
 
 const CONTROL_PLANE_AGENT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -130,17 +130,18 @@ async fn request_transient_agent(
     Err(ControlPlaneSessionListError::AgentTimeout { method })
 }
 
-pub struct SessionRegistry {
+pub struct RoomRegistry {
     agent_cmd: Option<AgentCmd>,
     replay_policy: ReplayTurns,
     session_ttl: Duration,
     meta_propagate: bool,
     client_tool_policy: ClientToolPolicy,
+    emit_segment_frames: bool,
     session_list_index: Arc<SessionListMetadataIndex>,
-    sessions: Mutex<HashMap<String, SessionHandle>>,
+    sessions: Mutex<HashMap<String, RoomHandle>>,
 }
 
-impl SessionRegistry {
+impl RoomRegistry {
     pub fn new(
         agent_cmd: Option<AgentCmd>,
         replay_policy: ReplayTurns,
@@ -177,12 +178,31 @@ impl SessionRegistry {
         meta_propagate: bool,
         client_tool_policy: ClientToolPolicy,
     ) -> Arc<Self> {
+        Self::new_with_options(
+            agent_cmd,
+            replay_policy,
+            session_ttl,
+            meta_propagate,
+            client_tool_policy,
+            true,
+        )
+    }
+
+    pub fn new_with_options(
+        agent_cmd: Option<AgentCmd>,
+        replay_policy: ReplayTurns,
+        session_ttl: Duration,
+        meta_propagate: bool,
+        client_tool_policy: ClientToolPolicy,
+        emit_segment_frames: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             agent_cmd,
             replay_policy,
             session_ttl,
             meta_propagate,
             client_tool_policy,
+            emit_segment_frames,
             session_list_index: Arc::new(SessionListMetadataIndex::new()),
             sessions: Mutex::new(HashMap::new()),
         })
@@ -216,7 +236,7 @@ impl SessionRegistry {
         self: &Arc<Self>,
         session_id: &str,
         subscriber: Subscriber,
-    ) -> Result<SessionHandle, RegistryError> {
+    ) -> Result<RoomHandle, RegistryError> {
         let existing = {
             let mut sessions = self.sessions.lock().await;
             match sessions.get(session_id) {
@@ -266,10 +286,10 @@ impl SessionRegistry {
 
     async fn spawn_locked(
         self: &Arc<Self>,
-        sessions: &mut HashMap<String, SessionHandle>,
+        sessions: &mut HashMap<String, RoomHandle>,
         session_id: &str,
         subscriber: Subscriber,
-    ) -> Result<SessionHandle, RegistryError> {
+    ) -> Result<RoomHandle, RegistryError> {
         let cmd = self
             .agent_cmd
             .as_ref()
@@ -283,17 +303,18 @@ impl SessionRegistry {
         let agent = AgentProcess::spawn(&cmd.program, &cmd.args)
             .await
             .map_err(RegistryError::AgentSpawn)?;
-        let (handle, _actor) = spawn_session(
+        let (handle, _actor) = spawn_room(
             subscriber,
             agent,
             session_id.to_string(),
-            SessionOptions {
+            RoomOptions {
                 replay_policy: self.replay_policy,
                 session_ttl: self.session_ttl,
                 meta_propagate: self.meta_propagate,
                 client_tool_policy: self.client_tool_policy,
                 session_list_index: self.session_list_index.clone(),
                 agent_cwd,
+                emit_segment_frames: self.emit_segment_frames,
             },
         );
         sessions.insert(session_id.to_string(), handle.clone());
@@ -303,13 +324,13 @@ impl SessionRegistry {
 
     async fn try_join(
         &self,
-        handle: &SessionHandle,
+        handle: &RoomHandle,
         subscriber: Subscriber,
     ) -> Result<(), RegistryError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         handle
             .tx
-            .send(SessionMsg::Attach {
+            .send(RoomMsg::Attach {
                 subscriber,
                 ack: ack_tx,
             })
@@ -322,7 +343,7 @@ impl SessionRegistry {
         }
     }
 
-    /// Force-shutdown all sessions. Drops every SessionHandle, which causes
+    /// Force-shutdown all sessions. Drops every RoomHandle, which causes
     /// each actor to see its rx closed and exit, which drops subscriber
     /// senders and shuts down the agent subprocess.
     pub async fn shutdown(&self) {
@@ -334,10 +355,10 @@ impl SessionRegistry {
 
     /// Snapshot every live session for `/debug/sessions`. Sessions whose
     /// actors have exited (handle closed) are skipped. Each live session
-    /// gets a `Snapshot` SessionMsg and a short timeout; sessions that
+    /// gets a `Snapshot` RoomMsg and a short timeout; sessions that
     /// don't reply in time are skipped with a warn.
-    pub async fn snapshot(&self) -> Vec<SessionSnapshot> {
-        let handles: Vec<(String, SessionHandle)> = {
+    pub async fn snapshot(&self) -> Vec<RoomSnapshot> {
+        let handles: Vec<(String, RoomHandle)> = {
             let sessions = self.sessions.lock().await;
             sessions
                 .iter()
@@ -351,7 +372,7 @@ impl SessionRegistry {
             let (ack_tx, ack_rx) = oneshot::channel();
             if handle
                 .tx
-                .send(SessionMsg::Snapshot { ack: ack_tx })
+                .send(RoomMsg::Snapshot { ack: ack_tx })
                 .await
                 .is_err()
             {

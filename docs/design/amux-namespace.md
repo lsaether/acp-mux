@@ -684,7 +684,8 @@ Independently of `--meta-propagate`, amux decorates `session/list` responses
 when an upstream entry corresponds to a live mux room. The mux learns that
 mapping from successful `session/new` and `session/load` responses: the
 upstream ACP `sessionId` becomes the lookup key, while the WebSocket
-`?session=` value remains the mux/proxy room id.
+`?room=` value remains the mux room id (`?session=` is accepted as a
+deprecated alias).
 
 For each `result.sessions[]` entry whose `sessionId` matches live mux state,
 amux merges fields under `sessions[i]._meta.amux`:
@@ -694,7 +695,7 @@ amux merges fields under `sessions[i]._meta.amux`:
   "sessionId": "sess-mock",
   "_meta": {
     "amux": {
-      "proxySessionId": "work",
+      "roomId": "work",
       "subscriberCount": 2,
       "drivingSubscriber": "desktop-1"
     }
@@ -704,7 +705,7 @@ amux merges fields under `sessions[i]._meta.amux`:
 
 Fields:
 
-- `proxySessionId` — mux room/session id from the attach URL.
+- `roomId` — mux room id from the attach URL.
 - `subscriberCount` — number of currently attached subscribers.
 - `drivingSubscriber` — optional peer id that last sent a substantive
   non-`initialize` request.

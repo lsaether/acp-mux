@@ -7,15 +7,15 @@
 //! no separate CI step needed.
 //!
 //! Pure unit tests for private server helpers (`strip_trailing_newline`,
-//! `validate`, `is_valid_session_id`) stay in `src/server.rs`.
+//! `validate`, `is_valid_room_id`) stay in `src/server.rs`.
 
 use std::sync::Arc;
 
 use amux::cli::{ClientToolPolicy, ReplayTurns};
+use amux::room::registry::{AgentCmd, RoomRegistry};
 use amux::server::{
     AppState, CLOSE_CODE_BAD_QUERY, CLOSE_CODE_INTERNAL, CLOSE_CODE_PEER_CONFLICT, router,
 };
-use amux::session::registry::{AgentCmd, SessionRegistry};
 use futures::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::Message as ClientMsg;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 /// Spawn an acp-mux server backed by `cat` as the agent (NDJSON loopback).
-async fn spawn_server_with_cat() -> (SocketAddr, Arc<SessionRegistry>) {
+async fn spawn_server_with_cat() -> (SocketAddr, Arc<RoomRegistry>) {
     spawn_server(Some(AgentCmd {
         program: "cat".into(),
         args: vec![],
@@ -37,15 +37,15 @@ async fn spawn_server_with_cat() -> (SocketAddr, Arc<SessionRegistry>) {
 /// exercise the grace window override via `spawn_server_with_ttl`.
 const TEST_DEFAULT_TTL: Duration = Duration::from_millis(150);
 
-async fn spawn_server(agent_cmd: Option<AgentCmd>) -> (SocketAddr, Arc<SessionRegistry>) {
+async fn spawn_server(agent_cmd: Option<AgentCmd>) -> (SocketAddr, Arc<RoomRegistry>) {
     spawn_server_with_ttl(agent_cmd, TEST_DEFAULT_TTL).await
 }
 
 async fn spawn_server_with_ttl(
     agent_cmd: Option<AgentCmd>,
     ttl: Duration,
-) -> (SocketAddr, Arc<SessionRegistry>) {
-    let registry = SessionRegistry::new(agent_cmd, ReplayTurns::Unbounded, ttl);
+) -> (SocketAddr, Arc<RoomRegistry>) {
+    let registry = RoomRegistry::new(agent_cmd, ReplayTurns::Unbounded, ttl);
     let app = router(AppState::new(registry.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -59,8 +59,8 @@ async fn spawn_server_with_ttl(
 async fn spawn_server_with_meta_propagation(
     agent_cmd: Option<AgentCmd>,
     enabled: bool,
-) -> (SocketAddr, Arc<SessionRegistry>) {
-    let registry = SessionRegistry::new_with_meta_propagation(
+) -> (SocketAddr, Arc<RoomRegistry>) {
+    let registry = RoomRegistry::new_with_meta_propagation(
         agent_cmd,
         ReplayTurns::Unbounded,
         TEST_DEFAULT_TTL,
@@ -79,8 +79,8 @@ async fn spawn_server_with_meta_propagation(
 async fn spawn_server_with_client_tool_policy(
     agent_cmd: Option<AgentCmd>,
     client_tool_policy: ClientToolPolicy,
-) -> (SocketAddr, Arc<SessionRegistry>) {
-    let registry = SessionRegistry::new_with_client_tool_policy(
+) -> (SocketAddr, Arc<RoomRegistry>) {
+    let registry = RoomRegistry::new_with_client_tool_policy(
         agent_cmd,
         ReplayTurns::Unbounded,
         TEST_DEFAULT_TTL,
@@ -107,7 +107,7 @@ async fn healthz_returns_ok() {
 #[tokio::test]
 async fn ws_invalid_session_closes_4400() {
     let (addr, _) = spawn_server_with_cat().await;
-    let url = format!("ws://{addr}/acp?session=bad%20space&peer_id=p1");
+    let url = format!("ws://{addr}/acp?room=bad%20space&peer_id=p1");
     let (mut ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");
@@ -118,7 +118,7 @@ async fn ws_invalid_session_closes_4400() {
 #[tokio::test]
 async fn ws_missing_peer_id_closes_4400() {
     let (addr, _) = spawn_server_with_cat().await;
-    let url = format!("ws://{addr}/acp?session=stream52");
+    let url = format!("ws://{addr}/acp?room=stream52");
     let (mut ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");
@@ -129,7 +129,7 @@ async fn ws_missing_peer_id_closes_4400() {
 #[tokio::test]
 async fn ws_no_agent_cmd_closes_1011() {
     let (addr, _) = spawn_server(None).await;
-    let url = format!("ws://{addr}/acp?session=ok&peer_id=p1");
+    let url = format!("ws://{addr}/acp?room=ok&peer_id=p1");
     let (mut ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");
@@ -140,7 +140,7 @@ async fn ws_no_agent_cmd_closes_1011() {
 #[tokio::test]
 async fn ws_loopback_roundtrip_via_cat() {
     let (addr, registry) = spawn_server_with_cat().await;
-    let url = format!("ws://{addr}/acp?session=loop&peer_id=p1");
+    let url = format!("ws://{addr}/acp?room=loop&peer_id=p1");
     let (mut ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");
@@ -207,24 +207,60 @@ async fn subscriber_receives_agent_context_cwd_on_attach() {
         .unwrap()
         .to_string_lossy()
         .to_string();
-    let url = format!("ws://{addr}/acp?session=ctx&peer_id=p1");
+    let url = format!("ws://{addr}/acp?room=ctx&peer_id=p1");
     let (mut ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");
 
     let context = ws_next_method(&mut ws, "amux/session_context").await;
 
-    assert_eq!(context["params"]["sessionId"], serde_json::json!("ctx"));
+    assert_eq!(context["params"]["roomId"], serde_json::json!("ctx"));
     assert_eq!(context["params"]["cwd"], serde_json::json!(expected_cwd));
 
     let _ = ws.send(ClientMsg::Close(None)).await;
 }
 
+/// Deprecation alias: `?session=` still accepted (one-release window) and
+/// behaves identically to `?room=`. v0.3 should remove this test along
+/// with the `session: Option<String>` field on AttachQuery.
+#[tokio::test]
+async fn ws_accepts_deprecated_session_alias() {
+    let (addr, _) = spawn_server_with_cat().await;
+    let url = format!("ws://{addr}/acp?session=legacy&peer_id=p1");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect with deprecated alias");
+
+    let context = ws_next_method(&mut ws, "amux/session_context").await;
+    assert_eq!(
+        context["params"]["roomId"],
+        serde_json::json!("legacy"),
+        "?session= alias must resolve to the same room id as ?room=",
+    );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+/// Specifying both `?room=` and `?session=` is rejected. Guards against
+/// callers that try to pass both during migration.
+#[tokio::test]
+async fn ws_rejects_both_room_and_session() {
+    let (addr, _) = spawn_server_with_cat().await;
+    let url = format!("ws://{addr}/acp?room=a&session=b&peer_id=p1");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
+    let close = wait_for_close(&mut ws)
+        .await
+        .expect("expected close frame for ambiguous query");
+    assert_eq!(u16::from(close), CLOSE_CODE_BAD_QUERY);
+}
+
 #[tokio::test]
 async fn ws_two_subscribers_see_naive_fanout() {
     let (addr, _) = spawn_server_with_cat().await;
-    let url_a = format!("ws://{addr}/acp?session=share&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=share&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=share&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=share&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(&url_a).await.unwrap();
     // Give A's attach time to complete before B joins.
@@ -272,7 +308,7 @@ fn mock_agent_cmd() -> AgentCmd {
     }
 }
 
-async fn spawn_server_with_mock() -> (SocketAddr, Arc<SessionRegistry>) {
+async fn spawn_server_with_mock() -> (SocketAddr, Arc<RoomRegistry>) {
     spawn_server(Some(mock_agent_cmd())).await
 }
 
@@ -335,7 +371,7 @@ where
 #[tokio::test]
 async fn rfd533_attach_returns_roster_and_history_policy() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url = format!("ws://{addr}/acp?session=rfd533&peer_id=A&peer_name=Alice");
+    let url = format!("ws://{addr}/acp?room=rfd533&peer_id=A&peer_name=Alice");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let init = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
     assert!(
@@ -412,7 +448,7 @@ async fn rfd533_attach_returns_roster_and_history_policy() {
 #[tokio::test]
 async fn rfd533_attach_full_history_can_be_returned_newest_turn_first_without_replay_markers() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url = format!("ws://{addr}/acp?session=replayorder&peer_id=A&peer_name=Alice");
+    let url = format!("ws://{addr}/acp?room=replayorder&peer_id=A&peer_name=Alice");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
     let _ = ws_request(
@@ -501,8 +537,8 @@ async fn rfd533_attach_full_history_can_be_returned_newest_turn_first_without_re
 #[tokio::test]
 async fn rfd533_attach_streams_latest_segment_then_backfills_older_turns() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url_a = format!("ws://{addr}/acp?session=stream52&peer_id=A&peer_name=Alice");
-    let url_b = format!("ws://{addr}/acp?session=stream52&peer_id=B&peer_name=Bob&replay=skip");
+    let url_a = format!("ws://{addr}/acp?room=stream52&peer_id=A&peer_name=Alice");
+    let url_b = format!("ws://{addr}/acp?room=stream52&peer_id=B&peer_name=Bob&replay=skip");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -622,9 +658,8 @@ async fn rfd533_attach_streams_latest_segment_then_backfills_older_turns() {
 #[tokio::test]
 async fn rfd533_attach_stream_chronological_backfills_in_original_order() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url_a = format!("ws://{addr}/acp?session=stream52_chrono&peer_id=A&peer_name=Alice");
-    let url_b =
-        format!("ws://{addr}/acp?session=stream52_chrono&peer_id=B&peer_name=Bob&replay=skip");
+    let url_a = format!("ws://{addr}/acp?room=stream52_chrono&peer_id=A&peer_name=Alice");
+    let url_b = format!("ws://{addr}/acp?room=stream52_chrono&peer_id=B&peer_name=Bob&replay=skip");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -695,8 +730,8 @@ async fn rfd533_attach_stream_chronological_backfills_in_original_order() {
 #[tokio::test]
 async fn rfd533_streaming_attach_does_not_block_live_events_behind_backfill() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url_a = format!("ws://{addr}/acp?session=stream52&peer_id=A&peer_name=Alice");
-    let url_b = format!("ws://{addr}/acp?session=stream52&peer_id=B&peer_name=Bob&replay=skip");
+    let url_a = format!("ws://{addr}/acp?room=stream52&peer_id=A&peer_name=Alice");
+    let url_b = format!("ws://{addr}/acp?room=stream52&peer_id=B&peer_name=Bob&replay=skip");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -784,8 +819,8 @@ async fn rfd533_attach_pending_only_reissues_permission_and_keeps_resolution_in_
         ("MOCK_ACP_PROMPT_DELAY_MS", "2000"),
     ])
     .await;
-    let url_a = format!("ws://{addr}/acp?session=rfd533&peer_id=A&peer_name=Alice");
-    let url_b = format!("ws://{addr}/acp?session=rfd533&peer_id=B&peer_name=Bob");
+    let url_a = format!("ws://{addr}/acp?room=rfd533&peer_id=A&peer_name=Alice");
+    let url_b = format!("ws://{addr}/acp?room=rfd533&peer_id=B&peer_name=Bob");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -850,7 +885,7 @@ async fn rfd533_attach_pending_only_reissues_permission_and_keeps_resolution_in_
     .unwrap();
 
     let resolved = ws_next_method(&mut ws_a, "amux/agent_request_resolved").await;
-    assert_eq!(resolved["params"]["sessionId"], serde_json::json!("rfd533"));
+    assert_eq!(resolved["params"]["roomId"], serde_json::json!("rfd533"));
     assert_eq!(resolved["params"]["requestId"], permission_a["id"]);
     assert_eq!(resolved["params"]["resolvedBy"], serde_json::json!("B"));
     assert_eq!(
@@ -873,8 +908,8 @@ async fn rfd533_attach_pending_only_reissues_permission_and_keeps_resolution_in_
 #[tokio::test]
 async fn rfd533_attach_detach_keeps_lifecycle_in_amux_namespace() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url_a = format!("ws://{addr}/acp?session=rfd533&peer_id=A&peer_name=Alice");
-    let url_b = format!("ws://{addr}/acp?session=rfd533&peer_id=B&peer_name=Bob");
+    let url_a = format!("ws://{addr}/acp?room=rfd533&peer_id=A&peer_name=Alice");
+    let url_b = format!("ws://{addr}/acp?room=rfd533&peer_id=B&peer_name=Bob");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -948,7 +983,7 @@ async fn rfd533_attach_detach_keeps_lifecycle_in_amux_namespace() {
 #[tokio::test]
 async fn meta_propagate_default_off_leaves_outbound_request_meta_unchanged() {
     let (addr, _) = spawn_server_with_cat().await;
-    let url = format!("ws://{addr}/acp?session=meta-default&peer_id=A&peer_name=Alice&role=driver");
+    let url = format!("ws://{addr}/acp?room=meta-default&peer_id=A&peer_name=Alice&role=driver");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     ws.send(ClientMsg::Text(
@@ -981,7 +1016,7 @@ async fn meta_propagate_opt_in_adds_peer_trace_to_outbound_requests() {
         true,
     )
     .await;
-    let url = format!("ws://{addr}/acp?session=meta-on&peer_id=A&peer_name=Alice&role=driver");
+    let url = format!("ws://{addr}/acp?room=meta-on&peer_id=A&peer_name=Alice&role=driver");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     ws.send(ClientMsg::Text(
@@ -1026,7 +1061,7 @@ async fn meta_propagate_prompt_includes_amux_turn_id() {
         true,
     )
     .await;
-    let url = format!("ws://{addr}/acp?session=meta-prompt&peer_id=A&peer_name=Alice&role=driver");
+    let url = format!("ws://{addr}/acp?room=meta-prompt&peer_id=A&peer_name=Alice&role=driver");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     ws.send(ClientMsg::Text(
@@ -1047,8 +1082,8 @@ async fn meta_propagate_prompt_includes_amux_turn_id() {
 #[tokio::test]
 async fn initialize_caches_for_late_joiners() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url_a = format!("ws://{addr}/acp?session=cache&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=cache&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=cache&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=cache&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let resp_a = ws_request(
@@ -1086,8 +1121,8 @@ async fn initialize_caches_for_late_joiners() {
 #[tokio::test]
 async fn session_new_caches_for_late_joiners() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url_a = format!("ws://{addr}/acp?session=newcache&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=newcache&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=newcache&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=newcache&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -1127,8 +1162,8 @@ async fn session_new_caches_for_late_joiners() {
 #[tokio::test]
 async fn prompt_notifications_broadcast_response_routes_to_originator() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url_a = format!("ws://{addr}/acp?session=prompt&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=prompt&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=prompt&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=prompt&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -1239,7 +1274,7 @@ async fn prompt_notifications_broadcast_response_routes_to_originator() {
 #[tokio::test]
 async fn original_id_is_preserved_across_mux() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url = format!("ws://{addr}/acp?session=id&peer_id=A");
+    let url = format!("ws://{addr}/acp?room=id&peer_id=A");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     // Use a high non-overlapping id to ensure we're not just lucky that
@@ -1264,14 +1299,14 @@ async fn original_id_is_preserved_across_mux() {
 
 /// Helper for chunk 5/6 tests: spawn acp-mux with mock_acp wrapped to
 /// pass through env vars (permission emission, prompt delay).
-async fn spawn_server_with_mock_env(env: &[(&str, &str)]) -> (SocketAddr, Arc<SessionRegistry>) {
+async fn spawn_server_with_mock_env(env: &[(&str, &str)]) -> (SocketAddr, Arc<RoomRegistry>) {
     spawn_server(Some(mock_agent_cmd_with_env(env))).await
 }
 
 async fn spawn_server_with_mock_env_and_client_tool_policy(
     env: &[(&str, &str)],
     client_tool_policy: ClientToolPolicy,
-) -> (SocketAddr, Arc<SessionRegistry>) {
+) -> (SocketAddr, Arc<RoomRegistry>) {
     spawn_server_with_client_tool_policy(Some(mock_agent_cmd_with_env(env)), client_tool_policy)
         .await
 }
@@ -1323,8 +1358,8 @@ where
 #[tokio::test]
 async fn amux_peer_joined_and_peer_left() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url_a = format!("ws://{addr}/acp?session=presence&peer_id=A&peer_name=Alice");
-    let url_b = format!("ws://{addr}/acp?session=presence&peer_id=B&peer_name=Bob");
+    let url_a = format!("ws://{addr}/acp?room=presence&peer_id=A&peer_name=Alice");
+    let url_b = format!("ws://{addr}/acp?room=presence&peer_id=B&peer_name=Bob");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     // A is the initial sub — peer_joined for A is emitted to an empty
@@ -1352,7 +1387,7 @@ async fn amux_peer_joined_and_peer_left() {
         .expect("A should see amux/peer_joined for B");
     assert_eq!(pj["params"]["peerId"], serde_json::json!("B"));
     assert_eq!(pj["params"]["peerName"], serde_json::json!("Bob"));
-    assert_eq!(pj["params"]["sessionId"], serde_json::json!("presence"));
+    assert_eq!(pj["params"]["roomId"], serde_json::json!("presence"));
 
     // B receives the replay log on join. The log contains peer_joined
     // for A (so B learns about A) but NOT peer_joined for B (B's own
@@ -1395,12 +1430,12 @@ async fn amux_peer_joined_and_peer_left() {
 #[tokio::test]
 async fn debug_sessions_reflects_live_state() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url_a = format!("ws://{addr}/acp?session=debug&peer_id=A&peer_name=Alice");
+    let url_a = format!("ws://{addr}/acp?room=debug&peer_id=A&peer_name=Alice");
 
     // Empty registry before any attaches.
     let body = http_get(&format!("http://{addr}/debug/sessions")).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["sessionCount"], serde_json::json!(0));
+    assert_eq!(v["roomCount"], serde_json::json!(0));
 
     // Attach, initialize, drive.
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
@@ -1417,10 +1452,10 @@ async fn debug_sessions_reflects_live_state() {
 
     let body = http_get(&format!("http://{addr}/debug/sessions")).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["sessionCount"], serde_json::json!(1));
+    assert_eq!(v["roomCount"], serde_json::json!(1));
 
-    let s = &v["sessions"][0];
-    assert_eq!(s["sessionId"], serde_json::json!("debug"));
+    let s = &v["rooms"][0];
+    assert_eq!(s["roomId"], serde_json::json!("debug"));
     assert_eq!(s["subscribers"].as_array().unwrap().len(), 1);
     assert_eq!(s["subscribers"][0]["peerId"], serde_json::json!("A"));
     assert_eq!(s["subscribers"][0]["peerName"], serde_json::json!("Alice"));
@@ -1438,8 +1473,8 @@ async fn debug_sessions_reflects_live_state() {
 async fn ttl_grace_cancelled_by_reconnect() {
     let (addr, registry) =
         spawn_server_with_ttl(Some(mock_agent_cmd()), Duration::from_millis(500)).await;
-    let url_a = format!("ws://{addr}/acp?session=grace&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=grace&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=grace&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=grace&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -1483,7 +1518,7 @@ async fn ttl_grace_cancelled_by_reconnect() {
 async fn ttl_grace_expires_when_idle() {
     let (addr, registry) =
         spawn_server_with_ttl(Some(mock_agent_cmd()), Duration::from_millis(150)).await;
-    let url_a = format!("ws://{addr}/acp?session=idle&peer_id=A");
+    let url_a = format!("ws://{addr}/acp?room=idle&peer_id=A");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -1521,7 +1556,7 @@ async fn agent_death_closes_subscribers_with_1011() {
         args: vec!["0.4".into()],
     };
     let (addr, _) = spawn_server_with_ttl(Some(agent_cmd), Duration::from_secs(30)).await;
-    let url = format!("ws://{addr}/acp?session=die&peer_id=A");
+    let url = format!("ws://{addr}/acp?room=die&peer_id=A");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     let close = wait_for_close(&mut ws).await.expect("expected close frame");
@@ -1539,8 +1574,8 @@ async fn agent_death_closes_subscribers_with_1011() {
 #[tokio::test]
 async fn replay_log_delivers_history_to_late_joiner() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url_a = format!("ws://{addr}/acp?session=replay&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=replay&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=replay&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=replay&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -1652,8 +1687,8 @@ async fn replay_log_delivers_history_to_late_joiner() {
 #[tokio::test]
 async fn replay_skip_suppresses_legacy_history_but_keeps_context_and_live_frames() {
     let (addr, _) = spawn_server_with_cat().await;
-    let url_a = format!("ws://{addr}/acp?session=replay-skip&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=replay-skip&peer_id=B&replay=skip");
+    let url_a = format!("ws://{addr}/acp?room=replay-skip&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=replay-skip&peer_id=B&replay=skip");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = drain_for(&mut ws_a, Duration::from_millis(100)).await;
@@ -1704,8 +1739,8 @@ async fn replay_skip_suppresses_legacy_history_but_keeps_context_and_live_frames
 #[tokio::test]
 async fn replay_log_adds_mux_record_metadata_to_late_join_frames() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url_a = format!("ws://{addr}/acp?session=replay-meta&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=replay-meta&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=replay-meta&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=replay-meta&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -1799,8 +1834,8 @@ async fn replay_log_adds_mux_record_metadata_to_late_join_frames() {
 #[tokio::test]
 async fn replay_log_merges_amux_metadata_without_clobbering_existing_meta() {
     let (addr, _) = spawn_server_with_cat().await;
-    let url_a = format!("ws://{addr}/acp?session=replay-meta-merge&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=replay-meta-merge&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=replay-meta-merge&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=replay-meta-merge&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let payload = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-meta","update":{"kind":"tool_call","toolCallId":"tool-1"},"_meta":{"traceparent":"00-abc","zed.dev/debugMode":true}}}"#;
@@ -1853,7 +1888,7 @@ async fn replay_log_merges_amux_metadata_without_clobbering_existing_meta() {
 #[tokio::test]
 async fn replay_turns_disabled_emits_no_history() {
     let agent_cmd = mock_agent_cmd();
-    let registry = SessionRegistry::new(
+    let registry = RoomRegistry::new(
         Some(agent_cmd),
         ReplayTurns::Disabled,
         Duration::from_secs(60),
@@ -1866,8 +1901,8 @@ async fn replay_turns_disabled_emits_no_history() {
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let url_a = format!("ws://{addr}/acp?session=nolog&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=nolog&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=nolog&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=nolog&peer_id=B");
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
         &mut ws_a,
@@ -1903,8 +1938,8 @@ async fn replay_turns_disabled_emits_no_history() {
 #[tokio::test]
 async fn amux_turn_started_and_complete() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url_a = format!("ws://{addr}/acp?session=turn&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=turn&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=turn&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=turn&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -1939,7 +1974,7 @@ async fn amux_turn_started_and_complete() {
             .find(|v| v.get("method") == Some(&serde_json::json!("amux/turn_started")))
             .unwrap_or_else(|| panic!("{label} should see amux/turn_started, frames: {frames:?}"));
         assert_eq!(started["params"]["peerId"], serde_json::json!("A"));
-        assert_eq!(started["params"]["sessionId"], serde_json::json!("turn"));
+        assert_eq!(started["params"]["roomId"], serde_json::json!("turn"));
         assert_eq!(started["params"]["amuxTurnId"], serde_json::json!("at-1"));
         assert_eq!(
             started["params"]["content"],
@@ -1965,8 +2000,8 @@ async fn amux_turn_started_and_complete() {
 #[tokio::test]
 async fn amux_session_busy_on_concurrent_prompt() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "500")]).await;
-    let url_a = format!("ws://{addr}/acp?session=busy&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=busy&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=busy&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=busy&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -2024,8 +2059,8 @@ async fn busy_session_prompt_queue_text_is_rejected() {
 
 async fn assert_busy_session_prompt_rejected(control_prompt: &str) {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "300")]).await;
-    let url_a = format!("ws://{addr}/acp?session=busy-control&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=busy-control&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=busy-control&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=busy-control&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -2089,8 +2124,8 @@ async fn amux_steer_active_turn_hard_replaces_after_cancel() {
         ("MOCK_ACP_ECHO_SESSION_CANCELS", "1"),
     ])
     .await;
-    let url_a = format!("ws://{addr}/acp?session=hard-steer&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=hard-steer&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=hard-steer&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=hard-steer&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -2207,8 +2242,8 @@ async fn amux_steer_active_turn_hard_replaces_after_cancel() {
 #[tokio::test]
 async fn amux_steer_active_turn_without_active_turn_submits_prompt() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "10")]).await;
-    let url_a = format!("ws://{addr}/acp?session=idle-steer&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=idle-steer&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=idle-steer&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=idle-steer&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -2326,8 +2361,8 @@ async fn amux_steer_active_turn_without_active_turn_submits_prompt() {
 #[tokio::test]
 async fn amux_steer_active_turn_rejects_second_pending_hard_steer_until_replacement_pops() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "350")]).await;
-    let url_a = format!("ws://{addr}/acp?session=busy-fixes&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=busy-fixes&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=busy-fixes&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=busy-fixes&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -2407,9 +2442,9 @@ async fn amux_steer_active_turn_rejects_second_pending_hard_steer_until_replacem
 #[tokio::test]
 async fn amux_queue_prompt_is_mux_owned_and_replays_lifecycle() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "120")]).await;
-    let url_a = format!("ws://{addr}/acp?session=mux-owned-queue&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=mux-owned-queue&peer_id=B");
-    let url_c = format!("ws://{addr}/acp?session=mux-owned-queue&peer_id=C");
+    let url_a = format!("ws://{addr}/acp?room=mux-owned-queue&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=mux-owned-queue&peer_id=B");
+    let url_c = format!("ws://{addr}/acp?room=mux-owned-queue&peer_id=C");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -2542,8 +2577,8 @@ async fn amux_queue_prompt_is_mux_owned_and_replays_lifecycle() {
 #[tokio::test]
 async fn amux_queue_prompt_without_active_turn_submits_immediately() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "10")]).await;
-    let url_a = format!("ws://{addr}/acp?session=queue_idle&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=queue_idle&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=queue_idle&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=queue_idle&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -2633,8 +2668,8 @@ async fn amux_queue_prompt_without_active_turn_submits_immediately() {
 #[tokio::test]
 async fn amux_queue_prompt_rejects_seventh_pending_item() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "2000")]).await;
-    let url_a = format!("ws://{addr}/acp?session=busy-fixes&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=busy-fixes&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=busy-fixes&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=busy-fixes&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -2689,9 +2724,9 @@ async fn amux_queue_prompt_rejects_seventh_pending_item() {
 #[tokio::test]
 async fn amux_unqueue_prompt_removes_pending_item_and_replays_removal() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "600")]).await;
-    let url_a = format!("ws://{addr}/acp?session=busy-fixes&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=busy-fixes&peer_id=B");
-    let url_c = format!("ws://{addr}/acp?session=busy-fixes&peer_id=C");
+    let url_a = format!("ws://{addr}/acp?room=busy-fixes&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=busy-fixes&peer_id=B");
+    let url_c = format!("ws://{addr}/acp?room=busy-fixes&peer_id=C");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -2783,8 +2818,8 @@ async fn amux_unqueue_prompt_removes_pending_item_and_replays_removal() {
 #[tokio::test]
 async fn amux_disconnected_queue_owner_persists_without_becoming_driver() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "500")]).await;
-    let url_a = format!("ws://{addr}/acp?session=busy-fixes&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=busy-fixes&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=busy-fixes&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=busy-fixes&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -2845,7 +2880,7 @@ async fn amux_disconnected_queue_owner_persists_without_becoming_driver() {
 
     let body = http_get(&format!("http://{addr}/debug/sessions")).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let session = &v["sessions"][0];
+    let session = &v["rooms"][0];
     assert_ne!(
         session["drivingSubscriber"],
         serde_json::json!("B"),
@@ -2866,8 +2901,8 @@ async fn amux_disconnected_queue_owner_persists_without_becoming_driver() {
 #[tokio::test]
 async fn busy_multimodal_control_prompt_still_rejected() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "300")]).await;
-    let url_a = format!("ws://{addr}/acp?session=busy-control&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=busy-control&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=busy-control&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=busy-control&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -2929,8 +2964,8 @@ async fn busy_multimodal_control_prompt_still_rejected() {
 #[tokio::test]
 async fn agent_request_broadcasts_to_every_subscriber() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_EMIT_PERMISSION", "1")]).await;
-    let url_a = format!("ws://{addr}/acp?session=drive&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=drive&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=drive&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=drive&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -3024,7 +3059,7 @@ async fn unsafe_debug_client_tool_broadcast_preserves_raw_fanout() {
 #[tokio::test]
 async fn initialize_strips_blocked_client_tool_capabilities_by_default() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_ECHO_INITIALIZE_PARAMS", "1")]).await;
-    let url = format!("ws://{addr}/acp?session=clienttool&peer_id=A");
+    let url = format!("ws://{addr}/acp?room=clienttool&peer_id=A");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     let resp = ws_request(
@@ -3113,8 +3148,8 @@ async fn drive_agent_client_tool_prompt_with_policy(
 async fn drive_prompt_and_collect(
     addr: SocketAddr,
 ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
-    let url_a = format!("ws://{addr}/acp?session=clienttool&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=clienttool&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=clienttool&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=clienttool&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -3176,8 +3211,8 @@ async fn agent_request_first_reply_wins() {
         ("MOCK_ACP_PROMPT_DELAY_MS", "400"),
     ])
     .await;
-    let url_a = format!("ws://{addr}/acp?session=first-wins&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=first-wins&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=first-wins&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=first-wins&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -3358,8 +3393,8 @@ async fn agent_request_first_reply_wins() {
 #[tokio::test]
 async fn agent_request_resolved_on_turn_end_when_no_reply() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_EMIT_PERMISSION", "1")]).await;
-    let url_a = format!("ws://{addr}/acp?session=turn-end&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=turn-end&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=turn-end&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=turn-end&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -3495,8 +3530,8 @@ async fn agent_request_opened_replayed_to_late_joiner_without_actionable_request
         ("MOCK_ACP_PROMPT_DELAY_MS", "200"),
     ])
     .await;
-    let url_a = format!("ws://{addr}/acp?session=agent-request-opened-replay&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=agent-request-opened-replay&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=agent-request-opened-replay&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=agent-request-opened-replay&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -3603,8 +3638,8 @@ async fn agent_request_opened_replayed_to_late_joiner_without_actionable_request
 #[tokio::test]
 async fn agent_request_falls_through_when_driver_left() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_EMIT_PERMISSION", "1")]).await;
-    let url_a = format!("ws://{addr}/acp?session=fallback&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=fallback&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=fallback&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=fallback&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -3670,8 +3705,8 @@ async fn agent_request_falls_through_when_driver_left() {
 #[tokio::test]
 async fn concurrent_prompt_rejected_with_32001() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "600")]).await;
-    let url_a = format!("ws://{addr}/acp?session=busy&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=busy&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=busy&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=busy&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -3813,7 +3848,7 @@ async fn collect_frames(
 #[tokio::test]
 async fn ws_peer_id_collision_closes_4409() {
     let (addr, _) = spawn_server_with_cat().await;
-    let url = format!("ws://{addr}/acp?session=dup&peer_id=p1");
+    let url = format!("ws://{addr}/acp?room=dup&peer_id=p1");
     let (mut ws_a, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("connect A");
@@ -3906,7 +3941,7 @@ async fn subscriber_cancels_own_prompt_translated_to_agent() {
         ("MOCK_ACP_PROMPT_DELAY_MS", "1500"),
     ])
     .await;
-    let url = format!("ws://{addr}/acp?session=cancel&peer_id=A");
+    let url = format!("ws://{addr}/acp?room=cancel&peer_id=A");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
@@ -3960,7 +3995,7 @@ async fn subscriber_cancels_own_prompt_translated_to_agent() {
 #[tokio::test]
 async fn subscriber_cancel_unknown_id_dropped() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_ECHO_CANCELS", "1")]).await;
-    let url = format!("ws://{addr}/acp?session=cu&peer_id=A");
+    let url = format!("ws://{addr}/acp?room=cu&peer_id=A");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
@@ -3994,8 +4029,8 @@ async fn subscriber_cannot_cancel_another_subscribers_request() {
         ("MOCK_ACP_PROMPT_DELAY_MS", "800"),
     ])
     .await;
-    let url_a = format!("ws://{addr}/acp?session=xpeer&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=xpeer&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=xpeer&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=xpeer&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -4069,8 +4104,8 @@ async fn agent_cancels_permission_request_fans_out() {
         ("MOCK_ACP_PROMPT_DELAY_MS", "500"),
     ])
     .await;
-    let url_a = format!("ws://{addr}/acp?session=agcancel&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=agcancel&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=agcancel&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=agcancel&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -4178,8 +4213,8 @@ async fn amux_cancel_active_turn_by_non_driver() {
         ("MOCK_ACP_PROMPT_DELAY_MS", "1500"),
     ])
     .await;
-    let url_a = format!("ws://{addr}/acp?session=cact&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=cact&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=cact&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=cact&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -4267,7 +4302,7 @@ async fn amux_cancel_active_turn_with_no_active_turn_dropped() {
         ("MOCK_ACP_ECHO_SESSION_CANCELS", "1"),
     ])
     .await;
-    let url = format!("ws://{addr}/acp?session=nt&peer_id=A");
+    let url = format!("ws://{addr}/acp?room=nt&peer_id=A");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
 
@@ -4308,7 +4343,7 @@ async fn amux_cancel_active_turn_with_no_active_turn_dropped() {
 #[tokio::test]
 async fn session_list_capability_propagates_from_agent() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_SESSION_LIST", "1")]).await;
-    let url = format!("ws://{addr}/acp?session=cap&peer_id=A");
+    let url = format!("ws://{addr}/acp?room=cap&peer_id=A");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let resp = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
     assert_eq!(
@@ -4324,7 +4359,7 @@ async fn session_list_capability_propagates_from_agent() {
 #[tokio::test]
 async fn session_list_capability_absent_when_agent_doesnt_advertise() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url = format!("ws://{addr}/acp?session=nocap&peer_id=A");
+    let url = format!("ws://{addr}/acp?room=nocap&peer_id=A");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let resp = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
     assert!(
@@ -4343,7 +4378,7 @@ async fn session_list_capability_absent_when_agent_doesnt_advertise() {
 #[tokio::test]
 async fn session_list_request_forwards_through_amux() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_SESSION_LIST", "1")]).await;
-    let url = format!("ws://{addr}/acp?session=list&peer_id=A");
+    let url = format!("ws://{addr}/acp?room=list&peer_id=A");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
 
@@ -4380,8 +4415,8 @@ async fn session_list_decorates_live_entry_with_amux_metadata() {
         ("MOCK_ACP_SESSION_LIST_META", "1"),
     ])
     .await;
-    let url_a = format!("ws://{addr}/acp?session=live-room&peer_id=A&peer_name=Alice&role=driver");
-    let url_b = format!("ws://{addr}/acp?session=live-room&peer_id=B&peer_name=Bob&role=observer");
+    let url_a = format!("ws://{addr}/acp?room=live-room&peer_id=A&peer_name=Alice&role=driver");
+    let url_b = format!("ws://{addr}/acp?room=live-room&peer_id=B&peer_name=Bob&role=observer");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -4417,7 +4452,7 @@ async fn session_list_decorates_live_entry_with_amux_metadata() {
         serde_json::json!("preserved")
     );
     assert_eq!(
-        current["_meta"]["amux"]["proxySessionId"],
+        current["_meta"]["amux"]["roomId"],
         serde_json::json!("live-room")
     );
     assert_eq!(
@@ -4450,7 +4485,7 @@ async fn session_list_decorates_live_entry_with_amux_metadata() {
 #[tokio::test]
 async fn session_list_with_cwd_filter_forwarded_unmodified() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_SESSION_LIST", "1")]).await;
-    let url = format!("ws://{addr}/acp?session=lfilter&peer_id=A");
+    let url = format!("ws://{addr}/acp?room=lfilter&peer_id=A");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
 
@@ -4543,8 +4578,8 @@ async fn control_plane_sessions_without_agent_cmd_returns_503() {
 #[tokio::test]
 async fn session_load_rebinds_canonical_session_for_late_joiners() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url_a = format!("ws://{addr}/acp?session=load&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=load&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=load&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=load&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -4600,8 +4635,8 @@ async fn session_load_rebinds_canonical_session_for_late_joiners() {
 #[tokio::test]
 async fn session_load_replay_generation_excludes_previous_session_updates_for_late_joiners() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_EMIT_LOAD_HISTORY", "1")]).await;
-    let url_a = format!("ws://{addr}/acp?session=load-replay&peer_id=A&peer_name=Alice");
-    let url_b = format!("ws://{addr}/acp?session=load-replay&peer_id=B&peer_name=Bob");
+    let url_a = format!("ws://{addr}/acp?room=load-replay&peer_id=A&peer_name=Alice");
+    let url_b = format!("ws://{addr}/acp?room=load-replay&peer_id=B&peer_name=Bob");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -4678,7 +4713,7 @@ async fn session_load_replay_generation_excludes_previous_session_updates_for_la
 #[tokio::test]
 async fn session_load_debug_sessions_exposes_replay_generation_and_acp_update_counts() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_EMIT_LOAD_HISTORY", "1")]).await;
-    let url = format!("ws://{addr}/acp?session=load-debug&peer_id=A");
+    let url = format!("ws://{addr}/acp?room=load-debug&peer_id=A");
 
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
@@ -4700,7 +4735,7 @@ async fn session_load_debug_sessions_exposes_replay_generation_and_acp_update_co
 
     let body = http_get(&format!("http://{addr}/debug/sessions")).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let s = &v["sessions"][0];
+    let s = &v["rooms"][0];
     assert_eq!(s["cachedSessionId"], serde_json::json!("loaded-debug"));
     assert_eq!(s["replayGeneration"], serde_json::json!(1));
     assert_eq!(
@@ -4741,8 +4776,8 @@ async fn session_load_debug_sessions_exposes_replay_generation_and_acp_update_co
 #[tokio::test]
 async fn session_load_without_prior_new_populates_cache() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url_a = format!("ws://{addr}/acp?session=loadfirst&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=loadfirst&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=loadfirst&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=loadfirst&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -4783,8 +4818,8 @@ async fn session_load_without_prior_new_populates_cache() {
 #[tokio::test]
 async fn failed_session_load_leaves_cache_untouched() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_FAIL_LOAD", "1")]).await;
-    let url_a = format!("ws://{addr}/acp?session=loadfail&peer_id=A");
-    let url_b = format!("ws://{addr}/acp?session=loadfail&peer_id=B");
+    let url_a = format!("ws://{addr}/acp?room=loadfail&peer_id=A");
+    let url_b = format!("ws://{addr}/acp?room=loadfail&peer_id=B");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(
@@ -4833,7 +4868,7 @@ async fn failed_session_load_leaves_cache_untouched() {
 #[tokio::test]
 async fn debug_sessions_shows_loaded_session_id() {
     let (addr, _) = spawn_server_with_mock().await;
-    let url = format!("ws://{addr}/acp?session=debugload&peer_id=A");
+    let url = format!("ws://{addr}/acp?room=debugload&peer_id=A");
 
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
@@ -4850,7 +4885,7 @@ async fn debug_sessions_shows_loaded_session_id() {
 
     let body = http_get(&format!("http://{addr}/debug/sessions")).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let s = &v["sessions"][0];
+    let s = &v["rooms"][0];
     assert_eq!(
         s["cachedSessionId"],
         serde_json::json!("loaded-debug"),

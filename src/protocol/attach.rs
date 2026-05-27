@@ -10,6 +10,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::protocol::amux::{EndReason, HermesProvenance, SegmentId};
+
 pub const METHOD_ATTACH: &str = "session/attach";
 pub const METHOD_DETACH: &str = "session/detach";
 
@@ -19,8 +21,14 @@ pub const ATTACH_ERR_UNSUPPORTED: i64 = -32003;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryPolicy {
+    /// Frames recorded in the current segment only. Preserves the
+    /// v0.1.x default — late joiners that haven't opted into lineage
+    /// see exactly today's behaviour.
     #[default]
     Full,
+    /// All segments' frames concatenated in `replaySeq` order.
+    /// Surfaces pre-compaction history that `Full` would hide.
+    FullLineage,
     PendingOnly,
     None,
     /// Depends on stable ACP message IDs; amux currently accepts it and
@@ -132,6 +140,31 @@ pub struct AttachSnapshot {
     pub pending_permissions: Vec<AttachPendingPermission>,
     pub replay_boundary_seq: u64,
     pub replay_generation: u64,
+    /// Lineage summary. Always populated so even `historyPolicy: full`
+    /// (current-segment-only) clients can tell that earlier segments
+    /// exist and request a richer history if desired.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<SegmentSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_segment_id: Option<SegmentId>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentSummary {
+    pub id: SegmentId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_session_id: Option<String>,
+    pub opened_at: String,
+    pub opened_replay_seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_replay_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<EndReason>,
+    #[serde(skip_serializing_if = "HermesProvenance::is_empty")]
+    pub provenance: HermesProvenance,
 }
 
 #[derive(Debug, Clone, Serialize)]

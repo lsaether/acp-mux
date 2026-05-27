@@ -2,7 +2,7 @@
 //! actor task that serializes all mutations.
 //!
 //! All state mutation flows through a single tokio task driven by an mpsc
-//! `SessionMsg` queue. Subscribers push inbound frames via
+//! `RoomMsg` queue. Subscribers push inbound frames via
 //! `InboundFromSubscriber` and detach via `Detach`. The agent's stdout pump
 //! task forwards each NDJSON line as `AgentStdoutLine` and signals exit
 //! via `AgentDied`.
@@ -81,16 +81,16 @@ use tokio::task::JoinHandle;
 use crate::agent::process::AgentProcess;
 use crate::cli::{ClientToolMode, ClientToolPolicy, ReplayTurns};
 use crate::multiplex::subscriber::{OutMsg, Subscriber};
-use crate::protocol::amux::{self, AmuxTurnId};
-use crate::protocol::attach;
+use crate::protocol::amux::{self, AmuxTurnId, EndReason, HermesProvenance, SegmentId};
+use crate::protocol::attach::{self, SegmentSummary};
 use crate::protocol::jsonrpc::{
     Id, Incoming, IncomingRequest, IncomingResponse, JsonRpcError, JsonRpcVersion,
 };
-pub use crate::session::attach::AttachStreamBackfill;
+pub use crate::room::attach::AttachStreamBackfill;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionListAmuxMetadata {
-    pub proxy_session_id: String,
+    pub room_id: String,
     pub subscriber_count: usize,
     pub driving_subscriber: Option<String>,
 }
@@ -120,14 +120,14 @@ impl SessionListMetadataIndex {
             .insert(acp_session_id.to_string(), metadata);
     }
 
-    fn remove_if_proxy(&self, acp_session_id: &str, proxy_session_id: &str) {
+    fn remove_if_room(&self, acp_session_id: &str, room_id: &str) {
         let mut index = self
             .by_acp_session_id
             .write()
             .expect("session list metadata index poisoned");
         if index
             .get(acp_session_id)
-            .is_some_and(|meta| meta.proxy_session_id == proxy_session_id)
+            .is_some_and(|meta| meta.room_id == room_id)
         {
             index.remove(acp_session_id);
         }
@@ -182,19 +182,170 @@ pub(super) struct ReplayEntry {
     pub(super) frame: Bytes,
     recorded_at: String,
     pub(super) seq: u64,
+    /// Segment id at the time the frame was recorded. Frames recorded
+    /// before any segment opens (e.g. `initialize` handshake replies)
+    /// carry `SegmentId(0)` as a sentinel — those frames sit in no
+    /// segment and are not counted against any segment's range.
+    pub(super) segment_id: SegmentId,
 }
 
 impl ReplayEntry {
-    fn new(seq: u64, frame: Bytes) -> Self {
+    fn new(seq: u64, frame: Bytes, segment_id: SegmentId) -> Self {
         Self {
             frame,
             recorded_at: utc_rfc3339_now(),
             seq,
+            segment_id,
         }
     }
 
     pub(super) fn frame_for_replay(&self) -> Bytes {
         inject_replay_metadata(&self.frame, &self.recorded_at, self.seq)
+    }
+}
+
+/// Sentinel segment id used for frames recorded before any canonical ACP
+/// session id has been captured (i.e. before the first segment opens).
+pub(super) const PRE_SEGMENT_ID: SegmentId = SegmentId(0);
+
+/// Parse a `_meta.hermes` value into a `HermesProvenance`. Tolerates the
+/// metadata being absent, partially populated, or wrongly typed: every
+/// missing field is left as `None`. Recognises the shape from
+/// `docs/design/rooms.md` (`sessionProvenance` + `compaction`).
+fn parse_hermes_provenance(meta_hermes: &Value) -> HermesProvenance {
+    let Value::Object(root) = meta_hermes else {
+        return HermesProvenance::default();
+    };
+    let mut prov = HermesProvenance::default();
+    if let Some(Value::Object(sp)) = root.get("sessionProvenance") {
+        prov.acp_session_id = sp
+            .get("acpSessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        prov.hermes_session_id = sp
+            .get("hermesSessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        prov.parent_hermes_session_id = sp
+            .get("parentHermesSessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        prov.root_hermes_session_id = sp
+            .get("rootHermesSessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        prov.session_kind = sp
+            .get("sessionKind")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        prov.creator_kind = sp
+            .get("creatorKind")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        prov.edge_kind = sp
+            .get("edgeKind")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        prov.compression_depth = sp
+            .get("compressionDepth")
+            .and_then(Value::as_u64)
+            .map(|n| n as u32);
+        prov.lineage_hermes_session_ids = sp
+            .get("lineageHermesSessionIds")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            });
+    }
+    if let Some(Value::Object(c)) = root.get("compaction") {
+        prov.last_mode = c
+            .get("lastMode")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        prov.last_reason = c
+            .get("lastReason")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    prov
+}
+
+/// Merge `observed` fields into `existing`, only overwriting `None`
+/// fields. Used to enrich an already-open segment's provenance when the
+/// agent ships partial `_meta.hermes` after the segment opened. Never
+/// downgrades a Some(..) field to None.
+fn merge_provenance(existing: &mut HermesProvenance, observed: &HermesProvenance) {
+    macro_rules! fill {
+        ($field:ident) => {
+            if existing.$field.is_none() {
+                existing.$field = observed.$field.clone();
+            }
+        };
+    }
+    fill!(acp_session_id);
+    fill!(hermes_session_id);
+    fill!(parent_hermes_session_id);
+    fill!(root_hermes_session_id);
+    fill!(session_kind);
+    fill!(creator_kind);
+    fill!(edge_kind);
+    fill!(compression_depth);
+    fill!(lineage_hermes_session_ids);
+    fill!(last_mode);
+    fill!(last_reason);
+}
+
+/// In-memory record of one segment's lifecycle. A segment spans the
+/// interval during which one canonical ACP `sessionId` is in force. See
+/// `amux::SegmentId` for the wire shape.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Segment {
+    pub id: SegmentId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_session_id: Option<String>,
+    pub opened_at: String,
+    pub opened_replay_seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_replay_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<EndReason>,
+    #[serde(skip_serializing_if = "HermesProvenance::is_empty")]
+    pub provenance: HermesProvenance,
+}
+
+/// Convert a `Segment` (the in-memory record) into a wire-shape
+/// `SegmentSummary` used by `result._meta.amux.snapshot.segments`.
+pub(super) fn segment_summary(seg: &Segment) -> SegmentSummary {
+    SegmentSummary {
+        id: seg.id,
+        acp_session_id: seg.acp_session_id.clone(),
+        opened_at: seg.opened_at.clone(),
+        opened_replay_seq: seg.opened_replay_seq,
+        closed_at: seg.closed_at.clone(),
+        closed_replay_seq: seg.closed_replay_seq,
+        end_reason: seg.end_reason,
+        provenance: seg.provenance.clone(),
+    }
+}
+
+impl Segment {
+    fn open(id: SegmentId, acp_session_id: Option<String>, opened_replay_seq: u64) -> Self {
+        Self {
+            id,
+            acp_session_id,
+            opened_at: utc_rfc3339_now(),
+            opened_replay_seq,
+            closed_at: None,
+            closed_replay_seq: None,
+            end_reason: None,
+            provenance: HermesProvenance::default(),
+        }
     }
 }
 
@@ -282,8 +433,8 @@ fn inject_session_list_amux_metadata(session: &mut Value, metadata: &SessionList
     };
 
     amux.insert(
-        "proxySessionId".to_string(),
-        Value::String(metadata.proxy_session_id.clone()),
+        "roomId".to_string(),
+        Value::String(metadata.room_id.clone()),
     );
     amux.insert(
         "subscriberCount".to_string(),
@@ -460,7 +611,7 @@ fn replay_log_update_counts_by_acp_session_id(
     counts
 }
 
-pub enum SessionMsg {
+pub enum RoomMsg {
     Attach {
         subscriber: Subscriber,
         ack: oneshot::Sender<Result<(), AttachError>>,
@@ -477,7 +628,7 @@ pub enum SessionMsg {
     AttachStreamBackfill(AttachStreamBackfill),
     /// Build a JSON snapshot of session state for `/debug/sessions`.
     Snapshot {
-        ack: oneshot::Sender<SessionSnapshot>,
+        ack: oneshot::Sender<RoomSnapshot>,
     },
 }
 
@@ -492,8 +643,8 @@ pub struct ReplayResetSnapshot {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionSnapshot {
-    pub session_id: String,
+pub struct RoomSnapshot {
+    pub room_id: String,
     pub agent_cwd: String,
     pub subscribers: Vec<SubscriberSnapshot>,
     pub pending_request_count: usize,
@@ -510,6 +661,10 @@ pub struct SessionSnapshot {
     pub last_replay_reset: Option<ReplayResetSnapshot>,
     pub next_mux_id: u64,
     pub next_amux_turn_id: u64,
+    /// Segments observed in this room, oldest→newest. Empty before the
+    /// first canonical ACP session id arrives.
+    pub segments: Vec<Segment>,
+    pub active_segment_id: Option<SegmentId>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -527,11 +682,11 @@ pub enum AttachError {
 }
 
 #[derive(Clone)]
-pub struct SessionHandle {
-    pub tx: mpsc::Sender<SessionMsg>,
+pub struct RoomHandle {
+    pub tx: mpsc::Sender<RoomMsg>,
 }
 
-impl SessionHandle {
+impl RoomHandle {
     pub fn is_alive(&self) -> bool {
         !self.tx.is_closed()
     }
@@ -658,8 +813,8 @@ fn build_hard_steer_prompt(
 }
 
 #[derive(Debug)]
-pub(super) struct SessionInner {
-    pub(super) session_id: String,
+pub(super) struct RoomInner {
+    pub(super) room_id: String,
     agent_cwd: String,
     session_list_index: Arc<SessionListMetadataIndex>,
     canonical_session_id: Option<String>,
@@ -706,7 +861,7 @@ pub(super) struct SessionInner {
     last_replay_reset: Option<ReplayResetSnapshot>,
     /// Sender back into this actor. Used to pace attach-stream backfill
     /// pages through the same serialized queue as live traffic.
-    pub(super) self_tx: mpsc::Sender<SessionMsg>,
+    pub(super) self_tx: mpsc::Sender<RoomMsg>,
     /// Opt-in propagation of mux-owned trace metadata into outbound
     /// subscriber → agent requests under `params._meta.amux`.
     meta_propagate: bool,
@@ -724,17 +879,31 @@ pub(super) struct SessionInner {
     /// re-issued to clients that attach after the first broadcast so the
     /// permission remains actionable, not just visible in history.
     pub(super) pending_permission_frames: Vec<(Id, Bytes)>,
+    /// Segments observed in this room, in open-order. The last entry is
+    /// the active segment when `active_segment_id` is `Some(..)`. Empty
+    /// before the first canonical ACP session id arrives.
+    pub(super) segments: Vec<Segment>,
+    /// Currently-open segment, or `None` if no canonical session id has
+    /// been captured yet.
+    pub(super) active_segment_id: Option<SegmentId>,
+    /// Monotonic id allocator for segments. First segment is `SegmentId(1)`.
+    next_segment_id: u64,
+    /// Whether to broadcast `amux/segment_started` / `amux/segment_ended`
+    /// frames on rotation. Default true; gated by `--emit-segment-frames`.
+    emit_segment_frames: bool,
 }
 
-impl SessionInner {
+impl RoomInner {
+    #[allow(clippy::too_many_arguments)]
     fn new(
-        session_id: String,
+        room_id: String,
         agent_cwd: String,
         replay_policy: ReplayTurns,
         meta_propagate: bool,
         client_tool_policy: ClientToolPolicy,
         session_list_index: Arc<SessionListMetadataIndex>,
-        self_tx: mpsc::Sender<SessionMsg>,
+        self_tx: mpsc::Sender<RoomMsg>,
+        emit_segment_frames: bool,
     ) -> Self {
         let replay_log = match replay_policy {
             ReplayTurns::Disabled => None,
@@ -748,7 +917,7 @@ impl SessionInner {
             }
         };
         Self {
-            session_id,
+            room_id,
             agent_cwd,
             session_list_index,
             canonical_session_id: None,
@@ -774,10 +943,22 @@ impl SessionInner {
             client_tool_policy,
             agent_pending: HashMap::new(),
             pending_permission_frames: Vec::new(),
+            segments: Vec::new(),
+            active_segment_id: None,
+            next_segment_id: 1,
+            emit_segment_frames,
         }
     }
 
     fn set_canonical_session_id(&mut self, acp_session_id: &str) {
+        self.set_canonical_session_id_with_reason(acp_session_id, EndReason::AcpSessionIdChanged);
+    }
+
+    /// Sets the canonical ACP session id and, if the id observably
+    /// changed, rotates the segment. `reason` is consumed only when an
+    /// active segment is being closed — the first call that opens the
+    /// initial segment ignores it.
+    fn set_canonical_session_id_with_reason(&mut self, acp_session_id: &str, reason: EndReason) {
         if self.canonical_session_id.as_deref() == Some(acp_session_id) {
             self.publish_session_list_metadata();
             return;
@@ -787,9 +968,131 @@ impl SessionInner {
             .replace(acp_session_id.to_string())
         {
             self.session_list_index
-                .remove_if_proxy(&previous, &self.session_id);
+                .remove_if_room(&previous, &self.room_id);
         }
+        self.rotate_segment(
+            Some(acp_session_id.to_string()),
+            reason,
+            HermesProvenance::default(),
+        );
         self.publish_session_list_metadata();
+    }
+
+    /// Open or rotate the active segment. When no segment is open this
+    /// just opens the initial one (no `amux/segment_ended` emitted). When
+    /// a segment is already open this closes it (recording `reason`),
+    /// broadcasts `amux/segment_ended`, then opens a fresh segment and
+    /// broadcasts `amux/segment_started`. Both lifecycle frames pass
+    /// through the regular `broadcast()` path so they're appended to the
+    /// transcript and tagged with the segment that owns them.
+    fn rotate_segment(
+        &mut self,
+        new_acp_session_id: Option<String>,
+        reason: EndReason,
+        provenance: HermesProvenance,
+    ) {
+        let now = utc_rfc3339_now();
+
+        // Initial open: no prior segment, no `amux/segment_ended`.
+        let Some(current_id) = self.active_segment_id else {
+            let id = SegmentId(self.next_segment_id);
+            self.next_segment_id = self.next_segment_id.saturating_add(1);
+            let mut seg = Segment::open(id, new_acp_session_id.clone(), self.next_replay_seq);
+            seg.provenance = provenance.clone();
+            seg.opened_at = now.clone();
+            self.segments.push(seg);
+            self.active_segment_id = Some(id);
+
+            if self.emit_segment_frames {
+                let frame = amux::segment_started(
+                    &self.room_id,
+                    id,
+                    new_acp_session_id.as_deref(),
+                    &now,
+                    &provenance,
+                );
+                self.broadcast(frame);
+            }
+            return;
+        };
+
+        let previous_acp = self
+            .segments
+            .iter()
+            .find(|s| s.id == current_id)
+            .and_then(|s| s.acp_session_id.clone());
+
+        // Mark the closing metadata in place but defer `closed_replay_seq`
+        // — the `amux/segment_ended` bookend needs to land inside the
+        // closing segment, and broadcasting it below advances
+        // `next_replay_seq`. Setting `closed_replay_seq` afterwards keeps
+        // the bookend frame's seq inside the closing range.
+        if let Some(seg) = self.segments.iter_mut().find(|s| s.id == current_id) {
+            seg.closed_at = Some(now.clone());
+            seg.end_reason = Some(reason);
+        }
+
+        // Retarget queued prompts to the new ACP session id whenever the
+        // canonical id observably moves. Skip when only the hermes side
+        // rotated (ACP id stable), because the queued prompts already
+        // point at the right ACP head.
+        if let Some(new_acp) = new_acp_session_id.as_deref()
+            && previous_acp.as_deref() != Some(new_acp)
+        {
+            for item in &mut self.queued_prompts {
+                item.session_id = new_acp.to_string();
+            }
+        }
+
+        // Allocate the new segment id so segment_ended can reference it
+        // as `successorSegmentId`.
+        let new_id = SegmentId(self.next_segment_id);
+        self.next_segment_id = self.next_segment_id.saturating_add(1);
+
+        // Broadcast `amux/segment_ended` while the OLD segment is still
+        // active — current_segment_id() returns current_id, so the frame
+        // is tagged with and lands inside the closing segment.
+        if self.emit_segment_frames {
+            let frame = amux::segment_ended(&self.room_id, current_id, &now, reason, Some(new_id));
+            self.broadcast(frame);
+        }
+
+        // Now finalize closed_replay_seq. next_replay_seq has been
+        // advanced past the bookend (or unchanged if --emit-segment-frames
+        // is off), so seq - 1 is either the seq of segment_ended or of
+        // the last regular frame in the segment.
+        let closed_replay_seq = self.next_replay_seq.saturating_sub(1);
+        if let Some(seg) = self.segments.iter_mut().find(|s| s.id == current_id) {
+            seg.closed_replay_seq = Some(closed_replay_seq);
+        }
+
+        // Open the new segment.
+        let mut new_segment =
+            Segment::open(new_id, new_acp_session_id.clone(), self.next_replay_seq);
+        new_segment.provenance = provenance.clone();
+        new_segment.opened_at = now.clone();
+        self.segments.push(new_segment);
+        self.active_segment_id = Some(new_id);
+
+        // Broadcast `amux/segment_started`. current_segment_id() now ==
+        // new_id so this frame lands in the opening segment.
+        if self.emit_segment_frames {
+            let frame = amux::segment_started(
+                &self.room_id,
+                new_id,
+                new_acp_session_id.as_deref(),
+                &now,
+                &provenance,
+            );
+            self.broadcast(frame);
+        }
+    }
+
+    /// Segment id used to tag freshly recorded frames. Frames recorded
+    /// before any segment opens carry `PRE_SEGMENT_ID` so the transcript
+    /// can still slice on segment boundaries without a fallible lookup.
+    fn current_segment_id(&self) -> SegmentId {
+        self.active_segment_id.unwrap_or(PRE_SEGMENT_ID)
     }
 
     fn publish_session_list_metadata(&self) {
@@ -798,13 +1101,13 @@ impl SessionInner {
         };
         if self.subscribers.is_empty() {
             self.session_list_index
-                .remove_if_proxy(acp_session_id, &self.session_id);
+                .remove_if_room(acp_session_id, &self.room_id);
             return;
         }
         self.session_list_index.upsert(
             acp_session_id,
             SessionListAmuxMetadata {
-                proxy_session_id: self.session_id.clone(),
+                room_id: self.room_id.clone(),
                 subscriber_count: self.subscribers.len(),
                 driving_subscriber: self.driving_subscriber_peer_id.clone(),
             },
@@ -814,7 +1117,7 @@ impl SessionInner {
     fn clear_session_list_metadata(&self) {
         if let Some(acp_session_id) = self.canonical_session_id.as_deref() {
             self.session_list_index
-                .remove_if_proxy(acp_session_id, &self.session_id);
+                .remove_if_room(acp_session_id, &self.room_id);
         }
     }
 
@@ -860,7 +1163,7 @@ impl SessionInner {
     ///    contains every broadcast-tier frame that happened before this
     ///    attach, in order, so the newcomer reconstructs the session.
     ///
-    /// Because the actor serializes all SessionMsg handling, no live frames
+    /// Because the actor serializes all RoomMsg handling, no live frames
     /// can interleave during this sequence.
     fn attach(&mut self, subscriber: Subscriber) -> Result<(), AttachError> {
         if self.subscribers.contains_key(&subscriber.peer_id) {
@@ -877,7 +1180,7 @@ impl SessionInner {
         };
 
         let frame = amux::peer_joined(
-            &self.session_id,
+            &self.room_id,
             &subscriber.peer_id,
             subscriber.peer_name.as_deref(),
             subscriber.role.as_deref(),
@@ -886,7 +1189,7 @@ impl SessionInner {
 
         let peer_id = subscriber.peer_id.clone();
         tracing::info!(
-            session = %self.session_id,
+            session = %self.room_id,
             peer_id = %peer_id,
             replay_frames = snapshot.len(),
             suppress_legacy_replay,
@@ -912,14 +1215,14 @@ impl SessionInner {
         let Some(sub) = self.subscribers.get(peer_id) else {
             return;
         };
-        let frame = Bytes::from(amux::session_context(&self.session_id, &self.agent_cwd));
+        let frame = Bytes::from(amux::session_context(&self.room_id, &self.agent_cwd));
         if sub.outbound.send(OutMsg::Frame(frame)).is_err() {
             tracing::debug!(%peer_id, "subscriber dropped before session context delivered");
         }
     }
 
     /// Build a serializable snapshot of session state for /debug/sessions.
-    fn build_snapshot(&self, ttl_pending: bool) -> SessionSnapshot {
+    fn build_snapshot(&self, ttl_pending: bool) -> RoomSnapshot {
         let subs: Vec<SubscriberSnapshot> = self
             .subscribers
             .values()
@@ -935,8 +1238,8 @@ impl SessionInner {
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string())
         });
-        SessionSnapshot {
-            session_id: self.session_id.clone(),
+        RoomSnapshot {
+            room_id: self.room_id.clone(),
             agent_cwd: self.agent_cwd.clone(),
             subscribers: subs,
             pending_request_count: self.pending.len(),
@@ -949,6 +1252,8 @@ impl SessionInner {
             ttl_pending,
             replay_log_len: self.replay_log.as_ref().map(|l| l.len()),
             replay_generation: self.replay_generation,
+            segments: self.segments.clone(),
+            active_segment_id: self.active_segment_id,
             replay_log_update_frames_by_acp_session_id: self
                 .replay_log
                 .as_ref()
@@ -982,8 +1287,8 @@ impl SessionInner {
     fn detach(&mut self, peer_id: &str) -> bool {
         let removed = self.subscribers.remove(peer_id);
         if removed.is_some() {
-            tracing::info!(session = %self.session_id, %peer_id, "subscriber detached");
-            let frame = amux::peer_left(&self.session_id, peer_id);
+            tracing::info!(session = %self.room_id, %peer_id, "subscriber detached");
+            let frame = amux::peer_left(&self.room_id, peer_id);
             self.broadcast(frame);
             let orphaned_queue_item_ids: Vec<String> = self
                 .queued_prompts
@@ -993,7 +1298,7 @@ impl SessionInner {
                 .collect();
             for queue_item_id in orphaned_queue_item_ids {
                 self.broadcast(amux::queue_item_orphaned(
-                    &self.session_id,
+                    &self.room_id,
                     &queue_item_id,
                     peer_id,
                 ));
@@ -1004,7 +1309,7 @@ impl SessionInner {
         }
         if self.subscribers.is_empty() {
             self.clear_session_list_metadata();
-            tracing::info!(session = %self.session_id, "last subscriber gone; ending session");
+            tracing::info!(session = %self.room_id, "last subscriber gone; ending session");
             return true;
         }
         self.publish_session_list_metadata();
@@ -1020,7 +1325,7 @@ impl SessionInner {
             Ok(f) => f,
             Err(err) => {
                 tracing::warn!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     %peer_id,
                     error = %err,
                     "invalid JSON-RPC frame from subscriber; dropping",
@@ -1072,7 +1377,7 @@ impl SessionInner {
             Some(id) => id,
             None => {
                 tracing::debug!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     %peer_id,
                     "subscriber $/cancel_request with invalid/null requestId; dropping",
                 );
@@ -1082,7 +1387,7 @@ impl SessionInner {
 
         let Some(mux_id) = self.find_pending_mux_id(peer_id, &original_id) else {
             tracing::debug!(
-                session = %self.session_id,
+                session = %self.room_id,
                 %peer_id,
                 id = ?original_id,
                 "subscriber $/cancel_request for unknown id; dropping",
@@ -1091,7 +1396,7 @@ impl SessionInner {
         };
 
         tracing::info!(
-            session = %self.session_id,
+            session = %self.room_id,
             %peer_id,
             ?original_id,
             mux_id,
@@ -1112,7 +1417,7 @@ impl SessionInner {
     ) -> Option<Vec<u8>> {
         let Some(active_mux_id) = self.active_turn_mux_id else {
             tracing::debug!(
-                session = %self.session_id,
+                session = %self.room_id,
                 %peer_id,
                 "amux/cancel_active_turn with no active turn; dropping",
             );
@@ -1120,7 +1425,7 @@ impl SessionInner {
         };
         let Some(amux_turn_id) = self.active_amux_turn_id else {
             tracing::warn!(
-                session = %self.session_id,
+                session = %self.room_id,
                 %peer_id,
                 "active_turn_mux_id set but active_amux_turn_id missing; dropping cancel",
             );
@@ -1128,7 +1433,7 @@ impl SessionInner {
         };
         let Some(pending) = self.pending.get(&active_mux_id) else {
             tracing::warn!(
-                session = %self.session_id,
+                session = %self.room_id,
                 %peer_id,
                 active_mux_id,
                 "active turn has no pending entry; dropping cancel",
@@ -1138,7 +1443,7 @@ impl SessionInner {
         let original_driver = pending.peer_id.clone();
         let Some(active_session_id) = self.active_turn_session_id.clone() else {
             tracing::warn!(
-                session = %self.session_id,
+                session = %self.room_id,
                 %peer_id,
                 active_mux_id,
                 "active turn has no ACP sessionId; dropping cancel",
@@ -1153,7 +1458,7 @@ impl SessionInner {
             .map(|s| s.to_string());
 
         tracing::info!(
-            session = %self.session_id,
+            session = %self.room_id,
             cancelled_by = %peer_id,
             %original_driver,
             active_mux_id,
@@ -1163,7 +1468,7 @@ impl SessionInner {
         );
 
         let frame = amux::turn_cancelled(
-            &self.session_id,
+            &self.room_id,
             amux_turn_id,
             peer_id,
             &original_driver,
@@ -1191,7 +1496,7 @@ impl SessionInner {
             Some(id) => id,
             None => {
                 tracing::debug!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     "agent $/cancel_request with invalid/null requestId; dropping",
                 );
                 return false;
@@ -1203,21 +1508,21 @@ impl SessionInner {
                 self.pending_permission_frames
                     .retain(|(id, _)| id != &request_id);
                 tracing::info!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     id = ?request_id,
                     "agent cancelled in-flight agent-initiated request; broadcasting",
                 );
             }
             Some(AgentReqState::Consumed) => {
                 tracing::debug!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     id = ?request_id,
                     "agent $/cancel_request for already-consumed id; broadcasting anyway so late UIs dismiss",
                 );
             }
             None => {
                 tracing::debug!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     id = ?request_id,
                     "agent $/cancel_request for unknown id; broadcasting anyway",
                 );
@@ -1238,7 +1543,7 @@ impl SessionInner {
             Ok(v) => v,
             Err(err) => {
                 tracing::warn!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     error = %err,
                     "failed to serialize cancelled request id; skipping amux/agent_request_resolved",
                 );
@@ -1246,7 +1551,7 @@ impl SessionInner {
             }
         };
         let frame = amux::agent_request_resolved(
-            &self.session_id,
+            &self.room_id,
             &request_id_value,
             amux::RESOLVED_BY_AGENT_CANCELLED,
             None,
@@ -1298,7 +1603,7 @@ impl SessionInner {
         match decision {
             Decision::Forward => {
                 tracing::debug!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     %peer_id,
                     id = ?resp.id,
                     "first reply to agent-initiated request; forwarding to agent",
@@ -1308,7 +1613,7 @@ impl SessionInner {
             }
             Decision::Drop => {
                 tracing::debug!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     %peer_id,
                     id = ?resp.id,
                     "duplicate reply to agent-initiated request; dropping",
@@ -1346,7 +1651,7 @@ impl SessionInner {
                 .retain(|(pending_id, _)| pending_id != id);
         }
         tracing::info!(
-            session = %self.session_id,
+            session = %self.room_id,
             stale_count = stale_ids.len(),
             reason,
             "sweeping unresolved agent-initiated requests",
@@ -1356,20 +1661,15 @@ impl SessionInner {
                 Ok(v) => v,
                 Err(err) => {
                     tracing::warn!(
-                        session = %self.session_id,
+                        session = %self.room_id,
                         error = %err,
                         "failed to serialize stale agent-request id; skipping cleanup broadcast",
                     );
                     continue;
                 }
             };
-            let frame = amux::agent_request_resolved(
-                &self.session_id,
-                &request_id_value,
-                reason,
-                None,
-                None,
-            );
+            let frame =
+                amux::agent_request_resolved(&self.room_id, &request_id_value, reason, None, None);
             self.broadcast(frame);
         }
     }
@@ -1387,7 +1687,7 @@ impl SessionInner {
             Ok(v) => v,
             Err(err) => {
                 tracing::warn!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     error = %err,
                     "failed to serialize agent-request id; skipping resolved broadcast",
                 );
@@ -1399,7 +1699,7 @@ impl SessionInner {
             .as_ref()
             .and_then(|e| serde_json::to_value(e).ok());
         let frame = amux::agent_request_resolved(
-            &self.session_id,
+            &self.room_id,
             &request_id_value,
             resolved_by,
             resp.result.as_ref(),
@@ -1429,7 +1729,7 @@ impl SessionInner {
         }
         if !stripped.is_empty() {
             tracing::info!(
-                session = %self.session_id,
+                session = %self.room_id,
                 namespaces = ?stripped,
                 "stripped blocked client-tool capabilities from initialize",
             );
@@ -1580,7 +1880,7 @@ impl SessionInner {
             kind: QueuedPromptKind::Queue,
         });
         self.broadcast(amux::queue_item_added(
-            &self.session_id,
+            &self.room_id,
             &queue_item_id,
             peer_id,
             peer_name,
@@ -1652,7 +1952,7 @@ impl SessionInner {
         };
         self.queued_prompts.remove(position);
         self.broadcast(amux::queue_item_removed(
-            &self.session_id,
+            &self.room_id,
             queue_item_id.as_str(),
             peer_id,
         ));
@@ -1708,7 +2008,7 @@ impl SessionInner {
             .unwrap_or((None, None));
 
         self.broadcast(amux::control_submitted(amux::ControlSubmitted {
-            session_id: &self.session_id,
+            room_id: &self.room_id,
             kind: "steer",
             mode: "hard",
             peer_id,
@@ -1718,7 +2018,7 @@ impl SessionInner {
             text: &control.text,
         }));
         self.broadcast(amux::turn_cancelled(
-            &self.session_id,
+            &self.room_id,
             supersedes_turn_id,
             peer_id,
             &original_driver,
@@ -1757,7 +2057,7 @@ impl SessionInner {
             .unwrap_or((None, None));
 
         self.broadcast(amux::control_submitted(amux::ControlSubmitted {
-            session_id: &self.session_id,
+            room_id: &self.room_id,
             kind: "steer",
             mode: "prompt",
             peer_id,
@@ -1846,13 +2146,13 @@ impl SessionInner {
         {
             let held_by = self.pending.get(&active).map(|pr| pr.peer_id.clone());
             tracing::warn!(
-                session = %self.session_id,
+                session = %self.room_id,
                 %peer_id,
                 active_turn = active,
                 held_by = ?held_by,
                 "rejecting concurrent session/prompt with -32001",
             );
-            let busy_frame = amux::session_busy(&self.session_id, true, held_by.as_deref());
+            let busy_frame = amux::session_busy(&self.room_id, true, held_by.as_deref());
             self.broadcast(busy_frame);
             self.send_error_response(
                 peer_id,
@@ -1957,7 +2257,7 @@ impl SessionInner {
                     self.active_turn_session_id = active_turn_session_id;
                     self.active_turn_prompt_text = active_turn_prompt_text;
                     tracing::info!(
-                        session = %self.session_id,
+                        session = %self.room_id,
                         %peer_id,
                         mux_id,
                         amux_turn_id = %turn_id.formatted(),
@@ -1970,7 +2270,7 @@ impl SessionInner {
             }
             Err(err) => {
                 tracing::error!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     mux_id,
                     error = %err,
                     "failed to serialize translated request; dropping",
@@ -1998,7 +2298,7 @@ impl SessionInner {
             .map(|s| (s.peer_name.clone(), s.role.clone()))
             .unwrap_or((None, None));
         let frame = amux::turn_started(
-            &self.session_id,
+            &self.room_id,
             turn_id,
             peer_id,
             peer_name.as_deref(),
@@ -2015,7 +2315,7 @@ impl SessionInner {
     fn emit_turn_complete(&mut self, turn_id: AmuxTurnId, result: Option<&Value>) {
         let null = Value::Null;
         let stop_reason = result.and_then(|r| r.get("stopReason")).unwrap_or(&null);
-        let frame = amux::turn_complete(&self.session_id, turn_id, stop_reason);
+        let frame = amux::turn_complete(&self.room_id, turn_id, stop_reason);
         self.broadcast(frame);
     }
 
@@ -2064,7 +2364,7 @@ impl SessionInner {
             Ok(out) => out,
             Err(err) => {
                 tracing::error!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     mux_id,
                     error = %err,
                     "failed to serialize mux-owned queued prompt; dropping",
@@ -2098,7 +2398,7 @@ impl SessionInner {
             .and_then(|p| p.get("prompt"))
             .and_then(text_from_text_only_prompt);
         tracing::info!(
-            session = %self.session_id,
+            session = %self.room_id,
             peer_id = %item.peer_id,
             mux_id,
             amux_turn_id = %turn_id.formatted(),
@@ -2114,7 +2414,7 @@ impl SessionInner {
         );
         if let Some(queue_item_id) = queue_item_id.as_deref() {
             self.broadcast(amux::queue_item_submitted(
-                &self.session_id,
+                &self.room_id,
                 queue_item_id,
                 turn_id,
             ));
@@ -2144,7 +2444,7 @@ impl SessionInner {
                     .insert("sessionId".to_string(), Value::String(loaded.to_string()))
                     .and_then(|v| v.as_str().map(|s| s.to_string()));
                 tracing::info!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     previous = ?previous,
                     loaded,
                     "session/load: rebound canonical session id (existing cache)",
@@ -2155,7 +2455,7 @@ impl SessionInner {
                     "sessionId": loaded,
                 }));
                 tracing::info!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     loaded,
                     "session/load: rebound canonical session id (synthesized cache)",
                 );
@@ -2185,7 +2485,11 @@ impl SessionInner {
             let mut segmented =
                 VecDeque::with_capacity(presence_frames.len() + retained_entries.len());
             for frame in presence_frames {
-                let entry = ReplayEntry::new(self.next_replay_seq, Bytes::from(frame));
+                let entry = ReplayEntry::new(
+                    self.next_replay_seq,
+                    Bytes::from(frame),
+                    self.current_segment_id(),
+                );
                 self.next_replay_seq += 1;
                 segmented.push_back(entry);
             }
@@ -2201,7 +2505,7 @@ impl SessionInner {
             retained_frame_count,
         });
         tracing::info!(
-            session = %self.session_id,
+            session = %self.room_id,
             loaded,
             replay_generation = self.replay_generation,
             dropped_frame_count,
@@ -2217,7 +2521,7 @@ impl SessionInner {
             .into_iter()
             .map(|subscriber| {
                 amux::peer_joined(
-                    &self.session_id,
+                    &self.room_id,
                     &subscriber.peer_id,
                     subscriber.peer_name.as_deref(),
                     subscriber.role.as_deref(),
@@ -2229,14 +2533,14 @@ impl SessionInner {
     fn note_driving_subscriber(&mut self, peer_id: &str) {
         if !self.subscribers.contains_key(peer_id) {
             tracing::debug!(
-                session = %self.session_id,
+                session = %self.room_id,
                 %peer_id,
                 "skipping driving subscriber update for detached peer",
             );
             return;
         }
         if self.driving_subscriber_peer_id.as_deref() != Some(peer_id) {
-            tracing::debug!(session = %self.session_id, %peer_id, "driving subscriber updated");
+            tracing::debug!(session = %self.room_id, %peer_id, "driving subscriber updated");
             self.driving_subscriber_peer_id = Some(peer_id.to_string());
             self.publish_session_list_metadata();
         }
@@ -2322,7 +2626,7 @@ impl SessionInner {
             Ok(f) => f,
             Err(err) => {
                 tracing::warn!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     error = %err,
                     "invalid JSON-RPC frame from agent; falling back to raw broadcast",
                 );
@@ -2351,6 +2655,13 @@ impl SessionInner {
     /// cancellation to every subscriber, mark the entry Consumed, and emit
     /// `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }` so
     /// peer UIs dismiss.
+    ///
+    /// Phase D: peek into the notification's `params` for an observable
+    /// ACP `sessionId` change and/or `_meta.hermes.sessionProvenance`
+    /// rotation; if either indicates a different head than the active
+    /// segment, rotate before broadcasting. Backfill provenance into the
+    /// active segment when the metadata is present but no rotation is
+    /// warranted.
     fn handle_agent_notification(
         &mut self,
         notif: crate::protocol::jsonrpc::IncomingNotification,
@@ -2359,7 +2670,111 @@ impl SessionInner {
         if notif.method == CANCEL_REQUEST_METHOD {
             return self.handle_agent_cancel(notif, line);
         }
+        self.detect_segment_signal_from_agent_notification(&notif);
         self.broadcast(line)
+    }
+
+    /// Inspect an agent notification's params for compaction signals and
+    /// rotate the segment if warranted. Pure observation: it never reads
+    /// or writes outside the parsed `Value`, and emits no frames besides
+    /// the ones `rotate_segment` itself produces.
+    fn detect_segment_signal_from_agent_notification(
+        &mut self,
+        notif: &crate::protocol::jsonrpc::IncomingNotification,
+    ) {
+        let Some(params) = notif.params.as_ref() else {
+            return;
+        };
+        let acp_session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let provenance = params
+            .get("_meta")
+            .and_then(|m| m.get("hermes"))
+            .map(parse_hermes_provenance)
+            .unwrap_or_default();
+
+        if acp_session_id.is_none() && provenance.is_empty() {
+            return;
+        }
+
+        let needs_rotation = self.rotation_warranted(acp_session_id.as_deref(), &provenance);
+        if !needs_rotation {
+            self.backfill_active_segment_provenance(&provenance);
+            return;
+        }
+
+        let reason = if provenance.hermes_session_id.is_some()
+            || provenance.last_mode.as_deref() == Some("session_split")
+        {
+            EndReason::HermesCompression
+        } else {
+            EndReason::AcpSessionIdChanged
+        };
+
+        // Prefer the canonical id we just observed; otherwise keep the
+        // active segment's id (compaction under a stable ACP id).
+        let new_acp_id = acp_session_id.or_else(|| self.canonical_session_id.clone());
+        self.rotate_segment(new_acp_id, reason, provenance);
+    }
+
+    /// Returns true iff the observed `acp_session_id` or `provenance`
+    /// indicate a different head than the active segment. See `Segment`
+    /// and `HermesProvenance` for the rotation decision tree.
+    fn rotation_warranted(
+        &self,
+        acp_session_id: Option<&str>,
+        provenance: &HermesProvenance,
+    ) -> bool {
+        let Some(active) = self.active_segment() else {
+            return false; // no active segment yet → initial open lives elsewhere
+        };
+
+        if let Some(observed) = acp_session_id
+            && active.acp_session_id.as_deref() != Some(observed)
+        {
+            return true;
+        }
+
+        let observed_hermes = provenance.hermes_session_id.as_deref();
+        let active_hermes = active.provenance.hermes_session_id.as_deref();
+        if let (Some(observed), Some(active_hermes)) = (observed_hermes, active_hermes)
+            && observed != active_hermes
+        {
+            return true;
+        }
+
+        // First-time provenance arrival on a segment that already has a
+        // different hermes id: also a rotation signal. (Active hermes is
+        // None but we now observe Some.)
+        if active_hermes.is_none() && observed_hermes.is_some() {
+            // Only rotate when the observed provenance explicitly marks a
+            // compression event; otherwise treat as enrichment.
+            if provenance.last_mode.as_deref() == Some("session_split") {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn active_segment(&self) -> Option<&Segment> {
+        let id = self.active_segment_id?;
+        self.segments.iter().find(|s| s.id == id)
+    }
+
+    fn backfill_active_segment_provenance(&mut self, observed: &HermesProvenance) {
+        if observed.is_empty() {
+            return;
+        }
+        let Some(id) = self.active_segment_id else {
+            return;
+        };
+        let Some(seg) = self.segments.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        merge_provenance(&mut seg.provenance, observed);
     }
 
     /// Fan out an agent-initiated request to every attached subscriber and
@@ -2376,7 +2791,7 @@ impl SessionInner {
             match mode {
                 ClientToolMode::Block => {
                     tracing::warn!(
-                        session = %self.session_id,
+                        session = %self.room_id,
                         id = ?id,
                         method = %req.method,
                         "blocking agent-initiated client-tool request by policy",
@@ -2385,7 +2800,7 @@ impl SessionInner {
                 }
                 ClientToolMode::UnsafeDebug => {
                     tracing::warn!(
-                        session = %self.session_id,
+                        session = %self.room_id,
                         id = ?id,
                         method = %req.method,
                         subscribers = self.subscribers.len(),
@@ -2396,7 +2811,7 @@ impl SessionInner {
         }
         if self.subscribers.is_empty() {
             tracing::warn!(
-                session = %self.session_id,
+                session = %self.room_id,
                 id = ?id,
                 method = %req.method,
                 "agent-initiated request with no attached subscribers; dropping",
@@ -2409,7 +2824,7 @@ impl SessionInner {
             Ok(v) => v,
             Err(err) => {
                 tracing::warn!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     error = %err,
                     id = ?id,
                     method = %req.method,
@@ -2419,7 +2834,7 @@ impl SessionInner {
             }
         };
         let opened = amux::agent_request_opened(
-            &self.session_id,
+            &self.room_id,
             &request_id_value,
             &req.method,
             req.params.as_ref(),
@@ -2427,7 +2842,7 @@ impl SessionInner {
         );
         self.broadcast(opened);
         tracing::debug!(
-            session = %self.session_id,
+            session = %self.room_id,
             id = ?id,
             method = %req.method,
             subscribers = self.subscribers.len(),
@@ -2458,7 +2873,7 @@ impl SessionInner {
             Id::Number(n) if n >= 0 => n as u64,
             ref other => {
                 tracing::warn!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     id = ?other,
                     "agent response with non-numeric or negative id; dropping",
                 );
@@ -2466,7 +2881,7 @@ impl SessionInner {
             }
         };
         let Some(pr) = self.pending.remove(&mux_id) else {
-            tracing::warn!(session = %self.session_id, mux_id, "no pending request matches agent response; dropping");
+            tracing::warn!(session = %self.room_id, mux_id, "no pending request matches agent response; dropping");
             return None;
         };
 
@@ -2477,7 +2892,7 @@ impl SessionInner {
             self.active_turn_prompt_text = None;
             let turn_id = self.active_amux_turn_id.take();
             tracing::info!(
-                session = %self.session_id,
+                session = %self.room_id,
                 mux_id,
                 amux_turn_id = ?turn_id.map(|t| t.formatted()),
                 "session/prompt response received; active turn cleared",
@@ -2499,7 +2914,7 @@ impl SessionInner {
                         .cloned()
                         .unwrap_or(Value::Null);
                     self.broadcast(amux::queue_item_completed(
-                        &self.session_id,
+                        &self.room_id,
                         queue_item_id,
                         turn_id,
                         &stop_reason,
@@ -2520,13 +2935,13 @@ impl SessionInner {
             match kind {
                 HandshakeKind::Initialize => {
                     if self.initialize_cache.is_none() {
-                        tracing::info!(session = %self.session_id, "caching initialize result");
+                        tracing::info!(session = %self.room_id, "caching initialize result");
                         self.initialize_cache = Some(result.clone());
                     }
                 }
                 HandshakeKind::SessionNew => {
                     if self.session_new_cache.is_none() {
-                        tracing::info!(session = %self.session_id, "caching session/new result");
+                        tracing::info!(session = %self.room_id, "caching session/new result");
                         self.session_new_cache = Some(result.clone());
                     }
                     if let Some(acp_session_id) = result.get("sessionId").and_then(Value::as_str) {
@@ -2538,7 +2953,10 @@ impl SessionInner {
                     replay_start_len,
                 } => {
                     self.rebind_canonical_session(&loaded_session_id);
-                    self.set_canonical_session_id(&loaded_session_id);
+                    self.set_canonical_session_id_with_reason(
+                        &loaded_session_id,
+                        EndReason::SessionLoad,
+                    );
                     self.reset_replay_generation_after_load(&loaded_session_id, replay_start_len);
                 }
             }
@@ -2585,8 +3003,9 @@ impl SessionInner {
     /// requests) do NOT go through `broadcast` and are NOT logged.
     fn broadcast(&mut self, frame: impl Into<Bytes>) -> bool {
         let frame: Bytes = frame.into();
+        let segment_id = self.current_segment_id();
         if let Some(log) = self.replay_log.as_mut() {
-            let entry = ReplayEntry::new(self.next_replay_seq, frame.clone());
+            let entry = ReplayEntry::new(self.next_replay_seq, frame.clone(), segment_id);
             self.next_replay_seq += 1;
             log.push_back(entry);
         }
@@ -2601,7 +3020,7 @@ impl SessionInner {
             }
         });
         if pre_fanout > 0 && self.subscribers.is_empty() {
-            tracing::info!(session = %self.session_id, "no live subscribers after fan-out; ending session");
+            tracing::info!(session = %self.room_id, "no live subscribers after fan-out; ending session");
             return true;
         }
         false
@@ -2611,10 +3030,11 @@ impl SessionInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::attach::HistoryPolicy;
 
-    fn test_inner() -> SessionInner {
+    fn test_inner() -> RoomInner {
         let (tx, _rx) = mpsc::channel(1);
-        SessionInner::new(
+        RoomInner::new(
             "test-room".to_string(),
             "/tmp".to_string(),
             ReplayTurns::Disabled,
@@ -2622,7 +3042,424 @@ mod tests {
             ClientToolPolicy::default(),
             Arc::new(SessionListMetadataIndex::new()),
             tx,
+            true,
         )
+    }
+
+    #[test]
+    fn first_canonical_session_id_opens_initial_segment() {
+        let mut inner = test_inner();
+        assert!(inner.active_segment_id.is_none(), "no segment before id");
+        assert!(inner.segments.is_empty());
+
+        inner.set_canonical_session_id("sess-mock");
+
+        assert_eq!(inner.active_segment_id, Some(SegmentId(1)));
+        assert_eq!(inner.segments.len(), 1);
+        let seg = &inner.segments[0];
+        assert_eq!(seg.id, SegmentId(1));
+        assert_eq!(seg.acp_session_id.as_deref(), Some("sess-mock"));
+        assert!(seg.closed_at.is_none());
+        assert!(seg.end_reason.is_none());
+    }
+
+    #[test]
+    fn repeated_canonical_session_id_does_not_reopen_segment() {
+        let mut inner = test_inner();
+        inner.set_canonical_session_id("sess-mock");
+        inner.set_canonical_session_id("sess-mock");
+
+        assert_eq!(inner.segments.len(), 1, "same id must not open new segment");
+        assert_eq!(inner.active_segment_id, Some(SegmentId(1)));
+    }
+
+    #[test]
+    fn rotate_segment_closes_current_and_opens_new() {
+        let mut inner = test_inner();
+        // Use the unbounded replay path so broadcasts are observable.
+        inner.replay_log = Some(VecDeque::new());
+
+        inner.set_canonical_session_id_with_reason("sess-1", EndReason::SessionLoad);
+        assert_eq!(inner.active_segment_id, Some(SegmentId(1)));
+        let seg1_opened_seq = inner.segments[0].opened_replay_seq;
+
+        // Rotate explicitly: closes seg-1, opens seg-2.
+        inner.set_canonical_session_id_with_reason("sess-2", EndReason::SessionLoad);
+
+        assert_eq!(
+            inner.segments.len(),
+            2,
+            "second canonical id must open a second segment",
+        );
+        assert_eq!(inner.active_segment_id, Some(SegmentId(2)));
+
+        let closed = &inner.segments[0];
+        assert_eq!(closed.id, SegmentId(1));
+        assert!(closed.closed_at.is_some(), "closed_at populated");
+        assert_eq!(closed.end_reason, Some(EndReason::SessionLoad));
+        assert!(closed.closed_replay_seq.is_some());
+
+        let opened = &inner.segments[1];
+        assert_eq!(opened.id, SegmentId(2));
+        assert_eq!(opened.acp_session_id.as_deref(), Some("sess-2"));
+        assert!(opened.closed_at.is_none());
+
+        // segment_ended for seg-1 + segment_started for seg-2 emitted at
+        // initial open + at rotation. Two opens, one ended → 3 frames.
+        let log = inner.replay_log.as_ref().unwrap();
+        let methods: Vec<String> = log
+            .iter()
+            .filter_map(|e| {
+                let v: serde_json::Value = serde_json::from_slice(&e.frame).ok()?;
+                v.get("method")?.as_str().map(String::from)
+            })
+            .collect();
+        assert_eq!(
+            methods,
+            vec![
+                "amux/segment_started",
+                "amux/segment_ended",
+                "amux/segment_started",
+            ],
+            "lifecycle frames in transcript: open seg-1, end seg-1, open seg-2",
+        );
+
+        // segment_ended must be tagged with the OLD segment (seg-1) so
+        // current-segment-only replay omits it cleanly.
+        let ended_entry = log
+            .iter()
+            .find(|e| {
+                let v: serde_json::Value = serde_json::from_slice(&e.frame).unwrap_or_default();
+                v.get("method")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s == "amux/segment_ended")
+                    .unwrap_or(false)
+            })
+            .expect("segment_ended must exist");
+        assert_eq!(
+            ended_entry.segment_id,
+            SegmentId(1),
+            "segment_ended sits in the closing segment",
+        );
+        // closed_replay_seq must include the bookend frame so per-segment
+        // slicing on (opened_replay_seq..=closed_replay_seq) covers it.
+        assert_eq!(
+            closed.closed_replay_seq,
+            Some(ended_entry.seq),
+            "closed_replay_seq must cover the segment_ended bookend",
+        );
+
+        // opened_replay_seq for seg-2 must be strictly after seg-1's open.
+        assert!(
+            opened.opened_replay_seq > seg1_opened_seq,
+            "new segment's opened_replay_seq must monotonically advance",
+        );
+
+        // segment_started for seg-2 must be the first frame at-or-after
+        // seg-2's opened_replay_seq, completing the bookend invariant.
+        let started_entry = log
+            .iter()
+            .find(|e| e.segment_id == SegmentId(2))
+            .expect("seg-2 must have at least one frame (segment_started)");
+        let v: serde_json::Value = serde_json::from_slice(&started_entry.frame).unwrap_or_default();
+        assert_eq!(
+            v["method"].as_str(),
+            Some("amux/segment_started"),
+            "first frame in new segment is the segment_started bookend",
+        );
+        assert_eq!(started_entry.seq, opened.opened_replay_seq);
+    }
+
+    fn make_notification(
+        method: &str,
+        params: Value,
+    ) -> crate::protocol::jsonrpc::IncomingNotification {
+        crate::protocol::jsonrpc::IncomingNotification {
+            jsonrpc: crate::protocol::jsonrpc::JsonRpcVersion,
+            method: method.to_string(),
+            params: Some(params),
+        }
+    }
+
+    #[test]
+    fn hermes_compression_metadata_rotates_segment_under_stable_acp_id() {
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+
+        // Bootstrap a segment with hermesSessionId via metadata enrichment.
+        inner.set_canonical_session_id_with_reason("acp-stable", EndReason::SessionLoad);
+        let enrich = make_notification(
+            "session/update",
+            json!({
+                "sessionId": "acp-stable",
+                "_meta": {
+                    "hermes": {
+                        "sessionProvenance": { "hermesSessionId": "hs-1" }
+                    }
+                }
+            }),
+        );
+        inner.detect_segment_signal_from_agent_notification(&enrich);
+        assert_eq!(
+            inner
+                .active_segment()
+                .unwrap()
+                .provenance
+                .hermes_session_id
+                .as_deref(),
+            Some("hs-1"),
+            "first metadata arrival enriches the active segment without rotating",
+        );
+        assert_eq!(inner.segments.len(), 1);
+
+        // Now the agent rotates internally — same ACP id, new hermes id,
+        // `lastMode: session_split` makes the compression explicit.
+        let compaction = make_notification(
+            "session/update",
+            json!({
+                "sessionId": "acp-stable",
+                "_meta": {
+                    "hermes": {
+                        "sessionProvenance": { "hermesSessionId": "hs-2", "compressionDepth": 1 },
+                        "compaction": { "lastMode": "session_split", "lastReason": "automatic_threshold" }
+                    }
+                }
+            }),
+        );
+        inner.detect_segment_signal_from_agent_notification(&compaction);
+
+        assert_eq!(inner.segments.len(), 2, "compaction must open seg-2");
+        assert_eq!(
+            inner.segments[0].end_reason,
+            Some(EndReason::HermesCompression)
+        );
+        assert_eq!(
+            inner.active_segment().unwrap().acp_session_id.as_deref(),
+            Some("acp-stable"),
+            "ACP id stays stable across hermes compaction",
+        );
+        assert_eq!(
+            inner
+                .active_segment()
+                .unwrap()
+                .provenance
+                .hermes_session_id
+                .as_deref(),
+            Some("hs-2"),
+        );
+    }
+
+    #[test]
+    fn acp_session_id_change_in_notification_rotates_via_heuristic() {
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+
+        inner.set_canonical_session_id_with_reason("acp-1", EndReason::SessionLoad);
+        let notif = make_notification("session/update", json!({ "sessionId": "acp-2" }));
+        inner.detect_segment_signal_from_agent_notification(&notif);
+
+        assert_eq!(inner.segments.len(), 2, "ACP id change must rotate");
+        assert_eq!(
+            inner.segments[0].end_reason,
+            Some(EndReason::AcpSessionIdChanged)
+        );
+        assert_eq!(
+            inner.active_segment().unwrap().acp_session_id.as_deref(),
+            Some("acp-2"),
+        );
+    }
+
+    #[test]
+    fn repeated_signals_with_same_ids_do_not_rotate() {
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+        inner.set_canonical_session_id_with_reason("acp-1", EndReason::SessionLoad);
+        let notif = make_notification(
+            "session/update",
+            json!({
+                "sessionId": "acp-1",
+                "_meta": { "hermes": { "sessionProvenance": { "hermesSessionId": "hs-1" } } }
+            }),
+        );
+        inner.detect_segment_signal_from_agent_notification(&notif);
+        inner.detect_segment_signal_from_agent_notification(&notif);
+        inner.detect_segment_signal_from_agent_notification(&notif);
+
+        assert_eq!(inner.segments.len(), 1, "stable ids never rotate");
+    }
+
+    #[test]
+    fn provenance_backfill_enriches_active_segment_without_rotating() {
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+        inner.set_canonical_session_id_with_reason("acp-1", EndReason::SessionLoad);
+
+        let notif = make_notification(
+            "session/update",
+            json!({
+                "sessionId": "acp-1",
+                "_meta": {
+                    "hermes": {
+                        "sessionProvenance": {
+                            "hermesSessionId": "hs-1",
+                            "rootHermesSessionId": "hs-root",
+                            "compressionDepth": 3
+                        }
+                    }
+                }
+            }),
+        );
+        inner.detect_segment_signal_from_agent_notification(&notif);
+
+        assert_eq!(inner.segments.len(), 1, "enrichment must not rotate");
+        let seg = inner.active_segment().unwrap();
+        assert_eq!(seg.provenance.hermes_session_id.as_deref(), Some("hs-1"));
+        assert_eq!(
+            seg.provenance.root_hermes_session_id.as_deref(),
+            Some("hs-root")
+        );
+        assert_eq!(seg.provenance.compression_depth, Some(3));
+    }
+
+    #[test]
+    fn history_full_returns_current_segment_only() {
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+
+        inner.set_canonical_session_id_with_reason("acp-1", EndReason::SessionLoad);
+        // Stuff a frame into seg-1.
+        let frame_seg1 = br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-1","update":{"kind":"seg1-marker"}}}"#;
+        inner.broadcast(Bytes::from_static(frame_seg1));
+
+        inner.set_canonical_session_id_with_reason("acp-2", EndReason::SessionLoad);
+        let frame_seg2 = br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-2","update":{"kind":"seg2-marker"}}}"#;
+        inner.broadcast(Bytes::from_static(frame_seg2));
+
+        let full = inner.history_full();
+        let kinds: Vec<&str> = full
+            .iter()
+            .filter_map(|e| e.params.get("update")?.get("kind")?.as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["seg2-marker"],
+            "Full must surface only the active segment's update frames",
+        );
+
+        // Lineage view sees both updates in chronological order.
+        let lineage = inner.history_full_lineage();
+        let lineage_kinds: Vec<&str> = lineage
+            .iter()
+            .filter_map(|e| e.params.get("update")?.get("kind")?.as_str())
+            .collect();
+        assert_eq!(lineage_kinds, vec!["seg1-marker", "seg2-marker"]);
+    }
+
+    #[test]
+    fn stream_path_respects_history_policy() {
+        // The streaming-delivery path must honour `historyPolicy: full` =
+        // current-segment-only; without the filter it leaked all
+        // segments to clients that opted into `full`.
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+
+        inner.set_canonical_session_id_with_reason("acp-1", EndReason::SessionLoad);
+        inner.broadcast(Bytes::from_static(
+            br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-1","update":{"kind":"seg1"}}}"#,
+        ));
+        inner.set_canonical_session_id_with_reason("acp-2", EndReason::SessionLoad);
+        inner.broadcast(Bytes::from_static(
+            br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-2","update":{"kind":"seg2"}}}"#,
+        ));
+
+        let full_entries = inner.replay_entries_for_policy(HistoryPolicy::Full);
+        let full_kinds: Vec<String> = full_entries
+            .iter()
+            .filter_map(|entry| {
+                let v: serde_json::Value = serde_json::from_slice(&entry.frame).ok()?;
+                v.get("params")?
+                    .get("update")?
+                    .get("kind")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            full_kinds,
+            vec!["seg2"],
+            "stream + full must only surface the active segment's updates",
+        );
+
+        let lineage_entries = inner.replay_entries_for_policy(HistoryPolicy::FullLineage);
+        let lineage_kinds: Vec<String> = lineage_entries
+            .iter()
+            .filter_map(|entry| {
+                let v: serde_json::Value = serde_json::from_slice(&entry.frame).ok()?;
+                v.get("params")?
+                    .get("update")?
+                    .get("kind")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            lineage_kinds,
+            vec!["seg1", "seg2"],
+            "stream + full_lineage must surface every segment's updates",
+        );
+    }
+
+    #[test]
+    fn segment_summary_populates_after_rotation() {
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+        inner.set_canonical_session_id_with_reason("acp-1", EndReason::SessionLoad);
+        inner.set_canonical_session_id_with_reason("acp-2", EndReason::SessionLoad);
+
+        let summaries: Vec<_> = inner.segments.iter().map(segment_summary).collect();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].id, SegmentId(1));
+        assert_eq!(summaries[0].end_reason, Some(EndReason::SessionLoad));
+        assert!(summaries[0].closed_at.is_some());
+        assert_eq!(summaries[1].id, SegmentId(2));
+        assert_eq!(summaries[1].acp_session_id.as_deref(), Some("acp-2"));
+        assert!(summaries[1].closed_at.is_none());
+    }
+
+    #[test]
+    fn rotate_segment_respects_emit_segment_frames_flag() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut inner = RoomInner::new(
+            "test-room".to_string(),
+            "/tmp".to_string(),
+            ReplayTurns::Unbounded,
+            false,
+            ClientToolPolicy::default(),
+            Arc::new(SessionListMetadataIndex::new()),
+            tx,
+            false, // emit_segment_frames OFF
+        );
+
+        inner.set_canonical_session_id_with_reason("sess-1", EndReason::SessionLoad);
+        inner.set_canonical_session_id_with_reason("sess-2", EndReason::SessionLoad);
+
+        // Internal state still rotates…
+        assert_eq!(inner.segments.len(), 2);
+        assert_eq!(inner.active_segment_id, Some(SegmentId(2)));
+
+        // …but no segment lifecycle frames hit the transcript.
+        let log = inner.replay_log.as_ref().unwrap();
+        let has_segment_method = log.iter().any(|e| {
+            let v: serde_json::Value = serde_json::from_slice(&e.frame).unwrap_or_default();
+            v.get("method")
+                .and_then(|m| m.as_str())
+                .map(|s| s.starts_with("amux/segment_"))
+                .unwrap_or(false)
+        });
+        assert!(
+            !has_segment_method,
+            "--emit-segment-frames=false must suppress lifecycle frames",
+        );
     }
 
     #[test]
@@ -2658,53 +3495,53 @@ mod tests {
 }
 
 #[derive(Debug, Clone)]
-pub struct SessionOptions {
+pub struct RoomOptions {
     pub replay_policy: ReplayTurns,
     pub session_ttl: Duration,
     pub meta_propagate: bool,
     pub client_tool_policy: ClientToolPolicy,
     pub session_list_index: Arc<SessionListMetadataIndex>,
     pub agent_cwd: String,
+    /// Whether to emit `amux/segment_started` / `amux/segment_ended`
+    /// lifecycle frames on rotation. Default true. Set false to preserve
+    /// byte-equivalence with v0.1.x clients during the rooms rollout.
+    pub emit_segment_frames: bool,
 }
 
-pub fn spawn_session(
+pub fn spawn_room(
     initial_subscriber: Subscriber,
     mut agent: AgentProcess,
-    session_id: String,
-    options: SessionOptions,
-) -> (SessionHandle, JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel::<SessionMsg>(SESSION_QUEUE_CAPACITY);
+    room_id: String,
+    options: RoomOptions,
+) -> (RoomHandle, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel::<RoomMsg>(SESSION_QUEUE_CAPACITY);
     let stdout_rx = agent
         .take_stdout_rx()
         .expect("AgentProcess::take_stdout_rx must succeed on a fresh process");
 
     let pump_tx = tx.clone();
-    let pump_session_id = session_id.clone();
+    let pump_room_id = room_id.clone();
     let pump = tokio::spawn(async move {
         let mut rx = stdout_rx;
         while let Some(line) = rx.recv().await {
-            if pump_tx
-                .send(SessionMsg::AgentStdoutLine(line))
-                .await
-                .is_err()
-            {
+            if pump_tx.send(RoomMsg::AgentStdoutLine(line)).await.is_err() {
                 return;
             }
         }
-        let _ = pump_tx.send(SessionMsg::AgentDied).await;
-        tracing::debug!(session = %pump_session_id, "stdout pump finished");
+        let _ = pump_tx.send(RoomMsg::AgentDied).await;
+        tracing::debug!(room = %pump_room_id, "stdout pump finished");
     });
 
-    let actor = tokio::spawn(run_session(
+    let actor = tokio::spawn(run_room(
         rx,
         tx.clone(),
         agent,
         initial_subscriber,
         pump,
-        session_id,
+        room_id,
         options,
     ));
-    (SessionHandle { tx }, actor)
+    (RoomHandle { tx }, actor)
 }
 
 /// Reason the session loop exited. Drives the teardown sequence — agent
@@ -2717,16 +3554,16 @@ enum ExitReason {
     ChannelClosed, // registry dropped tx; uncommon
 }
 
-async fn run_session(
-    mut rx: mpsc::Receiver<SessionMsg>,
-    self_tx: mpsc::Sender<SessionMsg>,
+async fn run_room(
+    mut rx: mpsc::Receiver<RoomMsg>,
+    self_tx: mpsc::Sender<RoomMsg>,
     mut agent: AgentProcess,
     initial_subscriber: Subscriber,
     pump: JoinHandle<()>,
     session_id: String,
-    options: SessionOptions,
+    options: RoomOptions,
 ) {
-    let mut inner = SessionInner::new(
+    let mut inner = RoomInner::new(
         session_id.clone(),
         options.agent_cwd.clone(),
         options.replay_policy,
@@ -2734,6 +3571,7 @@ async fn run_session(
         options.client_tool_policy,
         options.session_list_index.clone(),
         self_tx,
+        options.emit_segment_frames,
     );
     inner
         .attach(initial_subscriber)
@@ -2750,7 +3588,7 @@ async fn run_session(
             msg = rx.recv() => {
                 match msg {
                     None => Some(ExitReason::ChannelClosed),
-                    Some(SessionMsg::Attach { subscriber, ack }) => {
+                    Some(RoomMsg::Attach { subscriber, ack }) => {
                         let result = inner.attach(subscriber);
                         if result.is_ok() && ttl_sleep.take().is_some() {
                             tracing::info!(
@@ -2761,7 +3599,7 @@ async fn run_session(
                         let _ = ack.send(result);
                         None
                     }
-                    Some(SessionMsg::Detach { peer_id }) => {
+                    Some(RoomMsg::Detach { peer_id }) => {
                         let now_empty = inner.detach(&peer_id);
                         if now_empty {
                             tracing::info!(
@@ -2773,7 +3611,7 @@ async fn run_session(
                         }
                         None
                     }
-                    Some(SessionMsg::InboundFromSubscriber { peer_id, bytes }) => {
+                    Some(RoomMsg::InboundFromSubscriber { peer_id, bytes }) => {
                         if let Some(out) = inner.handle_inbound(&peer_id, bytes)
                             && let Err(err) = agent.send(&out).await
                         {
@@ -2786,7 +3624,7 @@ async fn run_session(
                         }
                         None
                     }
-                    Some(SessionMsg::AgentStdoutLine(line)) => {
+                    Some(RoomMsg::AgentStdoutLine(line)) => {
                         let action = inner.handle_agent_line(line);
                         for out in action.writes_to_agent {
                             if let Err(err) = agent.send(&out).await {
@@ -2804,14 +3642,14 @@ async fn run_session(
                             None
                         }
                     }
-                    Some(SessionMsg::AgentDied) => {
+                    Some(RoomMsg::AgentDied) => {
                         Some(ExitReason::AgentDied)
                     }
-                    Some(SessionMsg::AttachStreamBackfill(plan)) => {
+                    Some(RoomMsg::AttachStreamBackfill(plan)) => {
                         inner.send_attach_backfill_page(plan);
                         None
                     }
-                    Some(SessionMsg::Snapshot { ack }) => {
+                    Some(RoomMsg::Snapshot { ack }) => {
                         let snap = inner.build_snapshot(ttl_sleep.is_some());
                         let _ = ack.send(snap);
                         None

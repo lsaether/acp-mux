@@ -18,7 +18,7 @@ pub struct Cli {
     pub port: u16,
 
     /// Command (and args, whitespace-separated) used to spawn an agent
-    /// subprocess for each new `?session=`. Required to actually serve
+    /// subprocess for each new `?room=`. Required to actually serve
     /// sessions; absent values are caught at the first session attach.
     #[arg(long)]
     pub agent_cmd: Option<String>,
@@ -43,6 +43,20 @@ pub struct Cli {
     /// requests to every subscriber. May duplicate local side effects.
     #[arg(long, default_value_t = false)]
     pub unsafe_debug_client_tool_broadcast: bool,
+
+    /// Emit `amux/segment_started` and `amux/segment_ended` lifecycle frames
+    /// on segment rotation (session/load, hermes compaction). Default on;
+    /// pass `--emit-segment-frames=false` to keep wire output byte-equivalent
+    /// with v0.1.x for clients that haven't picked up the new frame methods
+    /// yet. Bare `--emit-segment-frames` is equivalent to `=true`.
+    #[arg(
+        long,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+    )]
+    pub emit_segment_frames: bool,
 
     /// Logging verbosity. Overridden by RUST_LOG when that variable is set.
     #[arg(long, value_enum, default_value_t = LogLevel::Info)]
@@ -236,6 +250,38 @@ mod tests {
             None,
             "v1 only classifies fs/* and terminal/* namespaces",
         );
+    }
+
+    #[test]
+    fn emit_segment_frames_defaults_on() {
+        let cli = Cli::try_parse_from(["amux"]).unwrap();
+        assert!(cli.emit_segment_frames);
+    }
+
+    #[test]
+    fn emit_segment_frames_can_be_disabled_with_explicit_false() {
+        let cli = Cli::try_parse_from(["amux", "--emit-segment-frames=false"]).unwrap();
+        assert!(!cli.emit_segment_frames);
+        let cli = Cli::try_parse_from(["amux", "--emit-segment-frames", "false"]).unwrap();
+        assert!(!cli.emit_segment_frames);
+    }
+
+    #[test]
+    fn emit_segment_frames_accepts_explicit_true() {
+        let cli = Cli::try_parse_from(["amux", "--emit-segment-frames=true"]).unwrap();
+        assert!(cli.emit_segment_frames);
+    }
+
+    #[test]
+    fn emit_segment_frames_bare_treated_as_true() {
+        let cli = Cli::try_parse_from(["amux", "--emit-segment-frames"]).unwrap();
+        assert!(cli.emit_segment_frames);
+    }
+
+    #[test]
+    fn emit_segment_frames_rejects_non_bool() {
+        let result = Cli::try_parse_from(["amux", "--emit-segment-frames=maybe"]);
+        assert!(result.is_err(), "non-bool values must be rejected");
     }
 
     #[test]
