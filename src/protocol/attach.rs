@@ -21,9 +21,13 @@ pub const ATTACH_ERR_UNSUPPORTED: i64 = -32003;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryPolicy {
-    /// Frames recorded in the current segment only. Preserves the
-    /// v0.1.x default — late joiners that haven't opted into lineage
-    /// see exactly today's behaviour.
+    /// Frames recorded in the current segment plus pre-segment
+    /// bootstrap. May also carry `amux/turn_started`,
+    /// `amux/turn_complete`, and `amux/turn_cancelled` frames from a
+    /// prior segment when their `amuxTurnId` brackets the active
+    /// segment — that keeps mid-rotation turns properly bracketed for
+    /// clients without leaking pre-rotation agent chunks. Preserves
+    /// the v0.1.x default for clients that haven't opted into lineage.
     #[default]
     Full,
     /// All segments' frames concatenated in `replaySeq` order.

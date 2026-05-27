@@ -143,8 +143,14 @@ explicit `session/load` handler → `SessionLoad`.
 `session/attach` accepts an extended `historyPolicy` enum:
 
 - `full` (default) — frames from the active segment only, plus any
-  pre-segment bootstrap frames tagged with `SegmentId(0)`. Preserves
-  v0.1.x semantics for clients that haven't opted in.
+  pre-segment bootstrap frames tagged with `SegmentId(0)`, plus any
+  `amux/turn_started` / `amux/turn_complete` / `amux/turn_cancelled`
+  bookend from a prior segment whose `amuxTurnId` brackets at least
+  one frame in the active segment or matches the currently active
+  turn. The lifecycle-frame carry exists so a hermes-compaction
+  rotation that splits a turn across segments doesn't leave clients
+  staring at an unmatched `turn_complete`. Agent chunks from prior
+  segments are still excluded — those belong to `full_lineage`.
 - `full_lineage` — every frame across every segment, in `replaySeq`
   order. The view a TUI wants when rendering history that strings
   along compaction.
