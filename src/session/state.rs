@@ -82,14 +82,11 @@ use crate::agent::process::AgentProcess;
 use crate::cli::{ClientToolMode, ClientToolPolicy, ReplayTurns};
 use crate::multiplex::subscriber::{OutMsg, Subscriber};
 use crate::protocol::amux::{self, AmuxTurnId};
-use crate::protocol::attach::{
-    self, AttachActiveTurn, AttachAmuxMeta, AttachMeta, AttachParams, AttachPendingPermission,
-    AttachQueueItem, AttachResult, AttachSnapshot, ConnectedClient, DetachParams, DetachResult,
-    HistoryDelivery, HistoryEntry, HistoryPolicy, ReplayOrder,
-};
+use crate::protocol::attach;
 use crate::protocol::jsonrpc::{
     Id, Incoming, IncomingRequest, IncomingResponse, JsonRpcError, JsonRpcVersion,
 };
+use crate::session::attach::AttachStreamBackfill;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionListAmuxMetadata {
@@ -181,10 +178,10 @@ const CANCEL_REQUEST_METHOD: &str = "$/cancel_request";
 const SESSION_CANCEL_METHOD: &str = "session/cancel";
 
 #[derive(Debug, Clone)]
-struct ReplayEntry {
-    frame: Bytes,
+pub(super) struct ReplayEntry {
+    pub(super) frame: Bytes,
     recorded_at: String,
-    seq: u64,
+    pub(super) seq: u64,
 }
 
 impl ReplayEntry {
@@ -196,7 +193,7 @@ impl ReplayEntry {
         }
     }
 
-    fn frame_for_replay(&self) -> Bytes {
+    pub(super) fn frame_for_replay(&self) -> Bytes {
         inject_replay_metadata(&self.frame, &self.recorded_at, self.seq)
     }
 }
@@ -463,18 +460,6 @@ fn replay_log_update_counts_by_acp_session_id(
     counts
 }
 
-#[derive(Debug)]
-pub struct AttachStreamBackfill {
-    peer_id: String,
-    session_id: String,
-    replay_order: ReplayOrder,
-    replay_generation: u64,
-    replay_boundary_seq: u64,
-    frame_count: usize,
-    segments: VecDeque<Vec<Bytes>>,
-    started: bool,
-}
-
 pub enum SessionMsg {
     Attach {
         subscriber: Subscriber,
@@ -570,8 +555,8 @@ enum HandshakeKind {
 }
 
 #[derive(Debug)]
-struct PendingRequest {
-    peer_id: String,
+pub(super) struct PendingRequest {
+    pub(super) peer_id: String,
     original_id: Id,
     handshake: Option<HandshakeKind>,
     decorate_session_list: bool,
@@ -590,19 +575,19 @@ enum AgentReqState {
 }
 
 #[derive(Debug, Clone)]
-enum QueuedPromptKind {
+pub(super) enum QueuedPromptKind {
     Prompt,
     Queue,
     HardSteer { supersedes_turn_id: AmuxTurnId },
 }
 
 #[derive(Debug, Clone)]
-struct QueuedPrompt {
-    queue_item_id: Option<String>,
-    peer_id: String,
+pub(super) struct QueuedPrompt {
+    pub(super) queue_item_id: Option<String>,
+    pub(super) peer_id: String,
     session_id: String,
     prompt_text: String,
-    kind: QueuedPromptKind,
+    pub(super) kind: QueuedPromptKind,
 }
 
 #[derive(Debug)]
@@ -673,14 +658,14 @@ fn build_hard_steer_prompt(
 }
 
 #[derive(Debug)]
-struct SessionInner {
-    session_id: String,
+pub(super) struct SessionInner {
+    pub(super) session_id: String,
     agent_cwd: String,
     session_list_index: Arc<SessionListMetadataIndex>,
     canonical_session_id: Option<String>,
-    subscribers: HashMap<String, Subscriber>,
+    pub(super) subscribers: HashMap<String, Subscriber>,
     next_mux_id: u64,
-    pending: HashMap<u64, PendingRequest>,
+    pub(super) pending: HashMap<u64, PendingRequest>,
     initialize_cache: Option<Value>,
     session_new_cache: Option<Value>,
     /// Last subscriber to issue a substantive (non-`initialize`) request.
@@ -689,10 +674,10 @@ struct SessionInner {
     driving_subscriber_peer_id: Option<String>,
     /// `mux_id` of the in-flight `session/prompt`, if any. While set, a
     /// second `session/prompt` is rejected locally with `-32001`.
-    active_turn_mux_id: Option<u64>,
+    pub(super) active_turn_mux_id: Option<u64>,
     /// `amuxTurnId` paired with the in-flight `session/prompt`. Used to
     /// bookend `amux/turn_started` and `amux/turn_complete`.
-    active_amux_turn_id: Option<AmuxTurnId>,
+    pub(super) active_amux_turn_id: Option<AmuxTurnId>,
     /// Upstream ACP `sessionId` paired with the in-flight `session/prompt`.
     /// Used to translate `amux/cancel_active_turn` into ACP-native
     /// `session/cancel`.
@@ -701,7 +686,7 @@ struct SessionInner {
     /// to inject the superseded prompt into the replacement prompt.
     active_turn_prompt_text: Option<String>,
     /// Mux-owned queue of future prompts to submit after active turns settle.
-    queued_prompts: VecDeque<QueuedPrompt>,
+    pub(super) queued_prompts: VecDeque<QueuedPrompt>,
     /// Monotonic per-session counter for queue ids.
     next_queue_item_id: u64,
     /// Monotonic per-session counter for `amuxTurnId` allocation.
@@ -710,18 +695,18 @@ struct SessionInner {
     /// Otherwise, every broadcast-tier frame (amux/* + agent notifications)
     /// is appended with mux-recorded provenance; new subscribers receive a
     /// metadata-augmented snapshot at attach time.
-    replay_log: Option<VecDeque<ReplayEntry>>,
+    pub(super) replay_log: Option<VecDeque<ReplayEntry>>,
     /// Monotonic per-session counter for replay provenance metadata.
     next_replay_seq: u64,
     /// Incremented whenever a successful `session/load` establishes a new
     /// canonical upstream ACP session and the replay log is segmented.
-    replay_generation: u64,
+    pub(super) replay_generation: u64,
     /// Last successful replay segmentation event, exposed through
     /// `/debug/sessions` for operator diagnostics.
     last_replay_reset: Option<ReplayResetSnapshot>,
     /// Sender back into this actor. Used to pace attach-stream backfill
     /// pages through the same serialized queue as live traffic.
-    self_tx: mpsc::Sender<SessionMsg>,
+    pub(super) self_tx: mpsc::Sender<SessionMsg>,
     /// Opt-in propagation of mux-owned trace metadata into outbound
     /// subscriber → agent requests under `params._meta.amux`.
     meta_propagate: bool,
@@ -738,7 +723,7 @@ struct SessionInner {
     /// `session/request_permission` requests. RFD #533 requires these to be
     /// re-issued to clients that attach after the first broadcast so the
     /// permission remains actionable, not just visible in history.
-    pending_permission_frames: Vec<(Id, Bytes)>,
+    pub(super) pending_permission_frames: Vec<(Id, Bytes)>,
 }
 
 impl SessionInner {
@@ -833,7 +818,7 @@ impl SessionInner {
         }
     }
 
-    fn acp_session_id(&self) -> Option<&str> {
+    pub(super) fn acp_session_id(&self) -> Option<&str> {
         self.canonical_session_id.as_deref().or_else(|| {
             self.session_new_cache
                 .as_ref()
@@ -2257,7 +2242,13 @@ impl SessionInner {
         }
     }
 
-    fn send_error_response(&self, peer_id: &str, original_id: Id, code: i64, message: &str) {
+    pub(super) fn send_error_response(
+        &self,
+        peer_id: &str,
+        original_id: Id,
+        code: i64,
+        message: &str,
+    ) {
         let resp = IncomingResponse {
             jsonrpc: JsonRpcVersion,
             id: original_id,
@@ -2282,7 +2273,7 @@ impl SessionInner {
         }
     }
 
-    fn send_result_response(&self, peer_id: &str, original_id: Id, result: Value) {
+    pub(super) fn send_result_response(&self, peer_id: &str, original_id: Id, result: Value) {
         let resp = IncomingResponse {
             jsonrpc: JsonRpcVersion,
             id: original_id,
@@ -2321,580 +2312,6 @@ impl SessionInner {
             && sub.outbound.send(OutMsg::Frame(bytes)).is_err()
         {
             tracing::debug!(%peer_id, "subscriber dropped before cached response delivered");
-        }
-    }
-
-    fn handle_attach(&mut self, peer_id: &str, req: IncomingRequest) {
-        let params: AttachParams = req
-            .params
-            .as_ref()
-            .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
-            .unwrap_or_default();
-
-        let requested_policy = params.history_policy.unwrap_or_default();
-        let requested_replay_order = params
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.amux.as_ref())
-            .and_then(|amux| amux.replay_order)
-            .unwrap_or_default();
-        let requested_history_delivery = params
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.amux.as_ref())
-            .and_then(|amux| amux.history_delivery)
-            .unwrap_or_default();
-        let effective_policy = match requested_policy {
-            HistoryPolicy::AfterMessage => {
-                tracing::debug!(
-                    session = %self.session_id,
-                    %peer_id,
-                    after_message_id = ?params.after_message_id,
-                    "session/attach after_message requested; falling back to full until ACP message IDs are available end-to-end",
-                );
-                HistoryPolicy::Full
-            }
-            other => other,
-        };
-
-        let resolved_session_id = self
-            .acp_session_id()
-            .map(str::to_string)
-            .unwrap_or_else(|| self.session_id.clone());
-        if let Some(requested) = params.session_id.as_deref()
-            && !requested.is_empty()
-            && requested != resolved_session_id
-            && requested != self.session_id
-        {
-            self.send_error_response(
-                peer_id,
-                req.id,
-                attach::ATTACH_ERR_NOT_FOUND,
-                "session not found",
-            );
-            return;
-        }
-
-        let connected_clients: Vec<ConnectedClient> = self
-            .subscribers
-            .values()
-            .map(|s| ConnectedClient {
-                client_id: s.peer_id.clone(),
-                name: s.peer_name.clone(),
-            })
-            .collect();
-        let applied_history_delivery = match (effective_policy, requested_history_delivery) {
-            (HistoryPolicy::Full, HistoryDelivery::Stream) => HistoryDelivery::Stream,
-            _ => HistoryDelivery::Response,
-        };
-        let stream_entries: Vec<ReplayEntry> =
-            if applied_history_delivery == HistoryDelivery::Stream {
-                self.replay_log
-                    .as_ref()
-                    .map(|log| log.iter().cloned().collect())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-        let replay_boundary_seq = stream_entries.last().map(|entry| entry.seq).unwrap_or(0);
-        let snapshot = if applied_history_delivery == HistoryDelivery::Stream {
-            Some(self.attach_snapshot(peer_id, connected_clients.clone(), replay_boundary_seq))
-        } else {
-            None
-        };
-        let history = if applied_history_delivery == HistoryDelivery::Stream {
-            None
-        } else {
-            match effective_policy {
-                HistoryPolicy::None => None,
-                HistoryPolicy::Full => Some(Self::apply_history_replay_order(
-                    self.history_full(),
-                    requested_replay_order,
-                )),
-                HistoryPolicy::PendingOnly => Some(Self::apply_history_replay_order(
-                    self.history_pending_only(),
-                    requested_replay_order,
-                )),
-                HistoryPolicy::AfterMessage => unreachable!("normalized above"),
-            }
-        };
-        let result = AttachResult {
-            session_id: resolved_session_id,
-            client_id: params.client_id.unwrap_or_else(|| peer_id.to_string()),
-            history_policy: effective_policy,
-            history,
-            meta: AttachMeta {
-                amux: AttachAmuxMeta {
-                    connected_clients,
-                    applied_replay_order: requested_replay_order,
-                    applied_history_delivery,
-                    snapshot,
-                },
-            },
-        };
-        let result = match serde_json::to_value(result) {
-            Ok(v) => v,
-            Err(err) => {
-                tracing::error!(error = %err, "failed to serialize session/attach result");
-                self.send_error_response(
-                    peer_id,
-                    req.id,
-                    attach::ATTACH_ERR_UNSUPPORTED,
-                    "session/attach serialization failed",
-                );
-                return;
-            }
-        };
-        self.send_result_response(peer_id, req.id, result);
-        if applied_history_delivery == HistoryDelivery::Stream {
-            let pending_permission_frames = self
-                .pending_permission_frames
-                .iter()
-                .map(|(_, frame)| frame.clone())
-                .collect();
-            self.stream_attach_history(
-                peer_id,
-                stream_entries,
-                requested_replay_order,
-                replay_boundary_seq,
-                pending_permission_frames,
-            );
-        } else {
-            self.reissue_pending_permissions(peer_id);
-        }
-    }
-
-    fn attach_snapshot(
-        &self,
-        peer_id: &str,
-        connected_clients: Vec<ConnectedClient>,
-        replay_boundary_seq: u64,
-    ) -> AttachSnapshot {
-        let self_peer = connected_clients
-            .iter()
-            .find(|client| client.client_id == peer_id)
-            .cloned()
-            .unwrap_or_else(|| ConnectedClient {
-                client_id: peer_id.to_string(),
-                name: self
-                    .subscribers
-                    .get(peer_id)
-                    .and_then(|s| s.peer_name.clone()),
-            });
-        let active_turn = self.active_amux_turn_id.and_then(|amux_turn_id| {
-            self.active_turn_mux_id
-                .and_then(|mux_id| self.pending.get(&mux_id))
-                .map(|pending| AttachActiveTurn {
-                    amux_turn_id: amux_turn_id.formatted(),
-                    peer_id: pending.peer_id.clone(),
-                })
-        });
-        let queue = self
-            .queued_prompts
-            .iter()
-            .map(|item| AttachQueueItem {
-                queue_item_id: item.queue_item_id.clone(),
-                peer_id: item.peer_id.clone(),
-                kind: match &item.kind {
-                    QueuedPromptKind::Prompt => "prompt",
-                    QueuedPromptKind::Queue => "queue",
-                    QueuedPromptKind::HardSteer { .. } => "hard_steer",
-                }
-                .to_string(),
-                status: "queued",
-            })
-            .collect();
-        AttachSnapshot {
-            connected_clients,
-            self_peer,
-            active_turn,
-            queue,
-            pending_permissions: self.pending_permission_summaries(),
-            replay_boundary_seq,
-            replay_generation: self.replay_generation,
-        }
-    }
-
-    fn pending_permission_summaries(&self) -> Vec<AttachPendingPermission> {
-        self.pending_permission_frames
-            .iter()
-            .map(|(id, frame)| {
-                let value: Value = serde_json::from_slice(frame).unwrap_or(Value::Null);
-                let params = value.get("params");
-                let tool_call = params.and_then(|p| p.get("toolCall"));
-                AttachPendingPermission {
-                    request_id: serde_json::to_value(id).unwrap_or(Value::Null),
-                    tool_name: tool_call
-                        .and_then(|t| {
-                            t.get("title")
-                                .or_else(|| t.get("toolName"))
-                                .or_else(|| t.get("name"))
-                        })
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    summary: tool_call
-                        .and_then(|t| t.get("title"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                }
-            })
-            .collect()
-    }
-
-    fn stream_attach_history(
-        &self,
-        peer_id: &str,
-        entries: Vec<ReplayEntry>,
-        replay_order: ReplayOrder,
-        replay_boundary_seq: u64,
-        pending_permission_frames: Vec<Bytes>,
-    ) {
-        let Some(sub) = self.subscribers.get(peer_id) else {
-            return;
-        };
-        let outbound = sub.outbound.clone();
-        let session_id = self.session_id.clone();
-        let replay_generation = self.replay_generation;
-        let replay_order_wire = Self::replay_order_wire(replay_order);
-        let (latest_segment, backfill_segments) =
-            Self::streaming_replay_segments(entries, replay_order);
-
-        if !latest_segment.is_empty() {
-            let frame_count = latest_segment.len();
-            if outbound
-                .send(OutMsg::Frame(Bytes::from(amux::replay_started(
-                    &session_id,
-                    "latest_segment",
-                    replay_order_wire,
-                    replay_generation,
-                    replay_boundary_seq,
-                    frame_count,
-                ))))
-                .is_err()
-            {
-                return;
-            }
-            for entry in latest_segment {
-                if outbound
-                    .send(OutMsg::Frame(entry.frame_for_replay()))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            if outbound
-                .send(OutMsg::Frame(Bytes::from(amux::replay_complete(
-                    &session_id,
-                    "latest_segment",
-                    replay_order_wire,
-                    replay_generation,
-                    replay_boundary_seq,
-                    frame_count,
-                ))))
-                .is_err()
-            {
-                return;
-            }
-        }
-
-        for frame in pending_permission_frames {
-            if outbound.send(OutMsg::Frame(frame)).is_err() {
-                return;
-            }
-        }
-
-        if backfill_segments.is_empty() {
-            return;
-        }
-
-        let frame_count: usize = backfill_segments.iter().map(Vec::len).sum();
-        let plan = AttachStreamBackfill {
-            peer_id: peer_id.to_string(),
-            session_id,
-            replay_order,
-            replay_generation,
-            replay_boundary_seq,
-            frame_count,
-            segments: backfill_segments
-                .into_iter()
-                .map(|segment| {
-                    segment
-                        .into_iter()
-                        .map(|entry| entry.frame_for_replay())
-                        .collect()
-                })
-                .collect(),
-            started: false,
-        };
-        Self::schedule_attach_backfill(self.self_tx.clone(), plan, Duration::from_millis(25));
-    }
-
-    fn send_attach_backfill_page(&self, mut plan: AttachStreamBackfill) {
-        let Some(sub) = self.subscribers.get(&plan.peer_id) else {
-            return;
-        };
-        let replay_order_wire = Self::replay_order_wire(plan.replay_order);
-        if !plan.started {
-            if sub
-                .outbound
-                .send(OutMsg::Frame(Bytes::from(amux::replay_started(
-                    &plan.session_id,
-                    "backfill",
-                    replay_order_wire,
-                    plan.replay_generation,
-                    plan.replay_boundary_seq,
-                    plan.frame_count,
-                ))))
-                .is_err()
-            {
-                return;
-            }
-            plan.started = true;
-        }
-
-        if let Some(segment) = plan.segments.pop_front() {
-            for frame in segment {
-                if sub.outbound.send(OutMsg::Frame(frame)).is_err() {
-                    return;
-                }
-            }
-        }
-
-        if plan.segments.is_empty() {
-            let _ = sub
-                .outbound
-                .send(OutMsg::Frame(Bytes::from(amux::replay_complete(
-                    &plan.session_id,
-                    "backfill",
-                    replay_order_wire,
-                    plan.replay_generation,
-                    plan.replay_boundary_seq,
-                    plan.frame_count,
-                ))));
-        } else {
-            Self::schedule_attach_backfill(self.self_tx.clone(), plan, Duration::from_millis(1));
-        }
-    }
-
-    fn schedule_attach_backfill(
-        tx: mpsc::Sender<SessionMsg>,
-        plan: AttachStreamBackfill,
-        delay: Duration,
-    ) {
-        tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            let _ = tx.send(SessionMsg::AttachStreamBackfill(plan)).await;
-        });
-    }
-
-    fn streaming_replay_segments(
-        entries: Vec<ReplayEntry>,
-        replay_order: ReplayOrder,
-    ) -> (Vec<ReplayEntry>, Vec<Vec<ReplayEntry>>) {
-        let mut ambient = Vec::new();
-        let mut turns: Vec<Vec<ReplayEntry>> = Vec::new();
-        let mut current_turn: Option<Vec<ReplayEntry>> = None;
-
-        for entry in entries {
-            match Self::replay_entry_method(&entry).as_deref() {
-                Some("amux/turn_started") => {
-                    if let Some(turn) = current_turn.take()
-                        && !turn.is_empty()
-                    {
-                        turns.push(turn);
-                    }
-                    current_turn = Some(vec![entry]);
-                }
-                Some("amux/turn_complete") => {
-                    if let Some(mut turn) = current_turn.take() {
-                        turn.push(entry);
-                        turns.push(turn);
-                    } else {
-                        ambient.push(entry);
-                    }
-                }
-                _ => {
-                    if let Some(turn) = current_turn.as_mut() {
-                        turn.push(entry);
-                    } else {
-                        ambient.push(entry);
-                    }
-                }
-            }
-        }
-
-        if let Some(turn) = current_turn
-            && !turn.is_empty()
-        {
-            turns.push(turn);
-        }
-
-        match replay_order {
-            ReplayOrder::Chronological => {
-                let mut backfill_segments = Vec::new();
-                if !ambient.is_empty() {
-                    backfill_segments.push(ambient);
-                }
-                backfill_segments.extend(turns);
-                (Vec::new(), backfill_segments)
-            }
-            ReplayOrder::NewestTurnFirst => {
-                let latest_segment = turns.pop().unwrap_or_default();
-                let mut backfill_segments: Vec<Vec<ReplayEntry>> =
-                    turns.into_iter().rev().collect();
-                if !ambient.is_empty() {
-                    backfill_segments.push(ambient);
-                }
-                (latest_segment, backfill_segments)
-            }
-        }
-    }
-
-    fn replay_entry_method(entry: &ReplayEntry) -> Option<String> {
-        let value: Value = serde_json::from_slice(&entry.frame).ok()?;
-        value.get("method")?.as_str().map(str::to_string)
-    }
-
-    fn replay_order_wire(replay_order: ReplayOrder) -> &'static str {
-        match replay_order {
-            ReplayOrder::Chronological => "chronological",
-            ReplayOrder::NewestTurnFirst => "newest_turn_first",
-        }
-    }
-
-    fn history_full(&self) -> Vec<HistoryEntry> {
-        let Some(log) = self.replay_log.as_ref() else {
-            return Vec::new();
-        };
-        log.iter()
-            .filter_map(|entry| Self::history_entry_from_frame(&entry.frame_for_replay()))
-            .collect()
-    }
-
-    fn history_pending_only(&self) -> Vec<HistoryEntry> {
-        self.pending_permission_frames
-            .iter()
-            .filter_map(|(_, frame)| Self::history_entry_from_frame(frame))
-            .collect()
-    }
-
-    fn apply_history_replay_order(
-        history: Vec<HistoryEntry>,
-        replay_order: ReplayOrder,
-    ) -> Vec<HistoryEntry> {
-        match replay_order {
-            ReplayOrder::Chronological => history,
-            ReplayOrder::NewestTurnFirst => Self::newest_turn_first_history(history),
-        }
-    }
-
-    fn newest_turn_first_history(history: Vec<HistoryEntry>) -> Vec<HistoryEntry> {
-        let mut ambient = Vec::new();
-        let mut turns: Vec<Vec<HistoryEntry>> = Vec::new();
-        let mut current_turn: Option<Vec<HistoryEntry>> = None;
-
-        for entry in history {
-            match entry.method.as_str() {
-                "amux/turn_started" => {
-                    if let Some(turn) = current_turn.take()
-                        && !turn.is_empty()
-                    {
-                        turns.push(turn);
-                    }
-                    current_turn = Some(vec![entry]);
-                }
-                "amux/turn_complete" => {
-                    if let Some(mut turn) = current_turn.take() {
-                        turn.push(entry);
-                        turns.push(turn);
-                    } else {
-                        ambient.push(entry);
-                    }
-                }
-                _ => {
-                    if let Some(turn) = current_turn.as_mut() {
-                        turn.push(entry);
-                    } else {
-                        ambient.push(entry);
-                    }
-                }
-            }
-        }
-
-        if let Some(turn) = current_turn
-            && !turn.is_empty()
-        {
-            turns.push(turn);
-        }
-
-        ambient.extend(turns.into_iter().rev().flatten());
-        ambient
-    }
-
-    fn history_entry_from_frame(frame: &Bytes) -> Option<HistoryEntry> {
-        let value: Value = serde_json::from_slice(frame).ok()?;
-        let method = value.get("method")?.as_str()?.to_string();
-        let params = value.get("params").cloned().unwrap_or(Value::Null);
-        Some(HistoryEntry { method, params })
-    }
-
-    fn reissue_pending_permissions(&self, peer_id: &str) {
-        if self.pending_permission_frames.is_empty() {
-            return;
-        }
-        let Some(sub) = self.subscribers.get(peer_id) else {
-            return;
-        };
-        for (_, frame) in &self.pending_permission_frames {
-            if sub.outbound.send(OutMsg::Frame(frame.clone())).is_err() {
-                tracing::debug!(%peer_id, "subscriber dropped during pending permission re-issue");
-                return;
-            }
-        }
-    }
-
-    fn handle_detach(&mut self, peer_id: &str, req: IncomingRequest) {
-        let params: DetachParams = req
-            .params
-            .as_ref()
-            .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
-            .unwrap_or_default();
-        let resolved_session_id = self
-            .acp_session_id()
-            .map(str::to_string)
-            .unwrap_or_else(|| self.session_id.clone());
-        if let Some(requested) = params.session_id.as_deref()
-            && !requested.is_empty()
-            && requested != resolved_session_id
-            && requested != self.session_id
-        {
-            self.send_error_response(
-                peer_id,
-                req.id,
-                attach::ATTACH_ERR_NOT_FOUND,
-                "session not found",
-            );
-            return;
-        }
-        let result = DetachResult {
-            session_id: resolved_session_id,
-            status: "detached",
-        };
-        let Ok(result) = serde_json::to_value(result) else {
-            self.send_error_response(
-                peer_id,
-                req.id,
-                attach::ATTACH_ERR_UNSUPPORTED,
-                "session/detach serialization failed",
-            );
-            return;
-        };
-        self.send_result_response(peer_id, req.id, result);
-        if let Some(sub) = self.subscribers.get(peer_id) {
-            let _ = sub.outbound.send(OutMsg::Close {
-                code: 1000,
-                reason: "client requested detach".to_string(),
-            });
         }
     }
 
