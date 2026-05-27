@@ -86,7 +86,7 @@ use crate::protocol::attach;
 use crate::protocol::jsonrpc::{
     Id, Incoming, IncomingRequest, IncomingResponse, JsonRpcError, JsonRpcVersion,
 };
-use crate::session::attach::AttachStreamBackfill;
+pub use crate::session::attach::AttachStreamBackfill;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionListAmuxMetadata {
