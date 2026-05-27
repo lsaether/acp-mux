@@ -83,8 +83,9 @@ use crate::cli::{ClientToolMode, ClientToolPolicy, ReplayTurns};
 use crate::multiplex::subscriber::{OutMsg, Subscriber};
 use crate::protocol::amux::{self, AmuxTurnId};
 use crate::protocol::attach::{
-    self, AttachAmuxMeta, AttachMeta, AttachParams, AttachResult, ConnectedClient, DetachParams,
-    DetachResult, HistoryEntry, HistoryPolicy, ReplayOrder,
+    self, AttachActiveTurn, AttachAmuxMeta, AttachMeta, AttachParams, AttachPendingPermission,
+    AttachQueueItem, AttachResult, AttachSnapshot, ConnectedClient, DetachParams, DetachResult,
+    HistoryDelivery, HistoryEntry, HistoryPolicy, ReplayOrder,
 };
 use crate::protocol::jsonrpc::{
     Id, Incoming, IncomingRequest, IncomingResponse, JsonRpcError, JsonRpcVersion,
@@ -462,6 +463,18 @@ fn replay_log_update_counts_by_acp_session_id(
     counts
 }
 
+#[derive(Debug)]
+pub struct AttachStreamBackfill {
+    peer_id: String,
+    session_id: String,
+    replay_order: ReplayOrder,
+    replay_generation: u64,
+    replay_boundary_seq: u64,
+    frame_count: usize,
+    segments: VecDeque<Vec<Bytes>>,
+    started: bool,
+}
+
 pub enum SessionMsg {
     Attach {
         subscriber: Subscriber,
@@ -476,6 +489,7 @@ pub enum SessionMsg {
     },
     AgentStdoutLine(Vec<u8>),
     AgentDied,
+    AttachStreamBackfill(AttachStreamBackfill),
     /// Build a JSON snapshot of session state for `/debug/sessions`.
     Snapshot {
         ack: oneshot::Sender<SessionSnapshot>,
@@ -705,6 +719,9 @@ struct SessionInner {
     /// Last successful replay segmentation event, exposed through
     /// `/debug/sessions` for operator diagnostics.
     last_replay_reset: Option<ReplayResetSnapshot>,
+    /// Sender back into this actor. Used to pace attach-stream backfill
+    /// pages through the same serialized queue as live traffic.
+    self_tx: mpsc::Sender<SessionMsg>,
     /// Opt-in propagation of mux-owned trace metadata into outbound
     /// subscriber → agent requests under `params._meta.amux`.
     meta_propagate: bool,
@@ -732,6 +749,7 @@ impl SessionInner {
         meta_propagate: bool,
         client_tool_policy: ClientToolPolicy,
         session_list_index: Arc<SessionListMetadataIndex>,
+        self_tx: mpsc::Sender<SessionMsg>,
     ) -> Self {
         let replay_log = match replay_policy {
             ReplayTurns::Disabled => None,
@@ -766,6 +784,7 @@ impl SessionInner {
             next_replay_seq: 1,
             replay_generation: 0,
             last_replay_reset: None,
+            self_tx,
             meta_propagate,
             client_tool_policy,
             agent_pending: HashMap::new(),
@@ -2319,6 +2338,12 @@ impl SessionInner {
             .and_then(|meta| meta.amux.as_ref())
             .and_then(|amux| amux.replay_order)
             .unwrap_or_default();
+        let requested_history_delivery = params
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.amux.as_ref())
+            .and_then(|amux| amux.history_delivery)
+            .unwrap_or_default();
         let effective_policy = match requested_policy {
             HistoryPolicy::AfterMessage => {
                 tracing::debug!(
@@ -2350,7 +2375,7 @@ impl SessionInner {
             return;
         }
 
-        let connected_clients = self
+        let connected_clients: Vec<ConnectedClient> = self
             .subscribers
             .values()
             .map(|s| ConnectedClient {
@@ -2358,17 +2383,40 @@ impl SessionInner {
                 name: s.peer_name.clone(),
             })
             .collect();
-        let history = match effective_policy {
-            HistoryPolicy::None => None,
-            HistoryPolicy::Full => Some(Self::apply_history_replay_order(
-                self.history_full(),
-                requested_replay_order,
-            )),
-            HistoryPolicy::PendingOnly => Some(Self::apply_history_replay_order(
-                self.history_pending_only(),
-                requested_replay_order,
-            )),
-            HistoryPolicy::AfterMessage => unreachable!("normalized above"),
+        let applied_history_delivery = match (effective_policy, requested_history_delivery) {
+            (HistoryPolicy::Full, HistoryDelivery::Stream) => HistoryDelivery::Stream,
+            _ => HistoryDelivery::Response,
+        };
+        let stream_entries: Vec<ReplayEntry> =
+            if applied_history_delivery == HistoryDelivery::Stream {
+                self.replay_log
+                    .as_ref()
+                    .map(|log| log.iter().cloned().collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+        let replay_boundary_seq = stream_entries.last().map(|entry| entry.seq).unwrap_or(0);
+        let snapshot = if applied_history_delivery == HistoryDelivery::Stream {
+            Some(self.attach_snapshot(peer_id, connected_clients.clone(), replay_boundary_seq))
+        } else {
+            None
+        };
+        let history = if applied_history_delivery == HistoryDelivery::Stream {
+            None
+        } else {
+            match effective_policy {
+                HistoryPolicy::None => None,
+                HistoryPolicy::Full => Some(Self::apply_history_replay_order(
+                    self.history_full(),
+                    requested_replay_order,
+                )),
+                HistoryPolicy::PendingOnly => Some(Self::apply_history_replay_order(
+                    self.history_pending_only(),
+                    requested_replay_order,
+                )),
+                HistoryPolicy::AfterMessage => unreachable!("normalized above"),
+            }
         };
         let result = AttachResult {
             session_id: resolved_session_id,
@@ -2379,6 +2427,8 @@ impl SessionInner {
                 amux: AttachAmuxMeta {
                     connected_clients,
                     applied_replay_order: requested_replay_order,
+                    applied_history_delivery,
+                    snapshot,
                 },
             },
         };
@@ -2396,7 +2446,320 @@ impl SessionInner {
             }
         };
         self.send_result_response(peer_id, req.id, result);
-        self.reissue_pending_permissions(peer_id);
+        if applied_history_delivery == HistoryDelivery::Stream {
+            let pending_permission_frames = self
+                .pending_permission_frames
+                .iter()
+                .map(|(_, frame)| frame.clone())
+                .collect();
+            self.stream_attach_history(
+                peer_id,
+                stream_entries,
+                requested_replay_order,
+                replay_boundary_seq,
+                pending_permission_frames,
+            );
+        } else {
+            self.reissue_pending_permissions(peer_id);
+        }
+    }
+
+    fn attach_snapshot(
+        &self,
+        peer_id: &str,
+        connected_clients: Vec<ConnectedClient>,
+        replay_boundary_seq: u64,
+    ) -> AttachSnapshot {
+        let self_peer = connected_clients
+            .iter()
+            .find(|client| client.client_id == peer_id)
+            .cloned()
+            .unwrap_or_else(|| ConnectedClient {
+                client_id: peer_id.to_string(),
+                name: self
+                    .subscribers
+                    .get(peer_id)
+                    .and_then(|s| s.peer_name.clone()),
+            });
+        let active_turn = self.active_amux_turn_id.and_then(|amux_turn_id| {
+            self.active_turn_mux_id
+                .and_then(|mux_id| self.pending.get(&mux_id))
+                .map(|pending| AttachActiveTurn {
+                    amux_turn_id: amux_turn_id.formatted(),
+                    peer_id: pending.peer_id.clone(),
+                })
+        });
+        let queue = self
+            .queued_prompts
+            .iter()
+            .map(|item| AttachQueueItem {
+                queue_item_id: item.queue_item_id.clone(),
+                peer_id: item.peer_id.clone(),
+                kind: match &item.kind {
+                    QueuedPromptKind::Prompt => "prompt",
+                    QueuedPromptKind::Queue => "queue",
+                    QueuedPromptKind::HardSteer { .. } => "hard_steer",
+                }
+                .to_string(),
+                status: "queued",
+            })
+            .collect();
+        AttachSnapshot {
+            connected_clients,
+            self_peer,
+            active_turn,
+            queue,
+            pending_permissions: self.pending_permission_summaries(),
+            replay_boundary_seq,
+            replay_generation: self.replay_generation,
+        }
+    }
+
+    fn pending_permission_summaries(&self) -> Vec<AttachPendingPermission> {
+        self.pending_permission_frames
+            .iter()
+            .map(|(id, frame)| {
+                let value: Value = serde_json::from_slice(frame).unwrap_or(Value::Null);
+                let params = value.get("params");
+                let tool_call = params.and_then(|p| p.get("toolCall"));
+                AttachPendingPermission {
+                    request_id: serde_json::to_value(id).unwrap_or(Value::Null),
+                    tool_name: tool_call
+                        .and_then(|t| {
+                            t.get("title")
+                                .or_else(|| t.get("toolName"))
+                                .or_else(|| t.get("name"))
+                        })
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    summary: tool_call
+                        .and_then(|t| t.get("title"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                }
+            })
+            .collect()
+    }
+
+    fn stream_attach_history(
+        &self,
+        peer_id: &str,
+        entries: Vec<ReplayEntry>,
+        replay_order: ReplayOrder,
+        replay_boundary_seq: u64,
+        pending_permission_frames: Vec<Bytes>,
+    ) {
+        let Some(sub) = self.subscribers.get(peer_id) else {
+            return;
+        };
+        let outbound = sub.outbound.clone();
+        let session_id = self.session_id.clone();
+        let replay_generation = self.replay_generation;
+        let replay_order_wire = Self::replay_order_wire(replay_order);
+        let (latest_segment, backfill_segments) =
+            Self::streaming_replay_segments(entries, replay_order);
+
+        if !latest_segment.is_empty() {
+            let frame_count = latest_segment.len();
+            if outbound
+                .send(OutMsg::Frame(Bytes::from(amux::replay_started(
+                    &session_id,
+                    "latest_segment",
+                    replay_order_wire,
+                    replay_generation,
+                    replay_boundary_seq,
+                    frame_count,
+                ))))
+                .is_err()
+            {
+                return;
+            }
+            for entry in latest_segment {
+                if outbound
+                    .send(OutMsg::Frame(entry.frame_for_replay()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if outbound
+                .send(OutMsg::Frame(Bytes::from(amux::replay_complete(
+                    &session_id,
+                    "latest_segment",
+                    replay_order_wire,
+                    replay_generation,
+                    replay_boundary_seq,
+                    frame_count,
+                ))))
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        for frame in pending_permission_frames {
+            if outbound.send(OutMsg::Frame(frame)).is_err() {
+                return;
+            }
+        }
+
+        if backfill_segments.is_empty() {
+            return;
+        }
+
+        let frame_count: usize = backfill_segments.iter().map(Vec::len).sum();
+        let plan = AttachStreamBackfill {
+            peer_id: peer_id.to_string(),
+            session_id,
+            replay_order,
+            replay_generation,
+            replay_boundary_seq,
+            frame_count,
+            segments: backfill_segments
+                .into_iter()
+                .map(|segment| {
+                    segment
+                        .into_iter()
+                        .map(|entry| entry.frame_for_replay())
+                        .collect()
+                })
+                .collect(),
+            started: false,
+        };
+        Self::schedule_attach_backfill(self.self_tx.clone(), plan, Duration::from_millis(25));
+    }
+
+    fn send_attach_backfill_page(&self, mut plan: AttachStreamBackfill) {
+        let Some(sub) = self.subscribers.get(&plan.peer_id) else {
+            return;
+        };
+        let replay_order_wire = Self::replay_order_wire(plan.replay_order);
+        if !plan.started {
+            if sub
+                .outbound
+                .send(OutMsg::Frame(Bytes::from(amux::replay_started(
+                    &plan.session_id,
+                    "backfill",
+                    replay_order_wire,
+                    plan.replay_generation,
+                    plan.replay_boundary_seq,
+                    plan.frame_count,
+                ))))
+                .is_err()
+            {
+                return;
+            }
+            plan.started = true;
+        }
+
+        if let Some(segment) = plan.segments.pop_front() {
+            for frame in segment {
+                if sub.outbound.send(OutMsg::Frame(frame)).is_err() {
+                    return;
+                }
+            }
+        }
+
+        if plan.segments.is_empty() {
+            let _ = sub
+                .outbound
+                .send(OutMsg::Frame(Bytes::from(amux::replay_complete(
+                    &plan.session_id,
+                    "backfill",
+                    replay_order_wire,
+                    plan.replay_generation,
+                    plan.replay_boundary_seq,
+                    plan.frame_count,
+                ))));
+        } else {
+            Self::schedule_attach_backfill(self.self_tx.clone(), plan, Duration::from_millis(1));
+        }
+    }
+
+    fn schedule_attach_backfill(
+        tx: mpsc::Sender<SessionMsg>,
+        plan: AttachStreamBackfill,
+        delay: Duration,
+    ) {
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = tx.send(SessionMsg::AttachStreamBackfill(plan)).await;
+        });
+    }
+
+    fn streaming_replay_segments(
+        entries: Vec<ReplayEntry>,
+        replay_order: ReplayOrder,
+    ) -> (Vec<ReplayEntry>, Vec<Vec<ReplayEntry>>) {
+        let mut ambient = Vec::new();
+        let mut turns: Vec<Vec<ReplayEntry>> = Vec::new();
+        let mut current_turn: Option<Vec<ReplayEntry>> = None;
+
+        for entry in entries {
+            match Self::replay_entry_method(&entry).as_deref() {
+                Some("amux/turn_started") => {
+                    if let Some(turn) = current_turn.take()
+                        && !turn.is_empty()
+                    {
+                        turns.push(turn);
+                    }
+                    current_turn = Some(vec![entry]);
+                }
+                Some("amux/turn_complete") => {
+                    if let Some(mut turn) = current_turn.take() {
+                        turn.push(entry);
+                        turns.push(turn);
+                    } else {
+                        ambient.push(entry);
+                    }
+                }
+                _ => {
+                    if let Some(turn) = current_turn.as_mut() {
+                        turn.push(entry);
+                    } else {
+                        ambient.push(entry);
+                    }
+                }
+            }
+        }
+
+        if let Some(turn) = current_turn
+            && !turn.is_empty()
+        {
+            turns.push(turn);
+        }
+
+        match replay_order {
+            ReplayOrder::Chronological => {
+                let mut backfill_segments = Vec::new();
+                if !ambient.is_empty() {
+                    backfill_segments.push(ambient);
+                }
+                backfill_segments.extend(turns);
+                (Vec::new(), backfill_segments)
+            }
+            ReplayOrder::NewestTurnFirst => {
+                let latest_segment = turns.pop().unwrap_or_default();
+                let mut backfill_segments: Vec<Vec<ReplayEntry>> =
+                    turns.into_iter().rev().collect();
+                if !ambient.is_empty() {
+                    backfill_segments.push(ambient);
+                }
+                (latest_segment, backfill_segments)
+            }
+        }
+    }
+
+    fn replay_entry_method(entry: &ReplayEntry) -> Option<String> {
+        let value: Value = serde_json::from_slice(&entry.frame).ok()?;
+        value.get("method")?.as_str().map(str::to_string)
+    }
+
+    fn replay_order_wire(replay_order: ReplayOrder) -> &'static str {
+        match replay_order {
+            ReplayOrder::Chronological => "chronological",
+            ReplayOrder::NewestTurnFirst => "newest_turn_first",
+        }
     }
 
     fn history_full(&self) -> Vec<HistoryEntry> {
@@ -2833,6 +3196,7 @@ mod tests {
     use super::*;
 
     fn test_inner() -> SessionInner {
+        let (tx, _rx) = mpsc::channel(1);
         SessionInner::new(
             "test-room".to_string(),
             "/tmp".to_string(),
@@ -2840,6 +3204,7 @@ mod tests {
             false,
             ClientToolPolicy::default(),
             Arc::new(SessionListMetadataIndex::new()),
+            tx,
         )
     }
 
@@ -2915,6 +3280,7 @@ pub fn spawn_session(
 
     let actor = tokio::spawn(run_session(
         rx,
+        tx.clone(),
         agent,
         initial_subscriber,
         pump,
@@ -2936,6 +3302,7 @@ enum ExitReason {
 
 async fn run_session(
     mut rx: mpsc::Receiver<SessionMsg>,
+    self_tx: mpsc::Sender<SessionMsg>,
     mut agent: AgentProcess,
     initial_subscriber: Subscriber,
     pump: JoinHandle<()>,
@@ -2949,6 +3316,7 @@ async fn run_session(
         options.meta_propagate,
         options.client_tool_policy,
         options.session_list_index.clone(),
+        self_tx,
     );
     inner
         .attach(initial_subscriber)
@@ -3021,6 +3389,10 @@ async fn run_session(
                     }
                     Some(SessionMsg::AgentDied) => {
                         Some(ExitReason::AgentDied)
+                    }
+                    Some(SessionMsg::AttachStreamBackfill(plan)) => {
+                        inner.send_attach_backfill_page(plan);
+                        None
                     }
                     Some(SessionMsg::Snapshot { ack }) => {
                         let snap = inner.build_snapshot(ttl_sleep.is_some());
