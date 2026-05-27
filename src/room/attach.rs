@@ -492,9 +492,7 @@ impl RoomInner {
         };
         let active = self.active_segment_id;
         log.iter()
-            .filter(|entry| {
-                entry.segment_id == PRE_SEGMENT_ID || Some(entry.segment_id) == active
-            })
+            .filter(|entry| entry.segment_id == PRE_SEGMENT_ID || Some(entry.segment_id) == active)
             .filter_map(|entry| Self::history_entry_from_frame(&entry.frame_for_replay()))
             .collect()
     }

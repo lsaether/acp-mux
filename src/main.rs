@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
 use amux::cli;
-use amux::server;
 use amux::room::registry::{AgentCmd, RoomRegistry};
+use amux::server;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;

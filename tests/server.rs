@@ -12,10 +12,10 @@
 use std::sync::Arc;
 
 use amux::cli::{ClientToolPolicy, ReplayTurns};
+use amux::room::registry::{AgentCmd, RoomRegistry};
 use amux::server::{
     AppState, CLOSE_CODE_BAD_QUERY, CLOSE_CODE_INTERNAL, CLOSE_CODE_PEER_CONFLICT, router,
 };
-use amux::room::registry::{AgentCmd, RoomRegistry};
 use futures::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -659,8 +659,7 @@ async fn rfd533_attach_streams_latest_segment_then_backfills_older_turns() {
 async fn rfd533_attach_stream_chronological_backfills_in_original_order() {
     let (addr, _) = spawn_server_with_mock().await;
     let url_a = format!("ws://{addr}/acp?room=stream52_chrono&peer_id=A&peer_name=Alice");
-    let url_b =
-        format!("ws://{addr}/acp?room=stream52_chrono&peer_id=B&peer_name=Bob&replay=skip");
+    let url_b = format!("ws://{addr}/acp?room=stream52_chrono&peer_id=B&peer_name=Bob&replay=skip");
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
     let _ = ws_request(

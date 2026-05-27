@@ -378,13 +378,7 @@ pub fn peer_joined(
 }
 
 pub fn peer_left(room_id: &str, peer_id: &str) -> Vec<u8> {
-    encode(
-        METHOD_PEER_LEFT,
-        PeerLeftParams {
-            room_id,
-            peer_id,
-        },
-    )
+    encode(METHOD_PEER_LEFT, PeerLeftParams { room_id, peer_id })
 }
 
 pub fn session_context(room_id: &str, cwd: &str) -> Vec<u8> {

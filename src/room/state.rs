@@ -218,7 +218,10 @@ fn parse_hermes_provenance(meta_hermes: &Value) -> HermesProvenance {
     };
     let mut prov = HermesProvenance::default();
     if let Some(Value::Object(sp)) = root.get("sessionProvenance") {
-        prov.acp_session_id = sp.get("acpSessionId").and_then(Value::as_str).map(str::to_string);
+        prov.acp_session_id = sp
+            .get("acpSessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         prov.hermes_session_id = sp
             .get("hermesSessionId")
             .and_then(Value::as_str)
@@ -231,9 +234,18 @@ fn parse_hermes_provenance(meta_hermes: &Value) -> HermesProvenance {
             .get("rootHermesSessionId")
             .and_then(Value::as_str)
             .map(str::to_string);
-        prov.session_kind = sp.get("sessionKind").and_then(Value::as_str).map(str::to_string);
-        prov.creator_kind = sp.get("creatorKind").and_then(Value::as_str).map(str::to_string);
-        prov.edge_kind = sp.get("edgeKind").and_then(Value::as_str).map(str::to_string);
+        prov.session_kind = sp
+            .get("sessionKind")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        prov.creator_kind = sp
+            .get("creatorKind")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        prov.edge_kind = sp
+            .get("edgeKind")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         prov.compression_depth = sp
             .get("compressionDepth")
             .and_then(Value::as_u64)
@@ -249,8 +261,14 @@ fn parse_hermes_provenance(meta_hermes: &Value) -> HermesProvenance {
             });
     }
     if let Some(Value::Object(c)) = root.get("compaction") {
-        prov.last_mode = c.get("lastMode").and_then(Value::as_str).map(str::to_string);
-        prov.last_reason = c.get("lastReason").and_then(Value::as_str).map(str::to_string);
+        prov.last_mode = c
+            .get("lastMode")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        prov.last_reason = c
+            .get("lastReason")
+            .and_then(Value::as_str)
+            .map(str::to_string);
     }
     prov
 }
@@ -876,6 +894,7 @@ pub(super) struct RoomInner {
 }
 
 impl RoomInner {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         room_id: String,
         agent_cwd: String,
@@ -939,11 +958,7 @@ impl RoomInner {
     /// changed, rotates the segment. `reason` is consumed only when an
     /// active segment is being closed — the first call that opens the
     /// initial segment ignores it.
-    fn set_canonical_session_id_with_reason(
-        &mut self,
-        acp_session_id: &str,
-        reason: EndReason,
-    ) {
+    fn set_canonical_session_id_with_reason(&mut self, acp_session_id: &str, reason: EndReason) {
         if self.canonical_session_id.as_deref() == Some(acp_session_id) {
             self.publish_session_list_metadata();
             return;
@@ -1021,11 +1036,11 @@ impl RoomInner {
         // canonical id observably moves. Skip when only the hermes side
         // rotated (ACP id stable), because the queued prompts already
         // point at the right ACP head.
-        if let Some(new_acp) = new_acp_session_id.as_deref() {
-            if previous_acp.as_deref() != Some(new_acp) {
-                for item in &mut self.queued_prompts {
-                    item.session_id = new_acp.to_string();
-                }
+        if let Some(new_acp) = new_acp_session_id.as_deref()
+            && previous_acp.as_deref() != Some(new_acp)
+        {
+            for item in &mut self.queued_prompts {
+                item.session_id = new_acp.to_string();
             }
         }
 
@@ -1038,13 +1053,7 @@ impl RoomInner {
         // active — current_segment_id() returns current_id, so the frame
         // is tagged with and lands inside the closing segment.
         if self.emit_segment_frames {
-            let frame = amux::segment_ended(
-                &self.room_id,
-                current_id,
-                &now,
-                reason,
-                Some(new_id),
-            );
+            let frame = amux::segment_ended(&self.room_id, current_id, &now, reason, Some(new_id));
             self.broadcast(frame);
         }
 
@@ -1659,13 +1668,8 @@ impl RoomInner {
                     continue;
                 }
             };
-            let frame = amux::agent_request_resolved(
-                &self.room_id,
-                &request_id_value,
-                reason,
-                None,
-                None,
-            );
+            let frame =
+                amux::agent_request_resolved(&self.room_id, &request_id_value, reason, None, None);
             self.broadcast(frame);
         }
     }
@@ -3155,11 +3159,9 @@ mod tests {
         // seg-2's opened_replay_seq, completing the bookend invariant.
         let started_entry = log
             .iter()
-            .filter(|e| e.segment_id == SegmentId(2))
-            .next()
+            .find(|e| e.segment_id == SegmentId(2))
             .expect("seg-2 must have at least one frame (segment_started)");
-        let v: serde_json::Value =
-            serde_json::from_slice(&started_entry.frame).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_slice(&started_entry.frame).unwrap_or_default();
         assert_eq!(
             v["method"].as_str(),
             Some("amux/segment_started"),
@@ -3168,7 +3170,10 @@ mod tests {
         assert_eq!(started_entry.seq, opened.opened_replay_seq);
     }
 
-    fn make_notification(method: &str, params: Value) -> crate::protocol::jsonrpc::IncomingNotification {
+    fn make_notification(
+        method: &str,
+        params: Value,
+    ) -> crate::protocol::jsonrpc::IncomingNotification {
         crate::protocol::jsonrpc::IncomingNotification {
             jsonrpc: crate::protocol::jsonrpc::JsonRpcVersion,
             method: method.to_string(),
@@ -3196,7 +3201,12 @@ mod tests {
         );
         inner.detect_segment_signal_from_agent_notification(&enrich);
         assert_eq!(
-            inner.active_segment().unwrap().provenance.hermes_session_id.as_deref(),
+            inner
+                .active_segment()
+                .unwrap()
+                .provenance
+                .hermes_session_id
+                .as_deref(),
             Some("hs-1"),
             "first metadata arrival enriches the active segment without rotating",
         );
@@ -3219,14 +3229,22 @@ mod tests {
         inner.detect_segment_signal_from_agent_notification(&compaction);
 
         assert_eq!(inner.segments.len(), 2, "compaction must open seg-2");
-        assert_eq!(inner.segments[0].end_reason, Some(EndReason::HermesCompression));
+        assert_eq!(
+            inner.segments[0].end_reason,
+            Some(EndReason::HermesCompression)
+        );
         assert_eq!(
             inner.active_segment().unwrap().acp_session_id.as_deref(),
             Some("acp-stable"),
             "ACP id stays stable across hermes compaction",
         );
         assert_eq!(
-            inner.active_segment().unwrap().provenance.hermes_session_id.as_deref(),
+            inner
+                .active_segment()
+                .unwrap()
+                .provenance
+                .hermes_session_id
+                .as_deref(),
             Some("hs-2"),
         );
     }
@@ -3241,7 +3259,10 @@ mod tests {
         inner.detect_segment_signal_from_agent_notification(&notif);
 
         assert_eq!(inner.segments.len(), 2, "ACP id change must rotate");
-        assert_eq!(inner.segments[0].end_reason, Some(EndReason::AcpSessionIdChanged));
+        assert_eq!(
+            inner.segments[0].end_reason,
+            Some(EndReason::AcpSessionIdChanged)
+        );
         assert_eq!(
             inner.active_segment().unwrap().acp_session_id.as_deref(),
             Some("acp-2"),
@@ -3293,7 +3314,10 @@ mod tests {
         assert_eq!(inner.segments.len(), 1, "enrichment must not rotate");
         let seg = inner.active_segment().unwrap();
         assert_eq!(seg.provenance.hermes_session_id.as_deref(), Some("hs-1"));
-        assert_eq!(seg.provenance.root_hermes_session_id.as_deref(), Some("hs-root"));
+        assert_eq!(
+            seg.provenance.root_hermes_session_id.as_deref(),
+            Some("hs-root")
+        );
         assert_eq!(seg.provenance.compression_depth, Some(3));
     }
 
@@ -3500,11 +3524,7 @@ pub fn spawn_room(
     let pump = tokio::spawn(async move {
         let mut rx = stdout_rx;
         while let Some(line) = rx.recv().await {
-            if pump_tx
-                .send(RoomMsg::AgentStdoutLine(line))
-                .await
-                .is_err()
-            {
+            if pump_tx.send(RoomMsg::AgentStdoutLine(line)).await.is_err() {
                 return;
             }
         }

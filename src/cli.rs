@@ -46,9 +46,15 @@ pub struct Cli {
 
     /// Emit `amux/segment_started` and `amux/segment_ended` lifecycle frames
     /// on segment rotation (session/load, hermes compaction). Default on;
-    /// disable to keep wire output byte-equivalent with v0.1.x for clients
-    /// that haven't picked up the new frame methods yet.
-    #[arg(long, default_value_t = true)]
+    /// pass `--emit-segment-frames=false` to keep wire output byte-equivalent
+    /// with v0.1.x for clients that haven't picked up the new frame methods
+    /// yet.
+    #[arg(
+        long,
+        action = clap::ArgAction::Set,
+        num_args = 1,
+        default_value_t = true,
+    )]
     pub emit_segment_frames: bool,
 
     /// Logging verbosity. Overridden by RUST_LOG when that variable is set.
@@ -243,6 +249,32 @@ mod tests {
             None,
             "v1 only classifies fs/* and terminal/* namespaces",
         );
+    }
+
+    #[test]
+    fn emit_segment_frames_defaults_on() {
+        let cli = Cli::try_parse_from(["amux"]).unwrap();
+        assert!(cli.emit_segment_frames);
+    }
+
+    #[test]
+    fn emit_segment_frames_can_be_disabled_with_explicit_false() {
+        let cli = Cli::try_parse_from(["amux", "--emit-segment-frames=false"]).unwrap();
+        assert!(!cli.emit_segment_frames);
+        let cli = Cli::try_parse_from(["amux", "--emit-segment-frames", "false"]).unwrap();
+        assert!(!cli.emit_segment_frames);
+    }
+
+    #[test]
+    fn emit_segment_frames_accepts_explicit_true() {
+        let cli = Cli::try_parse_from(["amux", "--emit-segment-frames=true"]).unwrap();
+        assert!(cli.emit_segment_frames);
+    }
+
+    #[test]
+    fn emit_segment_frames_rejects_non_bool() {
+        let result = Cli::try_parse_from(["amux", "--emit-segment-frames=maybe"]);
+        assert!(result.is_err(), "non-bool values must be rejected");
     }
 
     #[test]
