@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.1.3 — 2026-05-27
+
 ### Breaking
 
 - **`?room=` replaces `?session=`.** WebSocket attaches now key on
@@ -33,7 +35,7 @@
   `_meta.hermes.sessionProvenance.hermesSessionId` changes (compaction
   under a stable ACP id), and (c) bare ACP `sessionId` changes in agent
   notifications (heuristic fallback). See `docs/design/rooms.md` for
-  the full model and invariants.
+  the full model and invariants. Closes [#56](https://github.com/lsaether/acp-mux/issues/56) via [#58](https://github.com/lsaether/acp-mux/pull/58).
 - **Segment lifecycle frames.** `amux/segment_started` and
   `amux/segment_ended` mark rotation boundaries in both live broadcast
   and the replay log. Both flow through the standard `broadcast()` path
@@ -42,7 +44,9 @@
 - **`historyPolicy: full_lineage`.** `session/attach` accepts a new
   policy that returns every segment's frames in `replaySeq` order.
   `historyPolicy: full` continues to return current-segment-only
-  history (with pre-segment bootstrap frames included).
+  history (with pre-segment bootstrap frames included), plus any
+  `amux/turn_*` lifecycle bookend from a prior segment whose
+  `amuxTurnId` brackets the active segment.
 - **`_meta.hermes` recognition.** Provenance fields
   (`sessionProvenance`, `compaction`) are parsed from agent
   notifications and stored on the segment they describe. Late-arriving
@@ -55,8 +59,37 @@
   suppress `amux/segment_*` emission for clients that haven't picked up
   the new frame methods yet. Internal segment state still tracks
   rotation; only the wire is gated.
-
-- **Replay-safe agent request lifecycle openings.** Agent-initiated requests now emit inert `amux/agent_request_opened` notifications before the live raw request, preserving request context for late-join replay without replaying actionable ACP requests. Late joiners see `amux/agent_request_opened` followed by `amux/agent_request_resolved`; live subscribers still answer only the original `session/request_permission`. Fixes [#31](https://github.com/lsaether/acp-mux/issues/31).
+- **RFD #533-inspired `session/attach` / `session/detach`.** Proxy-local
+  methods answered by the mux instead of forwarded to the agent. Attach
+  callers receive `connectedClients`, an effective `historyPolicy`, and
+  shape-able replay history under `result._meta.amux`; detach returns a
+  clean acknowledgment before the WS closes. Lifecycle resolution stays
+  authoritative under `amux/*` — the mux still does not fabricate
+  proxy-owned `session/update` siblings. Closes [#5](https://github.com/lsaether/acp-mux/issues/5) via [#46](https://github.com/lsaether/acp-mux/pull/46).
+- **Attach-response replay ordering.** `params._meta.amux.replayOrder`
+  accepts `chronological` (default) or `newest_turn_first` for
+  `session/attach` history; the effective value is echoed back as
+  `result._meta.amux.appliedReplayOrder`. Closes [#44](https://github.com/lsaether/acp-mux/issues/44) via [#47](https://github.com/lsaether/acp-mux/pull/47).
+- **Streamed `session/attach` history.** Opt-in via
+  `params._meta.amux.historyDelivery: "stream"`: the attach response
+  carries snapshot metadata, then replay frames stream through
+  `amux/replay_started` / `amux/replay_complete` markers. Backfill is
+  paced through the session actor so live traffic interleaves cleanly.
+  Closes [#52](https://github.com/lsaether/acp-mux/issues/52) via [#53](https://github.com/lsaether/acp-mux/pull/53).
+- **`/acp?...&replay=skip`** suppresses the legacy WebSocket auto-replay
+  for attach-aware clients that want `session/attach.result.history` as
+  their single bootstrap source. Default WS replay behavior is
+  unchanged. Closes [#48](https://github.com/lsaether/acp-mux/issues/48) via [#50](https://github.com/lsaether/acp-mux/pull/50).
+- **`amux/session_context` attach notification.** Carries the mux/agent
+  cwd to newly attached subscribers and is exposed under
+  `/debug/sessions` for operator visibility. Closes [#13](https://github.com/lsaether/acp-mux/issues/13) via [#35](https://github.com/lsaether/acp-mux/pull/35).
+- **Replay-safe agent request lifecycle openings.** Agent-initiated
+  requests now emit inert `amux/agent_request_opened` notifications
+  before the live raw request, preserving request context for
+  late-join replay without replaying actionable ACP requests. Late
+  joiners see `amux/agent_request_opened` followed by
+  `amux/agent_request_resolved`; live subscribers still answer only
+  the original `session/request_permission`. Closes [#31](https://github.com/lsaether/acp-mux/issues/31) via [#33](https://github.com/lsaether/acp-mux/pull/33).
 
 ### Fixed
 
@@ -71,9 +104,26 @@
   bookends from prior segments when their `amuxTurnId` brackets the
   active segment or matches the currently active turn; non-lifecycle
   frames (agent chunks) from prior segments stay excluded — those
-  belong to `full_lineage`. Scoped subset of [#57](https://github.com/lsaether/acp-mux/issues/57).
-- **AMUX active-turn steer/queue controls.** `amux/steer_active_turn` and `amux/queue_prompt` are now the canonical control surface. Ordinary concurrent `session/prompt` requests—including text that starts with `/steer ...` or `/queue ...`—remain serialized and receive `-32001`. `amux/steer_active_turn` now performs mux-owned hard steer while a turn is active: it broadcasts `amux/control_submitted` and `amux/turn_cancelled`, sends ACP-native `session/cancel`, then starts a replacement turn with prompt-injected superseded-turn context. When idle, the same steer request submits immediately as the next prompt with `mode: "prompt"` and no cancellation or queue lifecycle. A second active hard steer is rejected while the first replacement is still pending. `amux/queue_prompt` now stores mux-owned queue/send state, caps pending public queue items at six (`-32003 "queue full"`), broadcasts/replays `amux/queue_item_*` lifecycle, submits immediately when idle, and submits queued prompts as real follow-up turns after active-turn settlement. Pending queue items survive owner disconnects without creating ghost drivers, emit orphan notifications, and can be removed with `amux/unqueue_prompt`. Fixes [#39](https://github.com/lsaether/acp-mux/issues/39); future native/soft steer is tracked separately in [#42](https://github.com/lsaether/acp-mux/issues/42).
-- **Active-turn cancellation for Hermes-backed sessions.** `amux/cancel_active_turn` now forwards ACP-native `session/cancel { sessionId }` for the active prompt while preserving the immediate `amux/turn_cancelled` intent broadcast and later `amux/turn_complete` settlement event. Fixes [#29](https://github.com/lsaether/acp-mux/issues/29).
+  belong to `full_lineage`. Scoped subset of [#57](https://github.com/lsaether/acp-mux/issues/57) via [#59](https://github.com/lsaether/acp-mux/pull/59).
+- **Block unsafe agent client-tool fanout.** Agent-initiated `fs/*` and
+  `terminal/*` requests are now blocked at the mux by default and
+  answered to the agent with structured JSON-RPC `-32000` instead of
+  being raw-broadcast to subscribers. Collaborative
+  `session/request_permission` fanout is preserved; the old raw fanout
+  remains available behind `--unsafe-debug-client-tool-broadcast` for
+  diagnostics only. `clientCapabilities.fs` / `.terminal` are stripped
+  from forwarded `initialize` requests. Fixes [#2](https://github.com/lsaether/acp-mux/issues/2) via [#36](https://github.com/lsaether/acp-mux/pull/36).
+- **AMUX active-turn steer/queue controls.** `amux/steer_active_turn` and `amux/queue_prompt` are now the canonical control surface. Ordinary concurrent `session/prompt` requests—including text that starts with `/steer ...` or `/queue ...`—remain serialized and receive `-32001`. `amux/steer_active_turn` now performs mux-owned hard steer while a turn is active: it broadcasts `amux/control_submitted` and `amux/turn_cancelled`, sends ACP-native `session/cancel`, then starts a replacement turn with prompt-injected superseded-turn context. When idle, the same steer request submits immediately as the next prompt with `mode: "prompt"` and no cancellation or queue lifecycle. A second active hard steer is rejected while the first replacement is still pending. `amux/queue_prompt` now stores mux-owned queue/send state, caps pending public queue items at six (`-32003 "queue full"`), broadcasts/replays `amux/queue_item_*` lifecycle, submits immediately when idle, and submits queued prompts as real follow-up turns after active-turn settlement. Pending queue items survive owner disconnects without creating ghost drivers, emit orphan notifications, and can be removed with `amux/unqueue_prompt`. Fixes [#39](https://github.com/lsaether/acp-mux/issues/39) via [#41](https://github.com/lsaether/acp-mux/pull/41); future native/soft steer is tracked separately in [#42](https://github.com/lsaether/acp-mux/issues/42).
+- **Active-turn cancellation for Hermes-backed sessions.** `amux/cancel_active_turn` now forwards ACP-native `session/cancel { sessionId }` for the active prompt while preserving the immediate `amux/turn_cancelled` intent broadcast and later `amux/turn_complete` settlement event. Fixes [#29](https://github.com/lsaether/acp-mux/issues/29) via [#30](https://github.com/lsaether/acp-mux/pull/30).
+- **Control-plane agent timeout.** Raised the transient `session/list`
+  agent-spawn timeout from 2s to 8s to accommodate Hermes/MCP startup
+  budgets. [#34](https://github.com/lsaether/acp-mux/pull/34).
+
+### Notes
+
+- Persistence (rooms surviving mux restart) is tracked in [#26](https://github.com/lsaether/acp-mux/issues/26); the natural seam is `RoomInner::{ replay_log, segments }` and is left explicit in the source for that follow-up.
+- The deprecated `?session=` alias is one-release-only; remove in v0.1.4.
+- Hermes remains the primary fully supported agent target.
 
 ## v0.1.2 — 2026-05-23
 
