@@ -25,6 +25,8 @@ const METHOD_QUEUE_ITEM_SUBMITTED: &str = "amux/queue_item_submitted";
 const METHOD_QUEUE_ITEM_COMPLETED: &str = "amux/queue_item_completed";
 const METHOD_QUEUE_ITEM_REMOVED: &str = "amux/queue_item_removed";
 const METHOD_QUEUE_ITEM_ORPHANED: &str = "amux/queue_item_orphaned";
+const METHOD_REPLAY_STARTED: &str = "amux/replay_started";
+const METHOD_REPLAY_COMPLETE: &str = "amux/replay_complete";
 
 /// Method name for the amux extension that lets any attached peer steer the
 /// current composer state. If a turn is in flight, current mux-owned semantics
@@ -255,6 +257,17 @@ struct QueueItemOrphanedParams<'a> {
     peer_id: &'a str,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplayMarkerParams<'a> {
+    session_id: &'a str,
+    phase: &'a str,
+    replay_order: &'a str,
+    generation: u64,
+    replay_boundary_seq: u64,
+    frame_count: usize,
+}
+
 fn encode<P: Serialize>(method: &'static str, params: P) -> Vec<u8> {
     serde_json::to_vec(&Frame {
         jsonrpc: "2.0",
@@ -462,6 +475,48 @@ pub fn queue_item_orphaned(session_id: &str, queue_item_id: &str, peer_id: &str)
             session_id,
             queue_item_id,
             peer_id,
+        },
+    )
+}
+
+pub fn replay_started(
+    session_id: &str,
+    phase: &str,
+    replay_order: &str,
+    generation: u64,
+    replay_boundary_seq: u64,
+    frame_count: usize,
+) -> Vec<u8> {
+    encode(
+        METHOD_REPLAY_STARTED,
+        ReplayMarkerParams {
+            session_id,
+            phase,
+            replay_order,
+            generation,
+            replay_boundary_seq,
+            frame_count,
+        },
+    )
+}
+
+pub fn replay_complete(
+    session_id: &str,
+    phase: &str,
+    replay_order: &str,
+    generation: u64,
+    replay_boundary_seq: u64,
+    frame_count: usize,
+) -> Vec<u8> {
+    encode(
+        METHOD_REPLAY_COMPLETE,
+        ReplayMarkerParams {
+            session_id,
+            phase,
+            replay_order,
+            generation,
+            replay_boundary_seq,
+            frame_count,
         },
     )
 }

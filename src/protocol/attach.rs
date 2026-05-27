@@ -36,6 +36,14 @@ pub enum ReplayOrder {
     NewestTurnFirst,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryDelivery {
+    #[default]
+    Response,
+    Stream,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachParams {
@@ -65,6 +73,8 @@ pub struct AttachParamsMeta {
 pub struct AttachParamsAmuxMeta {
     #[serde(default)]
     pub replay_order: Option<ReplayOrder>,
+    #[serde(default)]
+    pub history_delivery: Option<HistoryDelivery>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +108,9 @@ pub struct AttachMeta {
 pub struct AttachAmuxMeta {
     pub connected_clients: Vec<ConnectedClient>,
     pub applied_replay_order: ReplayOrder,
+    pub applied_history_delivery: HistoryDelivery,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<AttachSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,6 +119,46 @@ pub struct ConnectedClient {
     pub client_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachSnapshot {
+    pub connected_clients: Vec<ConnectedClient>,
+    pub self_peer: ConnectedClient,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_turn: Option<AttachActiveTurn>,
+    pub queue: Vec<AttachQueueItem>,
+    pub pending_permissions: Vec<AttachPendingPermission>,
+    pub replay_boundary_seq: u64,
+    pub replay_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachActiveTurn {
+    pub amux_turn_id: String,
+    pub peer_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachQueueItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_item_id: Option<String>,
+    pub peer_id: String,
+    pub kind: String,
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachPendingPermission {
+    pub request_id: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -118,7 +118,7 @@ async fn ws_invalid_session_closes_4400() {
 #[tokio::test]
 async fn ws_missing_peer_id_closes_4400() {
     let (addr, _) = spawn_server_with_cat().await;
-    let url = format!("ws://{addr}/acp?session=***");
+    let url = format!("ws://{addr}/acp?session=stream52");
     let (mut ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");
@@ -441,6 +441,11 @@ async fn rfd533_attach_full_history_can_be_returned_newest_turn_first_without_re
         attach["result"]["_meta"]["amux"]["appliedReplayOrder"],
         serde_json::json!("newest_turn_first")
     );
+    assert_eq!(
+        attach["result"]["_meta"]["amux"]["appliedHistoryDelivery"],
+        serde_json::json!("response"),
+        "newest_turn_first without historyDelivery=stream must keep Phase 1 response-body semantics"
+    );
     let history = attach["result"]["history"].as_array().unwrap();
     assert!(
         history.iter().all(|entry| {
@@ -491,6 +496,285 @@ async fn rfd533_attach_full_history_can_be_returned_newest_turn_first_without_re
     }
 
     let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn rfd533_attach_streams_latest_segment_then_backfills_older_turns() {
+    let (addr, _) = spawn_server_with_mock().await;
+    let url_a = format!("ws://{addr}/acp?session=stream52&peer_id=A&peer_name=Alice");
+    let url_b = format!("ws://{addr}/acp?session=stream52&peer_id=B&peer_name=Bob&replay=skip");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    for (id, text) in [(3, "first turn"), (4, "second turn"), (5, "third turn")] {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/prompt",
+            "params": {"sessionId": "sess-mock", "prompt": [{"type": "text", "text": text}]}
+        });
+        let _ = ws_request(&mut ws_a, &payload.to_string()).await;
+    }
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":10,"method":"initialize"}"#,
+    )
+    .await;
+    let attach = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":11,"method":"session/attach","params":{"sessionId":"sess-mock","historyPolicy":"full","clientId":"client-B","_meta":{"amux":{"replayOrder":"newest_turn_first","historyDelivery":"stream"}}}}"#,
+    )
+    .await;
+    assert_eq!(attach["result"]["historyPolicy"], serde_json::json!("full"));
+    assert!(
+        attach["result"].get("history").is_none(),
+        "streaming attach keeps the JSON-RPC response bounded and moves history to post-response notifications: {attach:?}",
+    );
+    assert_eq!(
+        attach["result"]["_meta"]["amux"]["appliedReplayOrder"],
+        serde_json::json!("newest_turn_first")
+    );
+    assert_eq!(
+        attach["result"]["_meta"]["amux"]["appliedHistoryDelivery"],
+        serde_json::json!("stream")
+    );
+    let snapshot = &attach["result"]["_meta"]["amux"]["snapshot"];
+    assert!(
+        snapshot["replayBoundarySeq"]
+            .as_u64()
+            .is_some_and(|seq| seq > 0),
+        "streaming attach must expose a snapshot/replay boundary: {attach:?}",
+    );
+    assert!(
+        snapshot["connectedClients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|client| client["clientId"] == serde_json::json!("B")),
+        "snapshot should include the current attached peer roster: {attach:?}",
+    );
+
+    let latest_started = ws_next_method(&mut ws_b, "amux/replay_started").await;
+    assert_eq!(
+        latest_started["params"]["phase"],
+        serde_json::json!("latest_segment")
+    );
+    assert_eq!(
+        latest_started["params"]["replayOrder"],
+        serde_json::json!("newest_turn_first")
+    );
+
+    let latest_turn = ws_next_method(&mut ws_b, "amux/turn_started").await;
+    assert_eq!(
+        latest_turn["params"]["content"][0]["text"],
+        serde_json::json!("third turn"),
+        "latest segment should be the newest completed turn, not the oldest backfill"
+    );
+    let latest_complete_turn = ws_next_method(&mut ws_b, "amux/turn_complete").await;
+    assert_eq!(
+        latest_complete_turn["params"]["amuxTurnId"],
+        latest_turn["params"]["amuxTurnId"]
+    );
+    let latest_complete = ws_next_method(&mut ws_b, "amux/replay_complete").await;
+    assert_eq!(
+        latest_complete["params"]["phase"],
+        serde_json::json!("latest_segment")
+    );
+
+    let backfill_started = ws_next_method(&mut ws_b, "amux/replay_started").await;
+    assert_eq!(
+        backfill_started["params"]["phase"],
+        serde_json::json!("backfill")
+    );
+    let second_turn = ws_next_method(&mut ws_b, "amux/turn_started").await;
+    assert_eq!(
+        second_turn["params"]["content"][0]["text"],
+        serde_json::json!("second turn"),
+        "backfill should proceed newest older turn first"
+    );
+    let first_turn = ws_next_method(&mut ws_b, "amux/turn_started").await;
+    assert_eq!(
+        first_turn["params"]["content"][0]["text"],
+        serde_json::json!("first turn"),
+        "backfilled turn frames should stay chronological within each newest-to-oldest segment"
+    );
+    let backfill_complete = ws_next_method(&mut ws_b, "amux/replay_complete").await;
+    assert_eq!(
+        backfill_complete["params"]["phase"],
+        serde_json::json!("backfill")
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn rfd533_attach_stream_chronological_backfills_in_original_order() {
+    let (addr, _) = spawn_server_with_mock().await;
+    let url_a = format!("ws://{addr}/acp?session=stream52_chrono&peer_id=A&peer_name=Alice");
+    let url_b =
+        format!("ws://{addr}/acp?session=stream52_chrono&peer_id=B&peer_name=Bob&replay=skip");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    for (id, text) in [(3, "first chrono turn"), (4, "second chrono turn")] {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/prompt",
+            "params": {"sessionId": "sess-mock", "prompt": [{"type": "text", "text": text}]}
+        });
+        let _ = ws_request(&mut ws_a, &payload.to_string()).await;
+    }
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":10,"method":"initialize"}"#,
+    )
+    .await;
+    let attach = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":11,"method":"session/attach","params":{"sessionId":"sess-mock","historyPolicy":"full","_meta":{"amux":{"historyDelivery":"stream"}}}}"#,
+    )
+    .await;
+    assert_eq!(
+        attach["result"]["_meta"]["amux"]["appliedReplayOrder"],
+        serde_json::json!("chronological")
+    );
+    assert_eq!(
+        attach["result"]["_meta"]["amux"]["appliedHistoryDelivery"],
+        serde_json::json!("stream")
+    );
+
+    let backfill_started = ws_next_method(&mut ws_b, "amux/replay_started").await;
+    assert_eq!(
+        backfill_started["params"]["phase"],
+        serde_json::json!("backfill"),
+        "chronological stream mode should not invent a newest-first latest_segment phase"
+    );
+    assert_eq!(
+        backfill_started["params"]["replayOrder"],
+        serde_json::json!("chronological")
+    );
+    let first = ws_next_method(&mut ws_b, "amux/turn_started").await;
+    let second = ws_next_method(&mut ws_b, "amux/turn_started").await;
+    assert_eq!(
+        first["params"]["content"][0]["text"],
+        serde_json::json!("first chrono turn")
+    );
+    assert_eq!(
+        second["params"]["content"][0]["text"],
+        serde_json::json!("second chrono turn")
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
+async fn rfd533_streaming_attach_does_not_block_live_events_behind_backfill() {
+    let (addr, _) = spawn_server_with_mock().await;
+    let url_a = format!("ws://{addr}/acp?session=stream52&peer_id=A&peer_name=Alice");
+    let url_b = format!("ws://{addr}/acp?session=stream52&peer_id=B&peer_name=Bob&replay=skip");
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    for id in 3..15 {
+        let text = format!("historical turn {id}");
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/prompt",
+            "params": {"sessionId": "sess-mock", "prompt": [{"type": "text", "text": text}]}
+        });
+        let _ = ws_request(&mut ws_a, &payload.to_string()).await;
+    }
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":20,"method":"initialize"}"#,
+    )
+    .await;
+    let attach = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":21,"method":"session/attach","params":{"sessionId":"sess-mock","historyPolicy":"full","_meta":{"amux":{"replayOrder":"newest_turn_first","historyDelivery":"stream"}}}}"#,
+    )
+    .await;
+    assert_eq!(
+        attach["result"]["_meta"]["amux"]["appliedHistoryDelivery"],
+        serde_json::json!("stream")
+    );
+
+    let latest_complete = ws_next_method(&mut ws_b, "amux/replay_complete").await;
+    assert_eq!(
+        latest_complete["params"]["phase"],
+        serde_json::json!("latest_segment")
+    );
+
+    ws_a.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":90,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"live while backfill"}]}}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        let msg = timeout(Duration::from_millis(100), ws_b.next())
+            .await
+            .expect("ws recv timeout")
+            .expect("stream ended")
+            .expect("recv err");
+        let ClientMsg::Text(t) = msg else {
+            continue;
+        };
+        let v: serde_json::Value = serde_json::from_str(t.as_str()).expect("frame is JSON");
+        if v.get("method") == Some(&serde_json::json!("amux/replay_complete"))
+            && v["params"]["phase"] == serde_json::json!("backfill")
+        {
+            panic!(
+                "live event with seq > snapshot boundary waited behind all backfill frames: {v:?}"
+            );
+        }
+        if v.get("method") == Some(&serde_json::json!("amux/turn_started"))
+            && v["params"]["content"][0]["text"] == serde_json::json!("live while backfill")
+        {
+            let _ = ws_a.send(ClientMsg::Close(None)).await;
+            let _ = ws_b.send(ClientMsg::Close(None)).await;
+            return;
+        }
+    }
+    panic!("timed out waiting for live event during streaming attach backfill");
 }
 
 #[tokio::test]
