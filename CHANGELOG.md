@@ -60,6 +60,18 @@
 
 ### Fixed
 
+- **Cross-segment turn bookends in `historyPolicy: full`.** When a turn
+  straddled a segment boundary (hermes compaction mid-turn, or
+  `session/load` with an in-flight turn that completes after the load
+  response), the default `historyPolicy: full` left late joiners with
+  an unmatched `amux/turn_complete` because the matching
+  `amux/turn_started` lived in the prior segment and was filtered out
+  by the current-segment-only rule. `full` now carries
+  `amux/turn_started` / `amux/turn_complete` / `amux/turn_cancelled`
+  bookends from prior segments when their `amuxTurnId` brackets the
+  active segment or matches the currently active turn; non-lifecycle
+  frames (agent chunks) from prior segments stay excluded — those
+  belong to `full_lineage`. Scoped subset of [#57](https://github.com/lsaether/acp-mux/issues/57).
 - **AMUX active-turn steer/queue controls.** `amux/steer_active_turn` and `amux/queue_prompt` are now the canonical control surface. Ordinary concurrent `session/prompt` requests—including text that starts with `/steer ...` or `/queue ...`—remain serialized and receive `-32001`. `amux/steer_active_turn` now performs mux-owned hard steer while a turn is active: it broadcasts `amux/control_submitted` and `amux/turn_cancelled`, sends ACP-native `session/cancel`, then starts a replacement turn with prompt-injected superseded-turn context. When idle, the same steer request submits immediately as the next prompt with `mode: "prompt"` and no cancellation or queue lifecycle. A second active hard steer is rejected while the first replacement is still pending. `amux/queue_prompt` now stores mux-owned queue/send state, caps pending public queue items at six (`-32003 "queue full"`), broadcasts/replays `amux/queue_item_*` lifecycle, submits immediately when idle, and submits queued prompts as real follow-up turns after active-turn settlement. Pending queue items survive owner disconnects without creating ghost drivers, emit orphan notifications, and can be removed with `amux/unqueue_prompt`. Fixes [#39](https://github.com/lsaether/acp-mux/issues/39); future native/soft steer is tracked separately in [#42](https://github.com/lsaether/acp-mux/issues/42).
 - **Active-turn cancellation for Hermes-backed sessions.** `amux/cancel_active_turn` now forwards ACP-native `session/cancel { sessionId }` for the active prompt while preserving the immediate `amux/turn_cancelled` intent broadcast and later `amux/turn_complete` settlement event. Fixes [#29](https://github.com/lsaether/acp-mux/issues/29).
 
