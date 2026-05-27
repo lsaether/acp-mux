@@ -515,7 +515,7 @@ impl RoomInner {
     /// delivery path so `stream + full` honours current-segment-only
     /// semantics and never leaks pre-compaction lineage to clients that
     /// didn't opt in.
-    fn replay_entries_for_policy(&self, policy: HistoryPolicy) -> Vec<ReplayEntry> {
+    pub(crate) fn replay_entries_for_policy(&self, policy: HistoryPolicy) -> Vec<ReplayEntry> {
         let Some(log) = self.replay_log.as_ref() else {
             return Vec::new();
         };

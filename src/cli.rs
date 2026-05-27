@@ -18,7 +18,7 @@ pub struct Cli {
     pub port: u16,
 
     /// Command (and args, whitespace-separated) used to spawn an agent
-    /// subprocess for each new `?session=`. Required to actually serve
+    /// subprocess for each new `?room=`. Required to actually serve
     /// sessions; absent values are caught at the first session attach.
     #[arg(long)]
     pub agent_cmd: Option<String>,

@@ -1001,18 +1001,19 @@ impl RoomInner {
             return;
         };
 
-        // Close the current segment in place. closed_replay_seq points at
-        // the last frame already in the log (next_replay_seq points at the
-        // next-to-allocate seq).
-        let closed_replay_seq = self.next_replay_seq.saturating_sub(1);
         let previous_acp = self
             .segments
             .iter()
             .find(|s| s.id == current_id)
             .and_then(|s| s.acp_session_id.clone());
+
+        // Mark the closing metadata in place but defer `closed_replay_seq`
+        // — the `amux/segment_ended` bookend needs to land inside the
+        // closing segment, and broadcasting it below advances
+        // `next_replay_seq`. Setting `closed_replay_seq` afterwards keeps
+        // the bookend frame's seq inside the closing range.
         if let Some(seg) = self.segments.iter_mut().find(|s| s.id == current_id) {
             seg.closed_at = Some(now.clone());
-            seg.closed_replay_seq = Some(closed_replay_seq);
             seg.end_reason = Some(reason);
         }
 
@@ -1028,14 +1029,14 @@ impl RoomInner {
             }
         }
 
-        // Allocate the new segment now so segment_ended can reference it
+        // Allocate the new segment id so segment_ended can reference it
         // as `successorSegmentId`.
         let new_id = SegmentId(self.next_segment_id);
         self.next_segment_id = self.next_segment_id.saturating_add(1);
 
         // Broadcast `amux/segment_ended` while the OLD segment is still
-        // active — the frame gets tagged with current_segment_id() ==
-        // current_id, so transcript slicing keeps it on the closing side.
+        // active — current_segment_id() returns current_id, so the frame
+        // is tagged with and lands inside the closing segment.
         if self.emit_segment_frames {
             let frame = amux::segment_ended(
                 &self.room_id,
@@ -1045,6 +1046,15 @@ impl RoomInner {
                 Some(new_id),
             );
             self.broadcast(frame);
+        }
+
+        // Now finalize closed_replay_seq. next_replay_seq has been
+        // advanced past the bookend (or unchanged if --emit-segment-frames
+        // is off), so seq - 1 is either the seq of segment_ended or of
+        // the last regular frame in the segment.
+        let closed_replay_seq = self.next_replay_seq.saturating_sub(1);
+        if let Some(seg) = self.segments.iter_mut().find(|s| s.id == current_id) {
+            seg.closed_replay_seq = Some(closed_replay_seq);
         }
 
         // Open the new segment.
@@ -3016,6 +3026,7 @@ impl RoomInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::attach::HistoryPolicy;
 
     fn test_inner() -> RoomInner {
         let (tx, _rx) = mpsc::channel(1);
@@ -3126,12 +3137,35 @@ mod tests {
             SegmentId(1),
             "segment_ended sits in the closing segment",
         );
+        // closed_replay_seq must include the bookend frame so per-segment
+        // slicing on (opened_replay_seq..=closed_replay_seq) covers it.
+        assert_eq!(
+            closed.closed_replay_seq,
+            Some(ended_entry.seq),
+            "closed_replay_seq must cover the segment_ended bookend",
+        );
 
         // opened_replay_seq for seg-2 must be strictly after seg-1's open.
         assert!(
             opened.opened_replay_seq > seg1_opened_seq,
             "new segment's opened_replay_seq must monotonically advance",
         );
+
+        // segment_started for seg-2 must be the first frame at-or-after
+        // seg-2's opened_replay_seq, completing the bookend invariant.
+        let started_entry = log
+            .iter()
+            .filter(|e| e.segment_id == SegmentId(2))
+            .next()
+            .expect("seg-2 must have at least one frame (segment_started)");
+        let v: serde_json::Value =
+            serde_json::from_slice(&started_entry.frame).unwrap_or_default();
+        assert_eq!(
+            v["method"].as_str(),
+            Some("amux/segment_started"),
+            "first frame in new segment is the segment_started bookend",
+        );
+        assert_eq!(started_entry.seq, opened.opened_replay_seq);
     }
 
     fn make_notification(method: &str, params: Value) -> crate::protocol::jsonrpc::IncomingNotification {
@@ -3295,6 +3329,60 @@ mod tests {
             .filter_map(|e| e.params.get("update")?.get("kind")?.as_str())
             .collect();
         assert_eq!(lineage_kinds, vec!["seg1-marker", "seg2-marker"]);
+    }
+
+    #[test]
+    fn stream_path_respects_history_policy() {
+        // The streaming-delivery path must honour `historyPolicy: full` =
+        // current-segment-only; without the filter it leaked all
+        // segments to clients that opted into `full`.
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+
+        inner.set_canonical_session_id_with_reason("acp-1", EndReason::SessionLoad);
+        inner.broadcast(Bytes::from_static(
+            br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-1","update":{"kind":"seg1"}}}"#,
+        ));
+        inner.set_canonical_session_id_with_reason("acp-2", EndReason::SessionLoad);
+        inner.broadcast(Bytes::from_static(
+            br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-2","update":{"kind":"seg2"}}}"#,
+        ));
+
+        let full_entries = inner.replay_entries_for_policy(HistoryPolicy::Full);
+        let full_kinds: Vec<String> = full_entries
+            .iter()
+            .filter_map(|entry| {
+                let v: serde_json::Value = serde_json::from_slice(&entry.frame).ok()?;
+                v.get("params")?
+                    .get("update")?
+                    .get("kind")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            full_kinds,
+            vec!["seg2"],
+            "stream + full must only surface the active segment's updates",
+        );
+
+        let lineage_entries = inner.replay_entries_for_policy(HistoryPolicy::FullLineage);
+        let lineage_kinds: Vec<String> = lineage_entries
+            .iter()
+            .filter_map(|entry| {
+                let v: serde_json::Value = serde_json::from_slice(&entry.frame).ok()?;
+                v.get("params")?
+                    .get("update")?
+                    .get("kind")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            lineage_kinds,
+            vec!["seg1", "seg2"],
+            "stream + full_lineage must surface every segment's updates",
+        );
     }
 
     #[test]
