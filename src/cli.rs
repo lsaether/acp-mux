@@ -48,12 +48,13 @@ pub struct Cli {
     /// on segment rotation (session/load, hermes compaction). Default on;
     /// pass `--emit-segment-frames=false` to keep wire output byte-equivalent
     /// with v0.1.x for clients that haven't picked up the new frame methods
-    /// yet.
+    /// yet. Bare `--emit-segment-frames` is equivalent to `=true`.
     #[arg(
         long,
         action = clap::ArgAction::Set,
-        num_args = 1,
+        num_args = 0..=1,
         default_value_t = true,
+        default_missing_value = "true",
     )]
     pub emit_segment_frames: bool,
 
@@ -268,6 +269,12 @@ mod tests {
     #[test]
     fn emit_segment_frames_accepts_explicit_true() {
         let cli = Cli::try_parse_from(["amux", "--emit-segment-frames=true"]).unwrap();
+        assert!(cli.emit_segment_frames);
+    }
+
+    #[test]
+    fn emit_segment_frames_bare_treated_as_true() {
+        let cli = Cli::try_parse_from(["amux", "--emit-segment-frames"]).unwrap();
         assert!(cli.emit_segment_frames);
     }
 
