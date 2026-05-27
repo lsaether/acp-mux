@@ -6,7 +6,7 @@
 //! `state` module owns the struct, fields, and actor loop. This module is
 //! a logical split for review and maintenance, not a behavioral one.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::multiplex::subscriber::OutMsg;
-use crate::protocol::amux;
+use crate::protocol::amux::{self, SegmentId};
 use crate::protocol::attach::{
     self, AttachActiveTurn, AttachAmuxMeta, AttachMeta, AttachParams, AttachPendingPermission,
     AttachQueueItem, AttachResult, AttachSnapshot, ConnectedClient, DetachParams, DetachResult,
@@ -484,15 +484,21 @@ impl RoomInner {
 
     /// Current-segment-only history. Includes pre-segment bootstrap
     /// frames (`SegmentId(0)`) so peer-presence emitted before the
-    /// canonical ACP id was captured is preserved across the
-    /// `historyPolicy: full` view.
+    /// canonical ACP id was captured is preserved, plus any
+    /// `amux/turn_started` / `amux/turn_complete` / `amux/turn_cancelled`
+    /// bookend from a prior segment whose `amuxTurnId` brackets a frame
+    /// in the active segment or matches the currently active turn —
+    /// otherwise hermes compaction mid-turn would leave clients staring
+    /// at an unmatched `turn_complete` for a turn that started in the
+    /// prior segment.
     pub(super) fn history_full(&self) -> Vec<HistoryEntry> {
         let Some(log) = self.replay_log.as_ref() else {
             return Vec::new();
         };
         let active = self.active_segment_id;
+        let carry = self.cross_segment_turn_carry();
         log.iter()
-            .filter(|entry| entry.segment_id == PRE_SEGMENT_ID || Some(entry.segment_id) == active)
+            .filter(|entry| Self::full_view_includes_entry(entry, active, &carry))
             .filter_map(|entry| Self::history_entry_from_frame(&entry.frame_for_replay()))
             .collect()
     }
@@ -512,7 +518,8 @@ impl RoomInner {
     /// Replay entries shaped by `historyPolicy`, used by the streaming
     /// delivery path so `stream + full` honours current-segment-only
     /// semantics and never leaks pre-compaction lineage to clients that
-    /// didn't opt in.
+    /// didn't opt in. Carries cross-segment turn bookends for the same
+    /// reason `history_full` does.
     pub(crate) fn replay_entries_for_policy(&self, policy: HistoryPolicy) -> Vec<ReplayEntry> {
         let Some(log) = self.replay_log.as_ref() else {
             return Vec::new();
@@ -521,24 +528,84 @@ impl RoomInner {
             HistoryPolicy::FullLineage => log.iter().cloned().collect(),
             HistoryPolicy::Full => {
                 let active = self.active_segment_id;
+                let carry = self.cross_segment_turn_carry();
                 log.iter()
-                    .filter(|entry| {
-                        entry.segment_id == PRE_SEGMENT_ID || Some(entry.segment_id) == active
-                    })
+                    .filter(|entry| Self::full_view_includes_entry(entry, active, &carry))
                     .cloned()
                     .collect()
             }
             // Other policies don't use streaming; fall back to current-segment view.
             _ => {
                 let active = self.active_segment_id;
+                let carry = self.cross_segment_turn_carry();
                 log.iter()
-                    .filter(|entry| {
-                        entry.segment_id == PRE_SEGMENT_ID || Some(entry.segment_id) == active
-                    })
+                    .filter(|entry| Self::full_view_includes_entry(entry, active, &carry))
                     .cloned()
                     .collect()
             }
         }
+    }
+
+    /// Filter predicate shared by `history_full` and
+    /// `replay_entries_for_policy`. Always includes pre-segment bootstrap
+    /// and active-segment frames; also includes turn-lifecycle frames
+    /// (`amux/turn_started` / `amux/turn_complete` / `amux/turn_cancelled`)
+    /// from prior segments when their `amuxTurnId` is in `carry`.
+    fn full_view_includes_entry(
+        entry: &ReplayEntry,
+        active: Option<SegmentId>,
+        carry: &HashSet<String>,
+    ) -> bool {
+        if entry.segment_id == PRE_SEGMENT_ID || Some(entry.segment_id) == active {
+            return true;
+        }
+        Self::parse_turn_lifecycle_frame(&entry.frame)
+            .map(|(_, turn_id)| carry.contains(&turn_id))
+            .unwrap_or(false)
+    }
+
+    /// Compute the set of `amuxTurnId` values whose turn-lifecycle bookends
+    /// should be carried into the `full` view from prior segments. A turn
+    /// qualifies if any of its lifecycle frames (`amux/turn_started`,
+    /// `amux/turn_complete`, `amux/turn_cancelled`) is observed in the
+    /// pre-segment bootstrap or active segment, or if the turn is the
+    /// currently active one (its `turn_started` may sit in a prior
+    /// segment when hermes compacted mid-turn).
+    fn cross_segment_turn_carry(&self) -> HashSet<String> {
+        let Some(log) = self.replay_log.as_ref() else {
+            return HashSet::new();
+        };
+        let active = self.active_segment_id;
+        let mut carry = HashSet::new();
+        for entry in log
+            .iter()
+            .filter(|e| e.segment_id == PRE_SEGMENT_ID || Some(e.segment_id) == active)
+        {
+            if let Some((_, turn_id)) = Self::parse_turn_lifecycle_frame(&entry.frame) {
+                carry.insert(turn_id);
+            }
+        }
+        if let Some(turn_id) = self.active_amux_turn_id {
+            carry.insert(turn_id.formatted());
+        }
+        carry
+    }
+
+    fn parse_turn_lifecycle_frame(frame: &Bytes) -> Option<(String, String)> {
+        let value: Value = serde_json::from_slice(frame).ok()?;
+        let method = value.get("method")?.as_str()?;
+        if !matches!(
+            method,
+            "amux/turn_started" | "amux/turn_complete" | "amux/turn_cancelled"
+        ) {
+            return None;
+        }
+        let turn_id = value
+            .get("params")?
+            .get("amuxTurnId")?
+            .as_str()?
+            .to_string();
+        Some((method.to_string(), turn_id))
     }
 
     fn history_pending_only(&self) -> Vec<HistoryEntry> {

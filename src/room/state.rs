@@ -3409,6 +3409,158 @@ mod tests {
         );
     }
 
+    fn turn_started_frame(room_id: &str, amux_turn_id: u64, peer_id: &str) -> Bytes {
+        Bytes::from(format!(
+            r#"{{"jsonrpc":"2.0","method":"amux/turn_started","params":{{"roomId":"{room_id}","amuxTurnId":"at-{amux_turn_id}","peerId":"{peer_id}","content":[]}}}}"#,
+        ))
+    }
+
+    fn turn_complete_frame(room_id: &str, amux_turn_id: u64) -> Bytes {
+        Bytes::from(format!(
+            r#"{{"jsonrpc":"2.0","method":"amux/turn_complete","params":{{"roomId":"{room_id}","amuxTurnId":"at-{amux_turn_id}","stopReason":"end_turn"}}}}"#,
+        ))
+    }
+
+    fn update_frame(session_id: &str) -> Bytes {
+        Bytes::from(format!(
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{session_id}","update":{{"kind":"agent_message_chunk"}}}}}}"#,
+        ))
+    }
+
+    #[test]
+    fn history_full_carries_turn_started_when_turn_completed_across_segments() {
+        // turn_started lands in seg-1, then a hermes compaction rotates
+        // to seg-2 mid-turn, then turn_complete lands in seg-2.
+        // historyPolicy: full must carry the seg-1 turn_started forward so
+        // clients see a bracketed turn instead of an orphan turn_complete.
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+
+        inner.set_canonical_session_id_with_reason("acp-1", EndReason::SessionLoad);
+        inner.broadcast(turn_started_frame("test-room", 7, "alice"));
+        inner.broadcast(update_frame("acp-1"));
+
+        // Hermes compaction signal — same ACP id, different hermes id.
+        inner.set_canonical_session_id_with_reason("acp-1", EndReason::HermesCompression);
+        // segment didn't rotate (set_canonical with same id is a no-op);
+        // simulate compaction explicitly via rotate_segment.
+        inner.rotate_segment(
+            Some("acp-1".to_string()),
+            EndReason::HermesCompression,
+            HermesProvenance::default(),
+        );
+
+        inner.broadcast(update_frame("acp-1"));
+        inner.broadcast(turn_complete_frame("test-room", 7));
+
+        let history = inner.history_full();
+        let methods: Vec<&str> = history.iter().map(|e| e.method.as_str()).collect();
+
+        // turn_started should appear (carried from seg-1) before turn_complete.
+        let started_idx = methods
+            .iter()
+            .position(|m| *m == "amux/turn_started")
+            .expect("turn_started must be carried into full view");
+        let complete_idx = methods
+            .iter()
+            .position(|m| *m == "amux/turn_complete")
+            .expect("turn_complete must be present");
+        assert!(
+            started_idx < complete_idx,
+            "carried turn_started must precede turn_complete in replay order",
+        );
+    }
+
+    #[test]
+    fn history_full_carries_turn_started_when_turn_is_still_active_across_segments() {
+        // turn_started lands in seg-1, rotation happens mid-turn, the turn
+        // has not yet completed when a late joiner attaches. The carry
+        // should pull turn_started forward by way of active_amux_turn_id.
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+
+        inner.set_canonical_session_id_with_reason("acp-1", EndReason::SessionLoad);
+        inner.broadcast(turn_started_frame("test-room", 11, "alice"));
+        inner.active_amux_turn_id = Some(AmuxTurnId(11));
+        inner.active_turn_mux_id = Some(99);
+        inner.broadcast(update_frame("acp-1"));
+
+        inner.rotate_segment(
+            Some("acp-1".to_string()),
+            EndReason::HermesCompression,
+            HermesProvenance::default(),
+        );
+        inner.broadcast(update_frame("acp-1"));
+        // Turn still in flight: no turn_complete yet.
+
+        let history = inner.history_full();
+        let methods: Vec<&str> = history.iter().map(|e| e.method.as_str()).collect();
+        assert!(
+            methods.contains(&"amux/turn_started"),
+            "active turn's started bookend must be carried even without turn_complete",
+        );
+    }
+
+    #[test]
+    fn history_full_does_not_carry_turn_that_completed_before_active_segment() {
+        // A turn fully contained in seg-1 (started AND completed there)
+        // followed by rotation into seg-2: the historyPolicy: full view
+        // for a late joiner attached in seg-2 must NOT show that prior
+        // turn — only frames in seg-2 plus any cross-segment bookend.
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+
+        inner.set_canonical_session_id_with_reason("acp-1", EndReason::SessionLoad);
+        inner.broadcast(turn_started_frame("test-room", 1, "alice"));
+        inner.broadcast(turn_complete_frame("test-room", 1));
+
+        inner.rotate_segment(
+            Some("acp-2".to_string()),
+            EndReason::SessionLoad,
+            HermesProvenance::default(),
+        );
+        inner.broadcast(turn_started_frame("test-room", 2, "alice"));
+        inner.broadcast(turn_complete_frame("test-room", 2));
+
+        let history = inner.history_full();
+        let turn_ids: Vec<&str> = history
+            .iter()
+            .filter(|e| e.method == "amux/turn_started" || e.method == "amux/turn_complete")
+            .filter_map(|e| e.params.get("amuxTurnId")?.as_str())
+            .collect();
+        assert!(
+            turn_ids.iter().all(|id| *id == "at-2"),
+            "only the active segment's turn bookends should appear (got {turn_ids:?})",
+        );
+    }
+
+    #[test]
+    fn history_full_lineage_returns_every_segment_unchanged() {
+        // Full lineage path is unaffected by the carry rule — it already
+        // returns everything. Regression guard.
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+
+        inner.set_canonical_session_id_with_reason("acp-1", EndReason::SessionLoad);
+        inner.broadcast(turn_started_frame("test-room", 1, "alice"));
+        inner.broadcast(turn_complete_frame("test-room", 1));
+        inner.rotate_segment(
+            Some("acp-2".to_string()),
+            EndReason::SessionLoad,
+            HermesProvenance::default(),
+        );
+        inner.broadcast(turn_started_frame("test-room", 2, "alice"));
+        inner.broadcast(turn_complete_frame("test-room", 2));
+
+        let history = inner.history_full_lineage();
+        let bookends: Vec<&str> = history
+            .iter()
+            .filter(|e| e.method == "amux/turn_started" || e.method == "amux/turn_complete")
+            .filter_map(|e| e.params.get("amuxTurnId")?.as_str())
+            .collect();
+        assert_eq!(bookends, vec!["at-1", "at-1", "at-2", "at-2"]);
+    }
+
     #[test]
     fn segment_summary_populates_after_rotation() {
         let mut inner = test_inner();
