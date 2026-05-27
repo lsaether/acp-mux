@@ -2,7 +2,7 @@
 //! and the streaming attach machinery (snapshot, latest-segment, async
 //! backfill) that lives on top of the mux's broadcast replay log.
 //!
-//! All methods here are declared as `impl SessionInner` blocks; the parent
+//! All methods here are declared as `impl RoomInner` blocks; the parent
 //! `state` module owns the struct, fields, and actor loop. This module is
 //! a logical split for review and maintenance, not a behavioral one.
 
@@ -21,12 +21,12 @@ use crate::protocol::attach::{
     HistoryDelivery, HistoryEntry, HistoryPolicy, ReplayOrder,
 };
 use crate::protocol::jsonrpc::IncomingRequest;
-use crate::session::state::{QueuedPromptKind, ReplayEntry, SessionInner, SessionMsg};
+use crate::room::state::{PRE_SEGMENT_ID, QueuedPromptKind, ReplayEntry, RoomInner, RoomMsg};
 
 #[derive(Debug)]
 pub struct AttachStreamBackfill {
     peer_id: String,
-    session_id: String,
+    room_id: String,
     replay_order: ReplayOrder,
     replay_generation: u64,
     replay_boundary_seq: u64,
@@ -35,7 +35,7 @@ pub struct AttachStreamBackfill {
     started: bool,
 }
 
-impl SessionInner {
+impl RoomInner {
     pub(super) fn handle_attach(&mut self, peer_id: &str, req: IncomingRequest) {
         let params: AttachParams = req
             .params
@@ -59,7 +59,7 @@ impl SessionInner {
         let effective_policy = match requested_policy {
             HistoryPolicy::AfterMessage => {
                 tracing::debug!(
-                    session = %self.session_id,
+                    session = %self.room_id,
                     %peer_id,
                     after_message_id = ?params.after_message_id,
                     "session/attach after_message requested; falling back to full until ACP message IDs are available end-to-end",
@@ -72,11 +72,11 @@ impl SessionInner {
         let resolved_session_id = self
             .acp_session_id()
             .map(str::to_string)
-            .unwrap_or_else(|| self.session_id.clone());
+            .unwrap_or_else(|| self.room_id.clone());
         if let Some(requested) = params.session_id.as_deref()
             && !requested.is_empty()
             && requested != resolved_session_id
-            && requested != self.session_id
+            && requested != self.room_id
         {
             self.send_error_response(
                 peer_id,
@@ -96,15 +96,13 @@ impl SessionInner {
             })
             .collect();
         let applied_history_delivery = match (effective_policy, requested_history_delivery) {
-            (HistoryPolicy::Full, HistoryDelivery::Stream) => HistoryDelivery::Stream,
+            (HistoryPolicy::Full, HistoryDelivery::Stream)
+            | (HistoryPolicy::FullLineage, HistoryDelivery::Stream) => HistoryDelivery::Stream,
             _ => HistoryDelivery::Response,
         };
         let stream_entries: Vec<ReplayEntry> =
             if applied_history_delivery == HistoryDelivery::Stream {
-                self.replay_log
-                    .as_ref()
-                    .map(|log| log.iter().cloned().collect())
-                    .unwrap_or_default()
+                self.replay_entries_for_policy(effective_policy)
             } else {
                 Vec::new()
             };
@@ -121,6 +119,10 @@ impl SessionInner {
                 HistoryPolicy::None => None,
                 HistoryPolicy::Full => Some(Self::apply_history_replay_order(
                     self.history_full(),
+                    requested_replay_order,
+                )),
+                HistoryPolicy::FullLineage => Some(Self::apply_history_replay_order(
+                    self.history_full_lineage(),
                     requested_replay_order,
                 )),
                 HistoryPolicy::PendingOnly => Some(Self::apply_history_replay_order(
@@ -224,6 +226,12 @@ impl SessionInner {
             pending_permissions: self.pending_permission_summaries(),
             replay_boundary_seq,
             replay_generation: self.replay_generation,
+            segments: self
+                .segments
+                .iter()
+                .map(crate::room::state::segment_summary)
+                .collect(),
+            active_segment_id: self.active_segment_id,
         }
     }
 
@@ -265,7 +273,7 @@ impl SessionInner {
             return;
         };
         let outbound = sub.outbound.clone();
-        let session_id = self.session_id.clone();
+        let room_id = self.room_id.clone();
         let replay_generation = self.replay_generation;
         let replay_order_wire = Self::replay_order_wire(replay_order);
         let (latest_segment, backfill_segments) =
@@ -275,7 +283,7 @@ impl SessionInner {
             let frame_count = latest_segment.len();
             if outbound
                 .send(OutMsg::Frame(Bytes::from(amux::replay_started(
-                    &session_id,
+                    &room_id,
                     "latest_segment",
                     replay_order_wire,
                     replay_generation,
@@ -296,7 +304,7 @@ impl SessionInner {
             }
             if outbound
                 .send(OutMsg::Frame(Bytes::from(amux::replay_complete(
-                    &session_id,
+                    &room_id,
                     "latest_segment",
                     replay_order_wire,
                     replay_generation,
@@ -322,7 +330,7 @@ impl SessionInner {
         let frame_count: usize = backfill_segments.iter().map(Vec::len).sum();
         let plan = AttachStreamBackfill {
             peer_id: peer_id.to_string(),
-            session_id,
+            room_id,
             replay_order,
             replay_generation,
             replay_boundary_seq,
@@ -350,7 +358,7 @@ impl SessionInner {
             if sub
                 .outbound
                 .send(OutMsg::Frame(Bytes::from(amux::replay_started(
-                    &plan.session_id,
+                    &plan.room_id,
                     "backfill",
                     replay_order_wire,
                     plan.replay_generation,
@@ -376,7 +384,7 @@ impl SessionInner {
             let _ = sub
                 .outbound
                 .send(OutMsg::Frame(Bytes::from(amux::replay_complete(
-                    &plan.session_id,
+                    &plan.room_id,
                     "backfill",
                     replay_order_wire,
                     plan.replay_generation,
@@ -389,13 +397,13 @@ impl SessionInner {
     }
 
     fn schedule_attach_backfill(
-        tx: mpsc::Sender<SessionMsg>,
+        tx: mpsc::Sender<RoomMsg>,
         plan: AttachStreamBackfill,
         delay: Duration,
     ) {
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            let _ = tx.send(SessionMsg::AttachStreamBackfill(plan)).await;
+            let _ = tx.send(RoomMsg::AttachStreamBackfill(plan)).await;
         });
     }
 
@@ -474,13 +482,65 @@ impl SessionInner {
         }
     }
 
-    fn history_full(&self) -> Vec<HistoryEntry> {
+    /// Current-segment-only history. Includes pre-segment bootstrap
+    /// frames (`SegmentId(0)`) so peer-presence emitted before the
+    /// canonical ACP id was captured is preserved across the
+    /// `historyPolicy: full` view.
+    pub(super) fn history_full(&self) -> Vec<HistoryEntry> {
+        let Some(log) = self.replay_log.as_ref() else {
+            return Vec::new();
+        };
+        let active = self.active_segment_id;
+        log.iter()
+            .filter(|entry| {
+                entry.segment_id == PRE_SEGMENT_ID || Some(entry.segment_id) == active
+            })
+            .filter_map(|entry| Self::history_entry_from_frame(&entry.frame_for_replay()))
+            .collect()
+    }
+
+    /// Every segment's frames concatenated in `replaySeq` order. The
+    /// `historyPolicy: full_lineage` view for clients that want to see
+    /// pre-compaction history.
+    pub(super) fn history_full_lineage(&self) -> Vec<HistoryEntry> {
         let Some(log) = self.replay_log.as_ref() else {
             return Vec::new();
         };
         log.iter()
             .filter_map(|entry| Self::history_entry_from_frame(&entry.frame_for_replay()))
             .collect()
+    }
+
+    /// Replay entries shaped by `historyPolicy`, used by the streaming
+    /// delivery path so `stream + full` honours current-segment-only
+    /// semantics and never leaks pre-compaction lineage to clients that
+    /// didn't opt in.
+    fn replay_entries_for_policy(&self, policy: HistoryPolicy) -> Vec<ReplayEntry> {
+        let Some(log) = self.replay_log.as_ref() else {
+            return Vec::new();
+        };
+        match policy {
+            HistoryPolicy::FullLineage => log.iter().cloned().collect(),
+            HistoryPolicy::Full => {
+                let active = self.active_segment_id;
+                log.iter()
+                    .filter(|entry| {
+                        entry.segment_id == PRE_SEGMENT_ID || Some(entry.segment_id) == active
+                    })
+                    .cloned()
+                    .collect()
+            }
+            // Other policies don't use streaming; fall back to current-segment view.
+            _ => {
+                let active = self.active_segment_id;
+                log.iter()
+                    .filter(|entry| {
+                        entry.segment_id == PRE_SEGMENT_ID || Some(entry.segment_id) == active
+                    })
+                    .cloned()
+                    .collect()
+            }
+        }
     }
 
     fn history_pending_only(&self) -> Vec<HistoryEntry> {
@@ -574,11 +634,11 @@ impl SessionInner {
         let resolved_session_id = self
             .acp_session_id()
             .map(str::to_string)
-            .unwrap_or_else(|| self.session_id.clone());
+            .unwrap_or_else(|| self.room_id.clone());
         if let Some(requested) = params.session_id.as_deref()
             && !requested.is_empty()
             && requested != resolved_session_id
-            && requested != self.session_id
+            && requested != self.room_id
         {
             self.send_error_response(
                 peer_id,

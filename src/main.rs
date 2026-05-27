@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use amux::cli;
 use amux::server;
-use amux::session::registry::{AgentCmd, SessionRegistry};
+use amux::room::registry::{AgentCmd, RoomRegistry};
 use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -33,12 +33,13 @@ async fn main() -> Result<()> {
         );
     }
 
-    let registry = SessionRegistry::new_with_client_tool_policy(
+    let registry = RoomRegistry::new_with_options(
         agent_cmd,
         cli.replay_turns,
         std::time::Duration::from_secs(cli.session_ttl_seconds),
         cli.meta_propagate,
         client_tool_policy,
+        cli.emit_segment_frames,
     );
     let app = server::router(server::AppState::new(registry));
 

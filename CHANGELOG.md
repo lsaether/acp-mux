@@ -2,7 +2,59 @@
 
 ## Unreleased
 
+### Breaking
+
+- **`?room=` replaces `?session=`.** WebSocket attaches now key on
+  `?room=<id>`. `?session=<id>` is accepted as a deprecated alias and
+  logs a one-shot WARN per attach; remove the alias next release.
+  Specifying both query params returns close `4400`.
+- **`amux/*` frames carry `roomId` instead of `sessionId`** where they
+  previously referred to the mux-level id (peer_joined, peer_left,
+  session_context, turn_started, turn_complete, session_busy, queue
+  lifecycle, agent_request_opened/resolved, control_submitted,
+  turn_cancelled, replay_started/complete). Frames that pass through
+  upstream ACP `sessionId` payloads are unchanged.
+- **`session/list` decoration field renamed.** Live mux annotations now
+  appear under `sessions[i]._meta.amux.roomId` (was `proxySessionId`).
+- **`/debug/sessions` JSON keys renamed.** Top-level `sessions`/`sessionCount`
+  → `rooms`/`roomCount`; per-room `sessionId` field is now `roomId`.
+- **Library type rename.** `src/session/*` moved to `src/room/*`;
+  `SessionInner` → `RoomInner`, `SessionMsg` → `RoomMsg`,
+  `SessionRegistry` → `RoomRegistry`, `SessionHandle` → `RoomHandle`,
+  `SessionSnapshot` → `RoomSnapshot`, `SessionOptions` → `RoomOptions`,
+  `spawn_session` → `spawn_room`. `SessionListMetadataIndex` keeps its
+  name (it indexes ACP session ids, not rooms).
+
 ### Added
+
+- **Rooms-as-transcripts abstraction.** A room now owns one or more
+  segments, each pinned to a single canonical ACP `sessionId`. Rotation
+  is detected from (a) `session/load` responses, (b)
+  `_meta.hermes.sessionProvenance.hermesSessionId` changes (compaction
+  under a stable ACP id), and (c) bare ACP `sessionId` changes in agent
+  notifications (heuristic fallback). See `docs/design/rooms.md` for
+  the full model and invariants.
+- **Segment lifecycle frames.** `amux/segment_started` and
+  `amux/segment_ended` mark rotation boundaries in both live broadcast
+  and the replay log. Both flow through the standard `broadcast()` path
+  and carry the same `_meta.amux { recordedAt, replaySeq }` envelope as
+  every other broadcast-tier frame.
+- **`historyPolicy: full_lineage`.** `session/attach` accepts a new
+  policy that returns every segment's frames in `replaySeq` order.
+  `historyPolicy: full` continues to return current-segment-only
+  history (with pre-segment bootstrap frames included).
+- **`_meta.hermes` recognition.** Provenance fields
+  (`sessionProvenance`, `compaction`) are parsed from agent
+  notifications and stored on the segment they describe. Late-arriving
+  provenance backfills the active segment in place without rotation.
+- **`snapshot.segments`.** `session/attach` results expose lineage at
+  `result._meta.amux.snapshot.segments` (with `activeSegmentId`) so
+  even `historyPolicy: full` clients can see that earlier segments
+  exist.
+- **`--emit-segment-frames` flag.** Default `true`. Set `false` to
+  suppress `amux/segment_*` emission for clients that haven't picked up
+  the new frame methods yet. Internal segment state still tracks
+  rotation; only the wire is gated.
 
 - **Replay-safe agent request lifecycle openings.** Agent-initiated requests now emit inert `amux/agent_request_opened` notifications before the live raw request, preserving request context for late-join replay without replaying actionable ACP requests. Late joiners see `amux/agent_request_opened` followed by `amux/agent_request_resolved`; live subscribers still answer only the original `session/request_permission`. Fixes [#31](https://github.com/lsaether/acp-mux/issues/31).
 

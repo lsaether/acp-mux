@@ -15,7 +15,7 @@ use amux::cli::{ClientToolPolicy, ReplayTurns};
 use amux::server::{
     AppState, CLOSE_CODE_BAD_QUERY, CLOSE_CODE_INTERNAL, CLOSE_CODE_PEER_CONFLICT, router,
 };
-use amux::session::registry::{AgentCmd, SessionRegistry};
+use amux::room::registry::{AgentCmd, RoomRegistry};
 use futures::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::Message as ClientMsg;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 /// Spawn an acp-mux server backed by `cat` as the agent (NDJSON loopback).
-async fn spawn_server_with_cat() -> (SocketAddr, Arc<SessionRegistry>) {
+async fn spawn_server_with_cat() -> (SocketAddr, Arc<RoomRegistry>) {
     spawn_server(Some(AgentCmd {
         program: "cat".into(),
         args: vec![],
@@ -37,15 +37,15 @@ async fn spawn_server_with_cat() -> (SocketAddr, Arc<SessionRegistry>) {
 /// exercise the grace window override via `spawn_server_with_ttl`.
 const TEST_DEFAULT_TTL: Duration = Duration::from_millis(150);
 
-async fn spawn_server(agent_cmd: Option<AgentCmd>) -> (SocketAddr, Arc<SessionRegistry>) {
+async fn spawn_server(agent_cmd: Option<AgentCmd>) -> (SocketAddr, Arc<RoomRegistry>) {
     spawn_server_with_ttl(agent_cmd, TEST_DEFAULT_TTL).await
 }
 
 async fn spawn_server_with_ttl(
     agent_cmd: Option<AgentCmd>,
     ttl: Duration,
-) -> (SocketAddr, Arc<SessionRegistry>) {
-    let registry = SessionRegistry::new(agent_cmd, ReplayTurns::Unbounded, ttl);
+) -> (SocketAddr, Arc<RoomRegistry>) {
+    let registry = RoomRegistry::new(agent_cmd, ReplayTurns::Unbounded, ttl);
     let app = router(AppState::new(registry.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -59,8 +59,8 @@ async fn spawn_server_with_ttl(
 async fn spawn_server_with_meta_propagation(
     agent_cmd: Option<AgentCmd>,
     enabled: bool,
-) -> (SocketAddr, Arc<SessionRegistry>) {
-    let registry = SessionRegistry::new_with_meta_propagation(
+) -> (SocketAddr, Arc<RoomRegistry>) {
+    let registry = RoomRegistry::new_with_meta_propagation(
         agent_cmd,
         ReplayTurns::Unbounded,
         TEST_DEFAULT_TTL,
@@ -79,8 +79,8 @@ async fn spawn_server_with_meta_propagation(
 async fn spawn_server_with_client_tool_policy(
     agent_cmd: Option<AgentCmd>,
     client_tool_policy: ClientToolPolicy,
-) -> (SocketAddr, Arc<SessionRegistry>) {
-    let registry = SessionRegistry::new_with_client_tool_policy(
+) -> (SocketAddr, Arc<RoomRegistry>) {
+    let registry = RoomRegistry::new_with_client_tool_policy(
         agent_cmd,
         ReplayTurns::Unbounded,
         TEST_DEFAULT_TTL,
@@ -214,7 +214,7 @@ async fn subscriber_receives_agent_context_cwd_on_attach() {
 
     let context = ws_next_method(&mut ws, "amux/session_context").await;
 
-    assert_eq!(context["params"]["sessionId"], serde_json::json!("ctx"));
+    assert_eq!(context["params"]["roomId"], serde_json::json!("ctx"));
     assert_eq!(context["params"]["cwd"], serde_json::json!(expected_cwd));
 
     let _ = ws.send(ClientMsg::Close(None)).await;
@@ -272,7 +272,7 @@ fn mock_agent_cmd() -> AgentCmd {
     }
 }
 
-async fn spawn_server_with_mock() -> (SocketAddr, Arc<SessionRegistry>) {
+async fn spawn_server_with_mock() -> (SocketAddr, Arc<RoomRegistry>) {
     spawn_server(Some(mock_agent_cmd())).await
 }
 
@@ -850,7 +850,7 @@ async fn rfd533_attach_pending_only_reissues_permission_and_keeps_resolution_in_
     .unwrap();
 
     let resolved = ws_next_method(&mut ws_a, "amux/agent_request_resolved").await;
-    assert_eq!(resolved["params"]["sessionId"], serde_json::json!("rfd533"));
+    assert_eq!(resolved["params"]["roomId"], serde_json::json!("rfd533"));
     assert_eq!(resolved["params"]["requestId"], permission_a["id"]);
     assert_eq!(resolved["params"]["resolvedBy"], serde_json::json!("B"));
     assert_eq!(
@@ -1264,14 +1264,14 @@ async fn original_id_is_preserved_across_mux() {
 
 /// Helper for chunk 5/6 tests: spawn acp-mux with mock_acp wrapped to
 /// pass through env vars (permission emission, prompt delay).
-async fn spawn_server_with_mock_env(env: &[(&str, &str)]) -> (SocketAddr, Arc<SessionRegistry>) {
+async fn spawn_server_with_mock_env(env: &[(&str, &str)]) -> (SocketAddr, Arc<RoomRegistry>) {
     spawn_server(Some(mock_agent_cmd_with_env(env))).await
 }
 
 async fn spawn_server_with_mock_env_and_client_tool_policy(
     env: &[(&str, &str)],
     client_tool_policy: ClientToolPolicy,
-) -> (SocketAddr, Arc<SessionRegistry>) {
+) -> (SocketAddr, Arc<RoomRegistry>) {
     spawn_server_with_client_tool_policy(Some(mock_agent_cmd_with_env(env)), client_tool_policy)
         .await
 }
@@ -1352,7 +1352,7 @@ async fn amux_peer_joined_and_peer_left() {
         .expect("A should see amux/peer_joined for B");
     assert_eq!(pj["params"]["peerId"], serde_json::json!("B"));
     assert_eq!(pj["params"]["peerName"], serde_json::json!("Bob"));
-    assert_eq!(pj["params"]["sessionId"], serde_json::json!("presence"));
+    assert_eq!(pj["params"]["roomId"], serde_json::json!("presence"));
 
     // B receives the replay log on join. The log contains peer_joined
     // for A (so B learns about A) but NOT peer_joined for B (B's own
@@ -1400,7 +1400,7 @@ async fn debug_sessions_reflects_live_state() {
     // Empty registry before any attaches.
     let body = http_get(&format!("http://{addr}/debug/sessions")).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["sessionCount"], serde_json::json!(0));
+    assert_eq!(v["roomCount"], serde_json::json!(0));
 
     // Attach, initialize, drive.
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
@@ -1417,10 +1417,10 @@ async fn debug_sessions_reflects_live_state() {
 
     let body = http_get(&format!("http://{addr}/debug/sessions")).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["sessionCount"], serde_json::json!(1));
+    assert_eq!(v["roomCount"], serde_json::json!(1));
 
-    let s = &v["sessions"][0];
-    assert_eq!(s["sessionId"], serde_json::json!("debug"));
+    let s = &v["rooms"][0];
+    assert_eq!(s["roomId"], serde_json::json!("debug"));
     assert_eq!(s["subscribers"].as_array().unwrap().len(), 1);
     assert_eq!(s["subscribers"][0]["peerId"], serde_json::json!("A"));
     assert_eq!(s["subscribers"][0]["peerName"], serde_json::json!("Alice"));
@@ -1853,7 +1853,7 @@ async fn replay_log_merges_amux_metadata_without_clobbering_existing_meta() {
 #[tokio::test]
 async fn replay_turns_disabled_emits_no_history() {
     let agent_cmd = mock_agent_cmd();
-    let registry = SessionRegistry::new(
+    let registry = RoomRegistry::new(
         Some(agent_cmd),
         ReplayTurns::Disabled,
         Duration::from_secs(60),
@@ -1939,7 +1939,7 @@ async fn amux_turn_started_and_complete() {
             .find(|v| v.get("method") == Some(&serde_json::json!("amux/turn_started")))
             .unwrap_or_else(|| panic!("{label} should see amux/turn_started, frames: {frames:?}"));
         assert_eq!(started["params"]["peerId"], serde_json::json!("A"));
-        assert_eq!(started["params"]["sessionId"], serde_json::json!("turn"));
+        assert_eq!(started["params"]["roomId"], serde_json::json!("turn"));
         assert_eq!(started["params"]["amuxTurnId"], serde_json::json!("at-1"));
         assert_eq!(
             started["params"]["content"],
@@ -2845,7 +2845,7 @@ async fn amux_disconnected_queue_owner_persists_without_becoming_driver() {
 
     let body = http_get(&format!("http://{addr}/debug/sessions")).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let session = &v["sessions"][0];
+    let session = &v["rooms"][0];
     assert_ne!(
         session["drivingSubscriber"],
         serde_json::json!("B"),
@@ -4417,7 +4417,7 @@ async fn session_list_decorates_live_entry_with_amux_metadata() {
         serde_json::json!("preserved")
     );
     assert_eq!(
-        current["_meta"]["amux"]["proxySessionId"],
+        current["_meta"]["amux"]["roomId"],
         serde_json::json!("live-room")
     );
     assert_eq!(
@@ -4700,7 +4700,7 @@ async fn session_load_debug_sessions_exposes_replay_generation_and_acp_update_co
 
     let body = http_get(&format!("http://{addr}/debug/sessions")).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let s = &v["sessions"][0];
+    let s = &v["rooms"][0];
     assert_eq!(s["cachedSessionId"], serde_json::json!("loaded-debug"));
     assert_eq!(s["replayGeneration"], serde_json::json!(1));
     assert_eq!(
@@ -4850,7 +4850,7 @@ async fn debug_sessions_shows_loaded_session_id() {
 
     let body = http_get(&format!("http://{addr}/debug/sessions")).await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let s = &v["sessions"][0];
+    let s = &v["rooms"][0];
     assert_eq!(
         s["cachedSessionId"],
         serde_json::json!("loaded-debug"),

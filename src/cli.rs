@@ -44,6 +44,13 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub unsafe_debug_client_tool_broadcast: bool,
 
+    /// Emit `amux/segment_started` and `amux/segment_ended` lifecycle frames
+    /// on segment rotation (session/load, hermes compaction). Default on;
+    /// disable to keep wire output byte-equivalent with v0.1.x for clients
+    /// that haven't picked up the new frame methods yet.
+    #[arg(long, default_value_t = true)]
+    pub emit_segment_frames: bool,
+
     /// Logging verbosity. Overridden by RUST_LOG when that variable is set.
     #[arg(long, value_enum, default_value_t = LogLevel::Info)]
     pub log_level: LogLevel,

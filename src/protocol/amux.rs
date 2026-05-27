@@ -27,6 +27,8 @@ const METHOD_QUEUE_ITEM_REMOVED: &str = "amux/queue_item_removed";
 const METHOD_QUEUE_ITEM_ORPHANED: &str = "amux/queue_item_orphaned";
 const METHOD_REPLAY_STARTED: &str = "amux/replay_started";
 const METHOD_REPLAY_COMPLETE: &str = "amux/replay_complete";
+const METHOD_SEGMENT_STARTED: &str = "amux/segment_started";
+const METHOD_SEGMENT_ENDED: &str = "amux/segment_ended";
 
 /// Method name for the amux extension that lets any attached peer steer the
 /// current composer state. If a turn is in flight, current mux-owned semantics
@@ -65,6 +67,87 @@ impl AmuxTurnId {
     }
 }
 
+/// Monotonic, per-room segment counter. A segment is the interval during
+/// which a single canonical ACP `sessionId` is in force. Compaction inside
+/// the agent (hermes rotating its internal session id under a stable ACP
+/// id) ends one segment and opens the next; a client-initiated
+/// `session/load` does the same. The first segment of a room opens once
+/// the canonical session id is captured from the agent's `session/new` or
+/// `session/load` response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SegmentId(pub u64);
+
+impl SegmentId {
+    pub fn formatted(self) -> String {
+        format!("seg-{}", self.0)
+    }
+}
+
+impl serde::Serialize for SegmentId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.formatted())
+    }
+}
+
+/// Why a segment closed. Captured on `amux/segment_ended` and exposed via
+/// `/debug/sessions` so operators can distinguish a client-driven session
+/// rotation from a hermes-driven compression rotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndReason {
+    /// Client called `session/load`, swapping the canonical ACP session id.
+    SessionLoad,
+    /// `_meta.hermes` reported a session-split compression — same ACP
+    /// session id, different internal hermes session id.
+    HermesCompression,
+    /// Heuristic detection: an agent frame carried a different ACP
+    /// `sessionId` than the active segment's known value. Used when
+    /// `_meta.hermes` is unavailable.
+    AcpSessionIdChanged,
+}
+
+/// Mirror of the (forthcoming) `_meta.hermes.sessionProvenance` +
+/// `_meta.hermes.compaction` payloads. Fields are populated opportunistic-
+/// ally: heuristic detection (Phase D) leaves most fields `None`; once
+/// hermes ships the metadata, parser fills them in. Late metadata for an
+/// already-open segment is allowed to backfill in place — see
+/// `RoomInner::maybe_rotate_segment` for the policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HermesProvenance {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hermes_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_hermes_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_hermes_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creator_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_depth: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lineage_hermes_session_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_reason: Option<String>,
+}
+
+impl HermesProvenance {
+    pub fn is_empty(&self) -> bool {
+        self == &HermesProvenance::default()
+    }
+}
+
 #[derive(Serialize)]
 struct Frame<'a, P: Serialize> {
     jsonrpc: &'a str,
@@ -75,7 +158,7 @@ struct Frame<'a, P: Serialize> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PeerJoinedParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     peer_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     peer_name: Option<&'a str>,
@@ -86,21 +169,21 @@ struct PeerJoinedParams<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PeerLeftParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     peer_id: &'a str,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionContextParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     cwd: &'a str,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TurnStartedParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     amux_turn_id: &'a str,
     peer_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,7 +198,7 @@ struct TurnStartedParams<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TurnCompleteParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     amux_turn_id: &'a str,
     stop_reason: &'a serde_json::Value,
 }
@@ -123,7 +206,7 @@ struct TurnCompleteParams<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionBusyParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     busy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     held_by: Option<&'a str>,
@@ -137,7 +220,7 @@ struct SessionBusyParams<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentRequestOpenedParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     request_id: &'a serde_json::Value,
     request_method: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,7 +238,7 @@ struct AgentRequestOpenedParams<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentRequestResolvedParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     request_id: &'a serde_json::Value,
     resolved_by: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,7 +257,7 @@ struct AgentRequestResolvedParams<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TurnCancelledParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     amux_turn_id: &'a str,
     cancelled_by: &'a str,
     original_driver: &'a str,
@@ -185,7 +268,7 @@ struct TurnCancelledParams<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ControlSubmittedParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     kind: &'a str,
     mode: &'a str,
     peer_id: &'a str,
@@ -199,7 +282,7 @@ struct ControlSubmittedParams<'a> {
 }
 
 pub struct ControlSubmitted<'a> {
-    pub session_id: &'a str,
+    pub room_id: &'a str,
     pub kind: &'a str,
     pub mode: &'a str,
     pub peer_id: &'a str,
@@ -212,7 +295,7 @@ pub struct ControlSubmitted<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueItemAddedParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     queue_item_id: &'a str,
     peer_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,7 +309,7 @@ struct QueueItemAddedParams<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueItemSubmittedParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     queue_item_id: &'a str,
     amux_turn_id: &'a str,
 }
@@ -234,7 +317,7 @@ struct QueueItemSubmittedParams<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueItemCompletedParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     queue_item_id: &'a str,
     amux_turn_id: &'a str,
     stop_reason: &'a serde_json::Value,
@@ -243,7 +326,7 @@ struct QueueItemCompletedParams<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueItemRemovedParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     queue_item_id: &'a str,
     removed_by: &'a str,
     reason: &'a str,
@@ -252,7 +335,7 @@ struct QueueItemRemovedParams<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueItemOrphanedParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     queue_item_id: &'a str,
     peer_id: &'a str,
 }
@@ -260,7 +343,7 @@ struct QueueItemOrphanedParams<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReplayMarkerParams<'a> {
-    session_id: &'a str,
+    room_id: &'a str,
     phase: &'a str,
     replay_order: &'a str,
     generation: u64,
@@ -278,7 +361,7 @@ fn encode<P: Serialize>(method: &'static str, params: P) -> Vec<u8> {
 }
 
 pub fn peer_joined(
-    session_id: &str,
+    room_id: &str,
     peer_id: &str,
     peer_name: Option<&str>,
     role: Option<&str>,
@@ -286,7 +369,7 @@ pub fn peer_joined(
     encode(
         METHOD_PEER_JOINED,
         PeerJoinedParams {
-            session_id,
+            room_id,
             peer_id,
             peer_name,
             role,
@@ -294,25 +377,25 @@ pub fn peer_joined(
     )
 }
 
-pub fn peer_left(session_id: &str, peer_id: &str) -> Vec<u8> {
+pub fn peer_left(room_id: &str, peer_id: &str) -> Vec<u8> {
     encode(
         METHOD_PEER_LEFT,
         PeerLeftParams {
-            session_id,
+            room_id,
             peer_id,
         },
     )
 }
 
-pub fn session_context(session_id: &str, cwd: &str) -> Vec<u8> {
+pub fn session_context(room_id: &str, cwd: &str) -> Vec<u8> {
     encode(
         METHOD_SESSION_CONTEXT,
-        SessionContextParams { session_id, cwd },
+        SessionContextParams { room_id, cwd },
     )
 }
 
 pub fn turn_started(
-    session_id: &str,
+    room_id: &str,
     amux_turn_id: AmuxTurnId,
     peer_id: &str,
     peer_name: Option<&str>,
@@ -325,7 +408,7 @@ pub fn turn_started(
     encode(
         METHOD_TURN_STARTED,
         TurnStartedParams {
-            session_id,
+            room_id,
             amux_turn_id: &id,
             peer_id,
             peer_name,
@@ -337,7 +420,7 @@ pub fn turn_started(
 }
 
 pub fn turn_complete(
-    session_id: &str,
+    room_id: &str,
     amux_turn_id: AmuxTurnId,
     stop_reason: &serde_json::Value,
 ) -> Vec<u8> {
@@ -345,18 +428,18 @@ pub fn turn_complete(
     encode(
         METHOD_TURN_COMPLETE,
         TurnCompleteParams {
-            session_id,
+            room_id,
             amux_turn_id: &id,
             stop_reason,
         },
     )
 }
 
-pub fn session_busy(session_id: &str, busy: bool, held_by: Option<&str>) -> Vec<u8> {
+pub fn session_busy(room_id: &str, busy: bool, held_by: Option<&str>) -> Vec<u8> {
     encode(
         METHOD_SESSION_BUSY,
         SessionBusyParams {
-            session_id,
+            room_id,
             busy,
             held_by,
         },
@@ -364,7 +447,7 @@ pub fn session_busy(session_id: &str, busy: bool, held_by: Option<&str>) -> Vec<
 }
 
 pub fn turn_cancelled(
-    session_id: &str,
+    room_id: &str,
     amux_turn_id: AmuxTurnId,
     cancelled_by: &str,
     original_driver: &str,
@@ -374,7 +457,7 @@ pub fn turn_cancelled(
     encode(
         METHOD_TURN_CANCELLED,
         TurnCancelledParams {
-            session_id,
+            room_id,
             amux_turn_id: &id,
             cancelled_by,
             original_driver,
@@ -388,7 +471,7 @@ pub fn control_submitted(event: ControlSubmitted<'_>) -> Vec<u8> {
     encode(
         METHOD_CONTROL_SUBMITTED,
         ControlSubmittedParams {
-            session_id: event.session_id,
+            room_id: event.room_id,
             kind: event.kind,
             mode: event.mode,
             peer_id: event.peer_id,
@@ -401,7 +484,7 @@ pub fn control_submitted(event: ControlSubmitted<'_>) -> Vec<u8> {
 }
 
 pub fn queue_item_added(
-    session_id: &str,
+    room_id: &str,
     queue_item_id: &str,
     peer_id: &str,
     peer_name: Option<&str>,
@@ -411,7 +494,7 @@ pub fn queue_item_added(
     encode(
         METHOD_QUEUE_ITEM_ADDED,
         QueueItemAddedParams {
-            session_id,
+            room_id,
             queue_item_id,
             peer_id,
             peer_name,
@@ -423,7 +506,7 @@ pub fn queue_item_added(
 }
 
 pub fn queue_item_submitted(
-    session_id: &str,
+    room_id: &str,
     queue_item_id: &str,
     amux_turn_id: AmuxTurnId,
 ) -> Vec<u8> {
@@ -431,7 +514,7 @@ pub fn queue_item_submitted(
     encode(
         METHOD_QUEUE_ITEM_SUBMITTED,
         QueueItemSubmittedParams {
-            session_id,
+            room_id,
             queue_item_id,
             amux_turn_id: &id,
         },
@@ -439,7 +522,7 @@ pub fn queue_item_submitted(
 }
 
 pub fn queue_item_completed(
-    session_id: &str,
+    room_id: &str,
     queue_item_id: &str,
     amux_turn_id: AmuxTurnId,
     stop_reason: &serde_json::Value,
@@ -448,7 +531,7 @@ pub fn queue_item_completed(
     encode(
         METHOD_QUEUE_ITEM_COMPLETED,
         QueueItemCompletedParams {
-            session_id,
+            room_id,
             queue_item_id,
             amux_turn_id: &id,
             stop_reason,
@@ -456,11 +539,11 @@ pub fn queue_item_completed(
     )
 }
 
-pub fn queue_item_removed(session_id: &str, queue_item_id: &str, removed_by: &str) -> Vec<u8> {
+pub fn queue_item_removed(room_id: &str, queue_item_id: &str, removed_by: &str) -> Vec<u8> {
     encode(
         METHOD_QUEUE_ITEM_REMOVED,
         QueueItemRemovedParams {
-            session_id,
+            room_id,
             queue_item_id,
             removed_by,
             reason: "unqueued",
@@ -468,11 +551,11 @@ pub fn queue_item_removed(session_id: &str, queue_item_id: &str, removed_by: &st
     )
 }
 
-pub fn queue_item_orphaned(session_id: &str, queue_item_id: &str, peer_id: &str) -> Vec<u8> {
+pub fn queue_item_orphaned(room_id: &str, queue_item_id: &str, peer_id: &str) -> Vec<u8> {
     encode(
         METHOD_QUEUE_ITEM_ORPHANED,
         QueueItemOrphanedParams {
-            session_id,
+            room_id,
             queue_item_id,
             peer_id,
         },
@@ -480,7 +563,7 @@ pub fn queue_item_orphaned(session_id: &str, queue_item_id: &str, peer_id: &str)
 }
 
 pub fn replay_started(
-    session_id: &str,
+    room_id: &str,
     phase: &str,
     replay_order: &str,
     generation: u64,
@@ -490,7 +573,7 @@ pub fn replay_started(
     encode(
         METHOD_REPLAY_STARTED,
         ReplayMarkerParams {
-            session_id,
+            room_id,
             phase,
             replay_order,
             generation,
@@ -501,7 +584,7 @@ pub fn replay_started(
 }
 
 pub fn replay_complete(
-    session_id: &str,
+    room_id: &str,
     phase: &str,
     replay_order: &str,
     generation: u64,
@@ -511,7 +594,7 @@ pub fn replay_complete(
     encode(
         METHOD_REPLAY_COMPLETE,
         ReplayMarkerParams {
-            session_id,
+            room_id,
             phase,
             replay_order,
             generation,
@@ -522,7 +605,7 @@ pub fn replay_complete(
 }
 
 pub fn agent_request_opened(
-    session_id: &str,
+    room_id: &str,
     request_id: &serde_json::Value,
     request_method: &str,
     request_params: Option<&serde_json::Value>,
@@ -532,7 +615,7 @@ pub fn agent_request_opened(
     encode(
         METHOD_AGENT_REQUEST_OPENED,
         AgentRequestOpenedParams {
-            session_id,
+            room_id,
             request_id,
             request_method,
             request_params,
@@ -541,8 +624,74 @@ pub fn agent_request_opened(
     )
 }
 
+/// Lifecycle frame emitted when a segment opens. The first segment of a
+/// room emits this alone (no `amux/segment_ended` precedes it). Subsequent
+/// segments emit `amux/segment_ended` for the closing segment first, then
+/// this frame for the opening one. Recorded in the transcript so late
+/// joiners on `historyPolicy: full_lineage` see the boundary.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SegmentStartedParams<'a> {
+    room_id: &'a str,
+    segment_id: SegmentId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acp_session_id: Option<&'a str>,
+    opened_at: &'a str,
+    #[serde(skip_serializing_if = "HermesProvenance::is_empty")]
+    provenance: &'a HermesProvenance,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SegmentEndedParams<'a> {
+    room_id: &'a str,
+    segment_id: SegmentId,
+    closed_at: &'a str,
+    end_reason: EndReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    successor_segment_id: Option<SegmentId>,
+}
+
+pub fn segment_started(
+    room_id: &str,
+    segment_id: SegmentId,
+    acp_session_id: Option<&str>,
+    opened_at: &str,
+    provenance: &HermesProvenance,
+) -> Vec<u8> {
+    encode(
+        METHOD_SEGMENT_STARTED,
+        SegmentStartedParams {
+            room_id,
+            segment_id,
+            acp_session_id,
+            opened_at,
+            provenance,
+        },
+    )
+}
+
+pub fn segment_ended(
+    room_id: &str,
+    segment_id: SegmentId,
+    closed_at: &str,
+    end_reason: EndReason,
+    successor_segment_id: Option<SegmentId>,
+) -> Vec<u8> {
+    encode(
+        METHOD_SEGMENT_ENDED,
+        SegmentEndedParams {
+            room_id,
+            segment_id,
+            closed_at,
+            end_reason,
+            successor_segment_id,
+        },
+    )
+}
+
 pub fn agent_request_resolved(
-    session_id: &str,
+    room_id: &str,
     request_id: &serde_json::Value,
     resolved_by: &str,
     result: Option<&serde_json::Value>,
@@ -551,7 +700,7 @@ pub fn agent_request_resolved(
     encode(
         METHOD_AGENT_REQUEST_RESOLVED,
         AgentRequestResolvedParams {
-            session_id,
+            room_id,
             request_id,
             resolved_by,
             result,
@@ -581,7 +730,7 @@ mod tests {
         let v = parse(&bytes);
         assert_eq!(v["jsonrpc"], json!("2.0"));
         assert_eq!(v["method"], json!("amux/peer_joined"));
-        assert_eq!(v["params"]["sessionId"], json!("work"));
+        assert_eq!(v["params"]["roomId"], json!("work"));
         assert_eq!(v["params"]["peerId"], json!("phone-1"));
         assert_eq!(v["params"]["peerName"], json!("phone"));
         assert_eq!(v["params"]["role"], json!("default"));
@@ -599,7 +748,7 @@ mod tests {
     fn peer_left_shape() {
         let v = parse(&peer_left("work", "p1"));
         assert_eq!(v["method"], json!("amux/peer_left"));
-        assert_eq!(v["params"]["sessionId"], json!("work"));
+        assert_eq!(v["params"]["roomId"], json!("work"));
         assert_eq!(v["params"]["peerId"], json!("p1"));
         assert!(v.get("id").is_none());
     }
@@ -637,7 +786,7 @@ mod tests {
     fn session_busy_shape() {
         let v = parse(&session_busy("work", true, Some("desktop-1")));
         assert_eq!(v["method"], json!("amux/session_busy"));
-        assert_eq!(v["params"]["sessionId"], json!("work"));
+        assert_eq!(v["params"]["roomId"], json!("work"));
         assert_eq!(v["params"]["busy"], json!(true));
         assert_eq!(v["params"]["heldBy"], json!("desktop-1"));
 
@@ -661,7 +810,7 @@ mod tests {
         ));
         assert_eq!(v["method"], json!("amux/agent_request_opened"));
         assert!(v.get("id").is_none());
-        assert_eq!(v["params"]["sessionId"], json!("work"));
+        assert_eq!(v["params"]["roomId"], json!("work"));
         assert_eq!(v["params"]["requestId"], req_id);
         assert_eq!(
             v["params"]["requestMethod"],
@@ -698,7 +847,7 @@ mod tests {
             None,
         ));
         assert_eq!(v["method"], json!("amux/agent_request_resolved"));
-        assert_eq!(v["params"]["sessionId"], json!("work"));
+        assert_eq!(v["params"]["roomId"], json!("work"));
         assert_eq!(v["params"]["requestId"], req_id);
         assert_eq!(v["params"]["resolvedBy"], json!("alice"));
         assert_eq!(v["params"]["result"], result);
