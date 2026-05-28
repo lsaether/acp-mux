@@ -470,6 +470,21 @@ fn rebuild_compaction_from_frame(
                 .unwrap_or_else(|| compaction_count.saturating_add(1));
             *compaction_count = (*compaction_count).max(observed);
         }
+        "amux/turn_complete" => {
+            // Durable mirror of `clear_stale_compaction_at_turn_end`: a
+            // `started` with no matching `done` by the time a turn settles
+            // was abandoned. The live path clears the transient flag in
+            // memory and emits no frame, so without applying the same
+            // bound here, restart hydration would replay the persisted
+            // `started` and resurrect `active = true` forever.
+            // `amux/turn_complete` is broadcast (and therefore persisted)
+            // on every prompt-turn settlement, so it's a reliable durable
+            // bound. Count and history timestamps stay untouched.
+            if compaction_state.active {
+                compaction_state.active = false;
+                compaction_state.pending_hermes_session_id = None;
+            }
+        }
         _ => {}
     }
 }
@@ -4617,6 +4632,79 @@ mod tests {
         let snap = inner.build_snapshot(false);
         let compaction = snap.compaction.expect("compaction lifecycle present");
         assert!(!compaction.active, "snapshot reflects cleared state");
+    }
+
+    #[test]
+    fn hydration_clears_stranded_compaction_via_persisted_turn_complete() {
+        // Durability guard for the turn-settlement clear: a `started`
+        // with no `done`, followed by a settled turn, must NOT come back
+        // as active=true after a replay-store restart. The persisted
+        // amux/turn_complete is the durable bound.
+        let dir = std::env::temp_dir().join(format!(
+            "amux-hydration-stranded-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(ReplayStore::open(&dir).unwrap());
+
+        // Run #1: started with no done, then the prompt turn settles
+        // (persists amux/turn_complete).
+        {
+            let mut inner = test_inner_with_store(store.clone());
+            inner.set_canonical_session_id_with_reason("acp-stable", EndReason::SessionLoad);
+            let mux_id = 5u64;
+            inner.pending.insert(
+                mux_id,
+                PendingRequest {
+                    peer_id: "p".into(),
+                    original_id: Id::Number(1),
+                    handshake: None,
+                    decorate_session_list: false,
+                    deliver_response: false,
+                    queue_item_id: None,
+                },
+            );
+            inner.active_turn_mux_id = Some(mux_id);
+            inner.active_amux_turn_id = Some(AmuxTurnId(1));
+            inner.handle_agent_stderr_line(
+                b"agent.conversation_compression: context compression started: session=hs messages=50"
+                    .to_vec(),
+            );
+            let resp = IncomingResponse {
+                jsonrpc: JsonRpcVersion,
+                id: Id::Number(mux_id as i64),
+                result: Some(json!({ "stopReason": "end_turn" })),
+                error: None,
+            };
+            inner.route_agent_response(resp);
+            assert!(
+                !inner
+                    .build_snapshot(false)
+                    .compaction
+                    .expect("live compaction state")
+                    .active,
+                "live path clears at turn settlement",
+            );
+        }
+
+        // Run #2: rebuild from the same store. Without the turn_complete
+        // hydration arm this comes back active=true.
+        let restored = test_inner_with_store(store);
+        let snap = restored.build_snapshot(false);
+        let compaction = snap
+            .compaction
+            .expect("compaction lifecycle restored from the started frame");
+        assert!(
+            !compaction.active,
+            "persisted amux/turn_complete must clear stranded active across restart",
+        );
+        assert_eq!(snap.compaction_count, 0, "no done means no count");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
