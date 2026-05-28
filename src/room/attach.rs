@@ -232,6 +232,8 @@ impl RoomInner {
                 .map(crate::room::state::segment_summary)
                 .collect(),
             active_segment_id: self.active_segment_id,
+            compression_count: self.compaction_count,
+            compaction: self.attach_compaction_summary(),
         }
     }
 

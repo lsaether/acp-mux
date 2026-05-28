@@ -633,6 +633,93 @@ sweep the mux drops any late subscriber reply for the same id at the
 first-reply-wins gate, so the agent never sees a duplicate or stale
 answer.
 
+### `amux/context_compaction_started` / `amux/context_compaction_done`
+
+Mux-observed Hermes context compaction lifecycle. The mux derives these
+from the Hermes agent's stderr stream when started with
+`--hermes-compaction-signals`; without that flag the mux never infers a
+compaction event from log text, so non-Hermes agents (e.g.
+claude-agent-acp) cannot trip a false positive on an unrelated log line.
+
+`amux/context_compaction_started` is broadcast when the mux observes the
+`agent.conversation_compression: context compression started: …` line.
+It is transient lifecycle state — clients render a "compacting…"
+indicator and drop it on the matching `done`.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "amux/context_compaction_started",
+  "params": {
+    "roomId": "review",
+    "source": "hermes_stderr",
+    "hermesSessionId": "20260527_202251_df54bf",
+    "messagesBefore": 50,
+    "tokensApproxBefore": 72908,
+    "model": "gpt-5.5"
+  }
+}
+```
+
+`amux/context_compaction_done` is broadcast when the mux observes the
+matching `context compression done: …` line. On the `done` line the mux
+also closes the active segment with `endReason: "hermes_compression"`
+and opens a new segment for the post-compaction head (see `amux/segment_*`
+above) — the same wire effect that `--emit-segment-frames` already produces
+for client-driven `session/load`. The compaction lifecycle frame carries
+the running `compressionCount` and references both segments so clients can
+correlate the rotation:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "amux/context_compaction_done",
+  "params": {
+    "roomId": "review",
+    "source": "hermes_stderr",
+    "hermesSessionId": "20260527_202251_df54bf",
+    "messagesBefore": 50,
+    "messagesAfter": 9,
+    "tokensApproxAfter": 54700,
+    "compressionCount": 1,
+    "previousSegmentId": "seg-1",
+    "successorSegmentId": "seg-2"
+  }
+}
+```
+
+Every field except `roomId`, `source`, and `compressionCount` is optional
+and may be omitted when the stderr line did not carry the underlying
+fact. `source` is currently always `"hermes_stderr"`; a future
+structured Hermes signal (#62) will provide a distinct source label.
+
+The `session/attach` snapshot path also surfaces the *current* state
+without requiring the client to have observed the live frames:
+
+```json
+{
+  "compressionCount": 1,
+  "compaction": {
+    "active": false,
+    "lastSource": "hermes_stderr",
+    "lastStartedAt": "2026-05-27T21:27:04Z",
+    "lastCompletedAt": "2026-05-27T21:27:08Z"
+  }
+}
+```
+
+The attach snapshot is the only place the mux re-states compaction state
+on demand. Clients that consume the live replay stream (the broadcast
+log) learn it through `amux/context_compaction_*` events in order with
+the rest of the transcript; clients that prefer one-shot reconciliation
+read it from the attach snapshot. The two paths are equivalent — the
+snapshot is just a convenience for late joiners.
+
+Compaction count never decrements. `--hermes-compaction-signals` is off
+by default; the mux still pipes child stderr (mirrored back to the
+operator terminal labeled `[AGENT <room>]`) but never invokes the
+parser when the flag is off.
+
 ## `_meta.amux` request trace metadata
 
 amux can optionally use ACP `_meta` passthrough to carry mux-owned trace
