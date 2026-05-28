@@ -231,6 +231,13 @@ struct Hydrated {
     /// canonical-id change (fresh `session/new` returning a different
     /// id, or `session/load`) rotates the segment as normal.
     canonical_session_id: Option<String>,
+    /// Mux-observed compactions rebuilt from persisted
+    /// `amux/context_compaction_done` frames. Lets the restored room
+    /// answer `snapshot.compressionCount` correctly across restart.
+    compaction_count: u64,
+    /// Rebuilt compaction lifecycle for `snapshot.compaction` /
+    /// `AttachCompactionSummary`.
+    compaction_state: CompactionState,
 }
 
 impl Default for Hydrated {
@@ -245,6 +252,8 @@ impl Default for Hydrated {
             next_replay_seq: 1,
             next_segment_id: 1,
             canonical_session_id: None,
+            compaction_count: 0,
+            compaction_state: CompactionState::default(),
         }
     }
 }
@@ -271,6 +280,8 @@ fn hydrate_from_store(
     let mut max_segment_id = 0u64;
     let mut segments: Vec<Segment> = Vec::new();
     let mut active_segment_id: Option<SegmentId> = None;
+    let mut compaction_count: u64 = 0;
+    let mut compaction_state = CompactionState::default();
 
     for record in &loaded {
         max_seq = max_seq.max(record.seq);
@@ -278,9 +289,16 @@ fn hydrate_from_store(
         rebuild_segment_from_frame(
             &record.frame,
             SegmentId(record.segment_id),
+            record.seq,
             &record.recorded_at,
             &mut segments,
             &mut active_segment_id,
+        );
+        rebuild_compaction_from_frame(
+            &record.frame,
+            &record.recorded_at,
+            &mut compaction_count,
+            &mut compaction_state,
         );
         log.push_back(ReplayEntry::from_persisted(
             record.seq,
@@ -295,6 +313,7 @@ fn hydrate_from_store(
             room = %room_id,
             frames = loaded.len(),
             segments = segments.len(),
+            compaction_count,
             "replay store: hydrated room from disk",
         );
     }
@@ -314,15 +333,24 @@ fn hydrate_from_store(
         next_replay_seq: max_seq.saturating_add(1).max(1),
         next_segment_id: max_segment_id.saturating_add(1).max(1),
         canonical_session_id,
+        compaction_count,
+        compaction_state,
     }
 }
 
 /// Walk a persisted broadcast frame and update the rebuilt `segments`
 /// vec / `active_segment_id` based on `amux/segment_started` and
 /// `amux/segment_ended` notifications. Other frames are ignored.
+///
+/// Restored fields per segment, sourced from the bookend frame's
+/// `params`: `acp_session_id`, `provenance`, `end_reason`. The
+/// `opened_replay_seq` / `closed_replay_seq` come from the persisted
+/// record's `seq` so cross-restart segment-bracket slicing stays
+/// correct.
 fn rebuild_segment_from_frame(
     frame: &Value,
     frame_segment_id: SegmentId,
+    record_seq: u64,
     recorded_at: &str,
     segments: &mut Vec<Segment>,
     active_segment_id: &mut Option<SegmentId>,
@@ -337,11 +365,13 @@ fn rebuild_segment_from_frame(
                 .and_then(|p| p.get("acpSessionId"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            // Use the frame's recorded_at as opened_at — that's when
-            // the segment_started bookend was emitted on the original
-            // run, which is the closest persistence-time signal.
-            let mut seg = Segment::open(frame_segment_id, acp_session_id, 0);
+            let provenance = params
+                .and_then(|p| p.get("provenance"))
+                .and_then(|v| serde_json::from_value::<HermesProvenance>(v.clone()).ok())
+                .unwrap_or_default();
+            let mut seg = Segment::open(frame_segment_id, acp_session_id, record_seq);
             seg.opened_at = recorded_at.to_string();
+            seg.provenance = provenance;
             // De-dup: a `segment_started` bookend lives in its own
             // segment, so a second observation of the same id would be
             // unexpected. Skip if already present.
@@ -351,17 +381,94 @@ fn rebuild_segment_from_frame(
             *active_segment_id = Some(frame_segment_id);
         }
         "amux/segment_ended" => {
+            // SegmentId serializes as the string "seg-N"; accept either
+            // shape for forward/backward compatibility (older persisted
+            // logs may have carried a raw u64).
             let closing_id = params
                 .and_then(|p| p.get("segmentId"))
-                .and_then(|v| v.as_u64())
-                .map(SegmentId)
+                .and_then(parse_segment_id_value)
                 .unwrap_or(frame_segment_id);
+            let end_reason = params
+                .and_then(|p| p.get("endReason"))
+                .and_then(|v| serde_json::from_value::<EndReason>(v.clone()).ok());
             if let Some(seg) = segments.iter_mut().find(|s| s.id == closing_id) {
                 seg.closed_at = Some(recorded_at.to_string());
+                seg.closed_replay_seq = Some(record_seq);
+                if seg.end_reason.is_none() {
+                    seg.end_reason = end_reason;
+                }
             }
             if *active_segment_id == Some(closing_id) {
                 *active_segment_id = None;
             }
+        }
+        _ => {}
+    }
+}
+
+fn parse_segment_id_value(value: &Value) -> Option<SegmentId> {
+    if let Some(n) = value.as_u64() {
+        return Some(SegmentId(n));
+    }
+    let s = value.as_str()?;
+    let trimmed = s.strip_prefix("seg-").unwrap_or(s);
+    trimmed.parse::<u64>().ok().map(SegmentId)
+}
+
+/// Walk a persisted broadcast frame and update the rebuilt
+/// `compaction_count` / `compaction_state` based on
+/// `amux/context_compaction_started` / `amux/context_compaction_done`
+/// notifications. Other frames are ignored.
+///
+/// `compaction_count` rebuilds to the maximum `compressionCount`
+/// observed across persisted `done` frames — equivalent to a count of
+/// completed compactions because the live path increments by 1 each
+/// time. Reading the max (rather than counting frames) tolerates a log
+/// that lost a `done` between persistence and restart without
+/// underreporting.
+fn rebuild_compaction_from_frame(
+    frame: &Value,
+    recorded_at: &str,
+    compaction_count: &mut u64,
+    compaction_state: &mut CompactionState,
+) {
+    let Some(method) = frame.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    let params = frame.get("params").and_then(Value::as_object);
+    match method {
+        "amux/context_compaction_started" => {
+            compaction_state.active = true;
+            compaction_state.last_started_at = Some(recorded_at.to_string());
+            compaction_state.last_source = params
+                .and_then(|p| p.get("source"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    Some(crate::protocol::amux::COMPACTION_SOURCE_HERMES_STDERR.to_string())
+                });
+            compaction_state.pending_hermes_session_id = params
+                .and_then(|p| p.get("hermesSessionId"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        "amux/context_compaction_done" => {
+            compaction_state.active = false;
+            compaction_state.pending_hermes_session_id = None;
+            compaction_state.last_completed_at = Some(recorded_at.to_string());
+            compaction_state.last_source = params
+                .and_then(|p| p.get("source"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| compaction_state.last_source.clone())
+                .or_else(|| {
+                    Some(crate::protocol::amux::COMPACTION_SOURCE_HERMES_STDERR.to_string())
+                });
+            let observed = params
+                .and_then(|p| p.get("compressionCount"))
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| compaction_count.saturating_add(1));
+            *compaction_count = (*compaction_count).max(observed);
         }
         _ => {}
     }
@@ -1153,6 +1260,8 @@ impl RoomInner {
             next_replay_seq,
             next_segment_id,
             canonical_session_id,
+            compaction_count,
+            compaction_state,
         } = hydrated;
 
         Self {
@@ -1188,8 +1297,8 @@ impl RoomInner {
             emit_segment_frames,
             replay_store: room_store_handle,
             hermes_compaction_signals,
-            compaction_count: 0,
-            compaction_state: CompactionState::default(),
+            compaction_count,
+            compaction_state,
         }
     }
 
@@ -3481,6 +3590,22 @@ mod tests {
         )
     }
 
+    fn test_inner_with_store(replay_store: Arc<ReplayStore>) -> RoomInner {
+        let (tx, _rx) = mpsc::channel(1);
+        RoomInner::new(
+            "hydrate-room".to_string(),
+            "/tmp".to_string(),
+            ReplayTurns::Unbounded,
+            false,
+            ClientToolPolicy::default(),
+            Arc::new(SessionListMetadataIndex::new()),
+            tx,
+            true,
+            true,
+            Some(replay_store),
+        )
+    }
+
     #[test]
     fn first_canonical_session_id_opens_initial_segment() {
         let mut inner = test_inner();
@@ -4260,6 +4385,112 @@ mod tests {
             baseline_frames,
             "flag off → no amux/* broadcast from stderr",
         );
+    }
+
+    #[test]
+    fn hydration_restores_compaction_count_and_segment_end_reason() {
+        // Round-trip: write live compaction frames into a real
+        // on-disk replay store, drop the room, rebuild a fresh
+        // RoomInner from the same store, and assert every restored
+        // piece of state matches the original. This is the regression
+        // guard for the "restart hydration loses compaction truth"
+        // bug — without the rebuild paths populated, the snapshot
+        // would come back with compressionCount=0 and segments
+        // missing endReason/provenance.
+        let dir = std::env::temp_dir().join(format!(
+            "amux-hydration-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(ReplayStore::open(&dir).unwrap());
+
+        // Run #1: emit a compaction and let the room persist its
+        // broadcast log.
+        {
+            let mut inner = test_inner_with_store(store.clone());
+            inner.set_canonical_session_id_with_reason("acp-stable", EndReason::SessionLoad);
+            inner.handle_agent_stderr_line(b"agent.conversation_compression: context compression started: session=hs-old messages=50 tokens=~1000 model=gpt-5.5".to_vec());
+            inner.handle_agent_stderr_line(b"agent.conversation_compression: context compression done: session=hs-old messages=50->9 tokens=~700".to_vec());
+            // Assert the live snapshot first so a regression is obvious
+            // whether it's in the hydrate path or the live path.
+            let live = inner.build_snapshot(false);
+            assert_eq!(live.compaction_count, 1);
+            assert_eq!(live.segments.len(), 2);
+            assert_eq!(
+                live.segments[0].end_reason,
+                Some(EndReason::HermesCompression),
+            );
+        }
+
+        // Run #2: fresh room from the same store. With the hydration
+        // bug, this snapshot would be the defaulted/empty state.
+        let restored = test_inner_with_store(store);
+        let snap = restored.build_snapshot(false);
+        assert_eq!(
+            snap.compaction_count, 1,
+            "compressionCount must survive restart",
+        );
+        let compaction = snap.compaction.expect("compaction lifecycle restored");
+        assert!(!compaction.active);
+        assert_eq!(compaction.last_source.as_deref(), Some("hermes_stderr"));
+        assert!(compaction.last_started_at.is_some());
+        assert!(compaction.last_completed_at.is_some());
+
+        assert_eq!(snap.segments.len(), 2, "segments must rebuild");
+        let seg1 = &snap.segments[0];
+        assert_eq!(seg1.id, SegmentId(1));
+        assert_eq!(
+            seg1.end_reason,
+            Some(EndReason::HermesCompression),
+            "segment_ended endReason must survive restart",
+        );
+        assert!(
+            seg1.closed_replay_seq.is_some(),
+            "closed_replay_seq must be restored from persisted record seq",
+        );
+        let seg2 = &snap.segments[1];
+        assert_eq!(seg2.id, SegmentId(2));
+        assert_eq!(seg2.acp_session_id.as_deref(), Some("acp-stable"));
+        assert!(
+            seg2.opened_replay_seq > 0,
+            "opened_replay_seq must be restored from persisted record seq, not 0",
+        );
+        assert_eq!(
+            seg2.provenance.last_mode.as_deref(),
+            Some("session_split"),
+            "segment_started provenance must survive restart",
+        );
+
+        // The replayed amux/context_compaction_done frame stays
+        // consistent with the snapshot's compressionCount.
+        let log = restored.replay_log.as_ref().expect("log restored");
+        let done = log
+            .iter()
+            .find_map(|e| {
+                let v: serde_json::Value = serde_json::from_slice(&e.frame).ok()?;
+                if v.get("method")? == "amux/context_compaction_done" {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .expect("done frame restored");
+        assert_eq!(
+            done["params"]["compressionCount"].as_u64(),
+            Some(snap.compaction_count),
+        );
+
+        let attach = restored
+            .attach_compaction_summary()
+            .expect("attach summary restored");
+        assert!(!attach.active);
+        assert_eq!(attach.last_source.as_deref(), Some("hermes_stderr"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

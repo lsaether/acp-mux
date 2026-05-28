@@ -103,7 +103,7 @@ impl serde::Serialize for SegmentId {
 /// Why a segment closed. Captured on `amux/segment_ended` and exposed via
 /// `/debug/sessions` so operators can distinguish a client-driven session
 /// rotation from a hermes-driven compression rotation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndReason {
     /// Client called `session/load`, swapping the canonical ACP session id.
@@ -123,8 +123,8 @@ pub enum EndReason {
 /// hermes ships the metadata, parser fills them in. Late metadata for an
 /// already-open segment is allowed to backfill in place — see
 /// `RoomInner::maybe_rotate_segment` for the policy.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct HermesProvenance {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
