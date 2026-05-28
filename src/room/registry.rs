@@ -19,6 +19,7 @@ use crate::agent::process::AgentProcess;
 use crate::cli::{ClientToolPolicy, ReplayTurns};
 use crate::multiplex::subscriber::Subscriber;
 use crate::protocol::jsonrpc::{Id, Incoming, JsonRpcError, ParseError};
+use crate::room::replay_store::ReplayStore;
 use crate::room::state::{
     AttachError, RoomHandle, RoomMsg, RoomOptions, RoomSnapshot, SessionListMetadataIndex,
     spawn_room,
@@ -137,6 +138,7 @@ pub struct RoomRegistry {
     meta_propagate: bool,
     client_tool_policy: ClientToolPolicy,
     emit_segment_frames: bool,
+    replay_store: Option<Arc<ReplayStore>>,
     session_list_index: Arc<SessionListMetadataIndex>,
     sessions: Mutex<HashMap<String, RoomHandle>>,
 }
@@ -196,6 +198,26 @@ impl RoomRegistry {
         client_tool_policy: ClientToolPolicy,
         emit_segment_frames: bool,
     ) -> Arc<Self> {
+        Self::new_with_replay_store(
+            agent_cmd,
+            replay_policy,
+            session_ttl,
+            meta_propagate,
+            client_tool_policy,
+            emit_segment_frames,
+            None,
+        )
+    }
+
+    pub fn new_with_replay_store(
+        agent_cmd: Option<AgentCmd>,
+        replay_policy: ReplayTurns,
+        session_ttl: Duration,
+        meta_propagate: bool,
+        client_tool_policy: ClientToolPolicy,
+        emit_segment_frames: bool,
+        replay_store: Option<Arc<ReplayStore>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             agent_cmd,
             replay_policy,
@@ -203,6 +225,7 @@ impl RoomRegistry {
             meta_propagate,
             client_tool_policy,
             emit_segment_frames,
+            replay_store,
             session_list_index: Arc::new(SessionListMetadataIndex::new()),
             sessions: Mutex::new(HashMap::new()),
         })
@@ -315,6 +338,7 @@ impl RoomRegistry {
                 session_list_index: self.session_list_index.clone(),
                 agent_cwd,
                 emit_segment_frames: self.emit_segment_frames,
+                replay_store: self.replay_store.clone(),
             },
         );
         sessions.insert(session_id.to_string(), handle.clone());

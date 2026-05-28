@@ -82,6 +82,7 @@ use crate::agent::process::AgentProcess;
 use crate::cli::{ClientToolMode, ClientToolPolicy, ReplayTurns};
 use crate::multiplex::subscriber::{OutMsg, Subscriber};
 use crate::protocol::amux::{self, AmuxTurnId, EndReason, HermesProvenance, SegmentId};
+use crate::room::replay_store::ReplayStore;
 use crate::protocol::attach::{self, SegmentSummary};
 use crate::protocol::jsonrpc::{
     Id, Incoming, IncomingRequest, IncomingResponse, JsonRpcError, JsonRpcVersion,
@@ -199,8 +200,170 @@ impl ReplayEntry {
         }
     }
 
+    /// Rebuild a `ReplayEntry` from a persisted record. Preserves the
+    /// original `recorded_at` (criterion: replay metadata must use the
+    /// mux-recorded time, not now).
+    fn from_persisted(seq: u64, frame: Bytes, segment_id: SegmentId, recorded_at: String) -> Self {
+        Self {
+            frame,
+            recorded_at,
+            seq,
+            segment_id,
+        }
+    }
+
     pub(super) fn frame_for_replay(&self) -> Bytes {
         inject_replay_metadata(&self.frame, &self.recorded_at, self.seq)
+    }
+}
+
+/// Outcome of replaying the on-disk store into a fresh `RoomInner`.
+struct Hydrated {
+    replay_store: Option<crate::room::replay_store::RoomReplayStore>,
+    segments: Vec<Segment>,
+    active_segment_id: Option<SegmentId>,
+    next_replay_seq: u64,
+    next_segment_id: u64,
+    /// Canonical ACP `sessionId` observed at the time the persisted log
+    /// was written. Restored so late joiners can `session/attach` with
+    /// the original `sessionId` before the fresh agent has had a chance
+    /// to issue a new `session/new` / `session/load`. The next
+    /// canonical-id change (fresh `session/new` returning a different
+    /// id, or `session/load`) rotates the segment as normal.
+    canonical_session_id: Option<String>,
+}
+
+impl Default for Hydrated {
+    /// Matches the no-store-configured baseline: 1 is the first id that
+    /// `RoomInner::new` historically used for both seq and segment id
+    /// allocators.
+    fn default() -> Self {
+        Self {
+            replay_store: None,
+            segments: Vec::new(),
+            active_segment_id: None,
+            next_replay_seq: 1,
+            next_segment_id: 1,
+            canonical_session_id: None,
+        }
+    }
+}
+
+fn hydrate_from_store(
+    store: &Arc<ReplayStore>,
+    room_id: &str,
+    log: &mut VecDeque<ReplayEntry>,
+) -> Hydrated {
+    let mut handle = match store.open_room(room_id) {
+        Ok(h) => h,
+        Err(err) => {
+            tracing::error!(
+                room = %room_id,
+                error = %err,
+                "replay store: failed to open per-room handle; continuing without persistence",
+            );
+            return Hydrated::default();
+        }
+    };
+
+    let loaded = handle.take_loaded();
+    let mut max_seq = 0u64;
+    let mut max_segment_id = 0u64;
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut active_segment_id: Option<SegmentId> = None;
+
+    for record in &loaded {
+        max_seq = max_seq.max(record.seq);
+        max_segment_id = max_segment_id.max(record.segment_id);
+        rebuild_segment_from_frame(
+            &record.frame,
+            SegmentId(record.segment_id),
+            &record.recorded_at,
+            &mut segments,
+            &mut active_segment_id,
+        );
+        log.push_back(ReplayEntry::from_persisted(
+            record.seq,
+            record.frame_bytes(),
+            SegmentId(record.segment_id),
+            record.recorded_at.clone(),
+        ));
+    }
+
+    if !loaded.is_empty() {
+        tracing::info!(
+            room = %room_id,
+            frames = loaded.len(),
+            segments = segments.len(),
+            "replay store: hydrated room from disk",
+        );
+    }
+
+    // The most recently observed acpSessionId — taken from the
+    // latest segment that carries one. This lets late joiners attach
+    // to the prior session id before the fresh agent has spoken.
+    let canonical_session_id = segments
+        .iter()
+        .rev()
+        .find_map(|seg| seg.acp_session_id.clone());
+
+    Hydrated {
+        replay_store: Some(handle),
+        segments,
+        active_segment_id,
+        next_replay_seq: max_seq.saturating_add(1).max(1),
+        next_segment_id: max_segment_id.saturating_add(1).max(1),
+        canonical_session_id,
+    }
+}
+
+/// Walk a persisted broadcast frame and update the rebuilt `segments`
+/// vec / `active_segment_id` based on `amux/segment_started` and
+/// `amux/segment_ended` notifications. Other frames are ignored.
+fn rebuild_segment_from_frame(
+    frame: &Value,
+    frame_segment_id: SegmentId,
+    recorded_at: &str,
+    segments: &mut Vec<Segment>,
+    active_segment_id: &mut Option<SegmentId>,
+) {
+    let Some(method) = frame.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    let params = frame.get("params").and_then(Value::as_object);
+    match method {
+        "amux/segment_started" => {
+            let acp_session_id = params
+                .and_then(|p| p.get("acpSessionId"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            // Use the frame's recorded_at as opened_at — that's when
+            // the segment_started bookend was emitted on the original
+            // run, which is the closest persistence-time signal.
+            let mut seg = Segment::open(frame_segment_id, acp_session_id, 0);
+            seg.opened_at = recorded_at.to_string();
+            // De-dup: a `segment_started` bookend lives in its own
+            // segment, so a second observation of the same id would be
+            // unexpected. Skip if already present.
+            if !segments.iter().any(|s| s.id == frame_segment_id) {
+                segments.push(seg);
+            }
+            *active_segment_id = Some(frame_segment_id);
+        }
+        "amux/segment_ended" => {
+            let closing_id = params
+                .and_then(|p| p.get("segmentId"))
+                .and_then(|v| v.as_u64())
+                .map(SegmentId)
+                .unwrap_or(frame_segment_id);
+            if let Some(seg) = segments.iter_mut().find(|s| s.id == closing_id) {
+                seg.closed_at = Some(recorded_at.to_string());
+            }
+            if *active_segment_id == Some(closing_id) {
+                *active_segment_id = None;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -891,6 +1054,11 @@ pub(super) struct RoomInner {
     /// Whether to broadcast `amux/segment_started` / `amux/segment_ended`
     /// frames on rotation. Default true; gated by `--emit-segment-frames`.
     emit_segment_frames: bool,
+    /// Opt-in on-disk persistence for the broadcast replay log. Open
+    /// only when `--replay-store <DIR>` is configured and the replay log
+    /// itself is enabled. Disk-write failures are logged and dropped so
+    /// live fan-out is never blocked by storage issues.
+    replay_store: Option<crate::room::replay_store::RoomReplayStore>,
 }
 
 impl RoomInner {
@@ -904,8 +1072,9 @@ impl RoomInner {
         session_list_index: Arc<SessionListMetadataIndex>,
         self_tx: mpsc::Sender<RoomMsg>,
         emit_segment_frames: bool,
+        replay_store: Option<Arc<ReplayStore>>,
     ) -> Self {
-        let replay_log = match replay_policy {
+        let mut replay_log = match replay_policy {
             ReplayTurns::Disabled => None,
             ReplayTurns::Unbounded => Some(VecDeque::new()),
             ReplayTurns::Bounded(n) => {
@@ -916,11 +1085,29 @@ impl RoomInner {
                 Some(VecDeque::new())
             }
         };
+
+        // Open the per-room persistence handle and rehydrate any prior
+        // on-disk state. Only attempted when both the in-memory log is
+        // enabled and a store is configured; `--replay-turns 0` disables
+        // persistence transparently.
+        let mut hydrated = Hydrated::default();
+        if replay_log.is_some() && let Some(store) = replay_store.as_ref() {
+            hydrated = hydrate_from_store(store, &room_id, replay_log.as_mut().unwrap());
+        }
+        let Hydrated {
+            replay_store: room_store_handle,
+            segments,
+            active_segment_id,
+            next_replay_seq,
+            next_segment_id,
+            canonical_session_id,
+        } = hydrated;
+
         Self {
             room_id,
             agent_cwd,
             session_list_index,
-            canonical_session_id: None,
+            canonical_session_id,
             subscribers: HashMap::new(),
             next_mux_id: FIRST_MUX_ID,
             pending: HashMap::new(),
@@ -935,7 +1122,7 @@ impl RoomInner {
             next_queue_item_id: 1,
             next_amux_turn_id: 1,
             replay_log,
-            next_replay_seq: 1,
+            next_replay_seq,
             replay_generation: 0,
             last_replay_reset: None,
             self_tx,
@@ -943,10 +1130,11 @@ impl RoomInner {
             client_tool_policy,
             agent_pending: HashMap::new(),
             pending_permission_frames: Vec::new(),
-            segments: Vec::new(),
-            active_segment_id: None,
-            next_segment_id: 1,
+            segments,
+            active_segment_id,
+            next_segment_id,
             emit_segment_frames,
+            replay_store: room_store_handle,
         }
     }
 
@@ -3006,6 +3194,17 @@ impl RoomInner {
         let segment_id = self.current_segment_id();
         if let Some(log) = self.replay_log.as_mut() {
             let entry = ReplayEntry::new(self.next_replay_seq, frame.clone(), segment_id);
+            if let Some(store) = self.replay_store.as_ref()
+                && let Err(err) =
+                    store.append(entry.seq, segment_id.0, &entry.recorded_at, &entry.frame)
+            {
+                tracing::warn!(
+                    room = %self.room_id,
+                    seq = entry.seq,
+                    error = %err,
+                    "replay store: append failed; frame not persisted",
+                );
+            }
             self.next_replay_seq += 1;
             log.push_back(entry);
         }
@@ -3043,6 +3242,7 @@ mod tests {
             Arc::new(SessionListMetadataIndex::new()),
             tx,
             true,
+            None,
         )
     }
 
@@ -3590,6 +3790,7 @@ mod tests {
             Arc::new(SessionListMetadataIndex::new()),
             tx,
             false, // emit_segment_frames OFF
+            None,
         );
 
         inner.set_canonical_session_id_with_reason("sess-1", EndReason::SessionLoad);
@@ -3658,6 +3859,12 @@ pub struct RoomOptions {
     /// lifecycle frames on rotation. Default true. Set false to preserve
     /// byte-equivalence with v0.1.x clients during the rooms rollout.
     pub emit_segment_frames: bool,
+    /// Opt-in on-disk replay persistence. When `Some`, every broadcast
+    /// frame is appended to the store and the room is rehydrated from
+    /// the store on construction. Has no effect when `replay_policy ==
+    /// ReplayTurns::Disabled` (the in-memory log is `None` so there is
+    /// nothing to persist or restore).
+    pub replay_store: Option<Arc<ReplayStore>>,
 }
 
 pub fn spawn_room(
@@ -3724,6 +3931,7 @@ async fn run_room(
         options.session_list_index.clone(),
         self_tx,
         options.emit_segment_frames,
+        options.replay_store.clone(),
     );
     inner
         .attach(initial_subscriber)

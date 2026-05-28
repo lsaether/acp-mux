@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use amux::cli::{ClientToolPolicy, ReplayTurns};
 use amux::room::registry::{AgentCmd, RoomRegistry};
+use amux::room::replay_store::ReplayStore;
 use amux::server::{
     AppState, CLOSE_CODE_BAD_QUERY, CLOSE_CODE_INTERNAL, CLOSE_CODE_PEER_CONFLICT, router,
 };
@@ -4893,4 +4894,279 @@ async fn debug_sessions_shows_loaded_session_id() {
     );
 
     let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+// ===== --replay-store persistence (issue #26) =====
+
+/// Per-test scratch directory under /tmp; caller is responsible for
+/// cleanup (we do not RAII-delete because tests may want to inspect on
+/// failure). Path is unique per (pid, nanos, label).
+fn replay_store_dir(label: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!(
+        "amux-replay-test-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        label,
+    ));
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+async fn spawn_server_with_mock_and_replay_store(
+    replay_turns: ReplayTurns,
+    store_dir: &std::path::Path,
+) -> (SocketAddr, Arc<RoomRegistry>) {
+    let store = ReplayStore::open(store_dir).expect("open replay store dir");
+    let registry = RoomRegistry::new_with_replay_store(
+        Some(mock_agent_cmd()),
+        replay_turns,
+        TEST_DEFAULT_TTL,
+        false,
+        ClientToolPolicy::default(),
+        true,
+        Some(Arc::new(store)),
+    );
+    let app = router(AppState::new(registry.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (addr, registry)
+}
+
+/// Drive a single mux instance through initialize + session/new + one
+/// prompt, leaving the resulting frames persisted in `store_dir`. Tears
+/// the server down (drops the registry, lets the room actor exit)
+/// before returning so on-disk state is at rest.
+async fn seed_room_to_disk(store_dir: &std::path::Path, room: &str, prompt_text: &str) {
+    let (addr, registry) =
+        spawn_server_with_mock_and_replay_store(ReplayTurns::Unbounded, store_dir).await;
+    let url = format!("ws://{addr}/acp?room={room}&peer_id=seed&peer_name=Seed");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": "sess-mock", "prompt": [{"type": "text", "text": prompt_text}]},
+    });
+    let _ = ws_request(&mut ws, &payload.to_string()).await;
+    let _ = ws.send(ClientMsg::Close(None)).await;
+
+    // Force the room actor down so the per-room file handle drops and
+    // any buffered writes flush. spawn_server's axum task is detached
+    // but we don't care — the listener gets a fresh bind next phase.
+    registry.shutdown().await;
+    // Brief beat to let the actor observe the channel close.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+#[tokio::test]
+async fn replay_store_restart_serves_history_to_late_joiner() {
+    // Criterion: a session emits replayable frames, mux stops, restarts
+    // with the same replay store, and late joiner sees prior broadcast
+    // history.
+    let dir = replay_store_dir("restart-late-joiner");
+    seed_room_to_disk(&dir, "room26r1", "first run prompt").await;
+
+    // File should exist and contain at least one session/update.
+    let file = dir.join("room26r1.jsonl");
+    let contents = std::fs::read_to_string(&file).expect("persistence file exists");
+    assert!(
+        contents.lines().any(|l| l.contains("session/update")),
+        "store should contain at least one session/update frame: {contents}",
+    );
+
+    // Restart against the same store directory and attach a late joiner
+    // that asks for full lineage so hydrated frames are visible.
+    let (addr, _registry) =
+        spawn_server_with_mock_and_replay_store(ReplayTurns::Unbounded, &dir).await;
+    let url = format!("ws://{addr}/acp?room=room26r1&peer_id=late&peer_name=Late");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let attach = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/attach","params":{"sessionId":"sess-mock","historyPolicy":"full_lineage","clientId":"late-client"}}"#,
+    )
+    .await;
+
+    let history = attach["result"]["history"]
+        .as_array()
+        .expect("attach history present");
+    let session_updates: Vec<_> = history
+        .iter()
+        .filter(|entry| entry["method"] == serde_json::json!("session/update"))
+        .collect();
+    assert!(
+        !session_updates.is_empty(),
+        "rehydrated history should include the seeded session/update broadcasts: {attach:?}",
+    );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn replay_store_replay_turns_zero_writes_no_history() {
+    // Criterion: --replay-turns 0 must not write or replay persisted
+    // history.
+    let dir = replay_store_dir("replay-turns-zero");
+    let (addr, registry) =
+        spawn_server_with_mock_and_replay_store(ReplayTurns::Disabled, &dir).await;
+    let url = format!("ws://{addr}/acp?room=room26nostore&peer_id=A");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": "sess-mock", "prompt": [{"type": "text", "text": "nope"}]},
+    });
+    let _ = ws_request(&mut ws, &payload.to_string()).await;
+    let _ = ws.send(ClientMsg::Close(None)).await;
+    registry.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let file = dir.join("room26nostore.jsonl");
+    assert!(
+        !file.exists(),
+        "replay-turns 0 must not create a per-room store file: {}",
+        file.display()
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn replay_store_preserves_original_recorded_at_across_restart() {
+    // Criterion: replay metadata still lives under _meta.amux and uses
+    // the original mux-record time, not the replay send time.
+    let dir = replay_store_dir("recorded-at");
+    seed_room_to_disk(&dir, "room26ts", "ts-check").await;
+
+    // Read recordedAt straight off disk for the first session/update.
+    let raw = std::fs::read_to_string(dir.join("room26ts.jsonl")).expect("file exists");
+    let original_recorded_at: String = raw
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|v| v["frame"]["method"] == serde_json::json!("session/update"))
+        .and_then(|v| v["recorded_at"].as_str().map(str::to_string))
+        .expect("at least one persisted session/update");
+
+    // Wait a beat so a fresh recordedAt would be observably different.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (addr, _registry) =
+        spawn_server_with_mock_and_replay_store(ReplayTurns::Unbounded, &dir).await;
+    let url = format!("ws://{addr}/acp?room=room26ts&peer_id=late");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+    let attach = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/attach","params":{"sessionId":"sess-mock","historyPolicy":"full_lineage","clientId":"late"}}"#,
+    )
+    .await;
+
+    let history = attach["result"]["history"].as_array().expect("history");
+    let replayed_recorded_at: String = history
+        .iter()
+        .find(|entry| entry["method"] == serde_json::json!("session/update"))
+        .and_then(|entry| entry["params"]["_meta"]["amux"]["recordedAt"].as_str().map(str::to_string))
+        .expect("replayed session/update carries amux.recordedAt");
+
+    assert_eq!(
+        replayed_recorded_at, original_recorded_at,
+        "replay metadata must surface the original mux-record time, not the post-restart now",
+    );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn replay_store_session_load_segmentation_excludes_stale_frames() {
+    // Criterion: session/load segmentation prevents replaying stale
+    // frames from a previous canonical ACP session. Validated within a
+    // single mux instance with persistence enabled — the default
+    // historyPolicy: full view (current segment only) must not include
+    // pre-load frames from the prior segment, even though they live in
+    // the persisted log.
+    let dir = replay_store_dir("segmentation");
+    let (addr, _registry) =
+        spawn_server_with_mock_and_replay_store(ReplayTurns::Unbounded, &dir).await;
+
+    let url_a = format!("ws://{addr}/acp?room=room26seg&peer_id=A");
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(&mut ws_a, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    // Pre-load prompt (lands in segment 1).
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": "sess-mock", "prompt": [{"type": "text", "text": "PRELOAD-MARKER"}]},
+    });
+    let _ = ws_request(&mut ws_a, &payload.to_string()).await;
+
+    // session/load rotates the segment.
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":4,"method":"session/load","params":{"sessionId":"sess-loaded"}}"#,
+    )
+    .await;
+    // Post-load prompt (lands in segment 2).
+    let post = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "session/prompt",
+        "params": {"sessionId": "sess-loaded", "prompt": [{"type": "text", "text": "POSTLOAD-MARKER"}]},
+    });
+    let _ = ws_request(&mut ws_a, &post.to_string()).await;
+
+    // Late joiner uses default historyPolicy: full (current segment only).
+    let url_b = format!("ws://{addr}/acp?room=room26seg&peer_id=B&replay=skip");
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":10,"method":"initialize"}"#,
+    )
+    .await;
+    let attach = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":11,"method":"session/attach","params":{"sessionId":"sess-loaded","historyPolicy":"full","clientId":"late"}}"#,
+    )
+    .await;
+
+    let serialized = serde_json::to_string(&attach["result"]["history"]).unwrap();
+    assert!(
+        !serialized.contains("PRELOAD-MARKER"),
+        "current-segment-only history must not include pre-load frames after session/load: {attach:?}",
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+    std::fs::remove_dir_all(&dir).ok();
 }
