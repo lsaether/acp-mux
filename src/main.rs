@@ -53,13 +53,20 @@ async fn main() -> Result<()> {
         None => None,
     };
 
-    let registry = RoomRegistry::new_with_replay_store(
+    if cli.hermes_compaction_signals {
+        tracing::info!(
+            "hermes compaction signal parser enabled; stderr lines matching Hermes \
+             context-compression formats will emit amux/context_compaction_* events",
+        );
+    }
+    let registry = RoomRegistry::new_full(
         agent_cmd,
         cli.replay_turns,
         std::time::Duration::from_secs(cli.session_ttl_seconds),
         cli.meta_propagate,
         client_tool_policy,
         cli.emit_segment_frames,
+        cli.hermes_compaction_signals,
         replay_store,
     );
     let app = server::router(server::AppState::new(registry));

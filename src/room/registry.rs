@@ -138,6 +138,7 @@ pub struct RoomRegistry {
     meta_propagate: bool,
     client_tool_policy: ClientToolPolicy,
     emit_segment_frames: bool,
+    hermes_compaction_signals: bool,
     replay_store: Option<Arc<ReplayStore>>,
     session_list_index: Arc<SessionListMetadataIndex>,
     sessions: Mutex<HashMap<String, RoomHandle>>,
@@ -218,6 +219,29 @@ impl RoomRegistry {
         emit_segment_frames: bool,
         replay_store: Option<Arc<ReplayStore>>,
     ) -> Arc<Self> {
+        Self::new_full(
+            agent_cmd,
+            replay_policy,
+            session_ttl,
+            meta_propagate,
+            client_tool_policy,
+            emit_segment_frames,
+            false,
+            replay_store,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full(
+        agent_cmd: Option<AgentCmd>,
+        replay_policy: ReplayTurns,
+        session_ttl: Duration,
+        meta_propagate: bool,
+        client_tool_policy: ClientToolPolicy,
+        emit_segment_frames: bool,
+        hermes_compaction_signals: bool,
+        replay_store: Option<Arc<ReplayStore>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             agent_cmd,
             replay_policy,
@@ -225,6 +249,7 @@ impl RoomRegistry {
             meta_propagate,
             client_tool_policy,
             emit_segment_frames,
+            hermes_compaction_signals,
             replay_store,
             session_list_index: Arc::new(SessionListMetadataIndex::new()),
             sessions: Mutex::new(HashMap::new()),
@@ -338,6 +363,7 @@ impl RoomRegistry {
                 session_list_index: self.session_list_index.clone(),
                 agent_cwd,
                 emit_segment_frames: self.emit_segment_frames,
+                hermes_compaction_signals: self.hermes_compaction_signals,
                 replay_store: self.replay_store.clone(),
             },
         );

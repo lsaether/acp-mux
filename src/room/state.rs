@@ -1077,6 +1077,12 @@ pub(super) struct RoomInner {
     /// itself is enabled. Disk-write failures are logged and dropped so
     /// live fan-out is never blocked by storage issues.
     replay_store: Option<crate::room::replay_store::RoomReplayStore>,
+    /// Whether to invoke the Hermes stderr parser on incoming agent
+    /// stderr lines. When false, stderr is still mirrored to the
+    /// operator terminal and to mux logs, but compaction lifecycle
+    /// events are never inferred from log text — claude-agent-acp and
+    /// other non-Hermes agents stay quiet.
+    hermes_compaction_signals: bool,
     /// Mux-observed Hermes compactions for this room. Incremented on
     /// each `context compression done` line, exposed in snapshots, and
     /// echoed back in `amux/context_compaction_done`.
@@ -1115,6 +1121,7 @@ impl RoomInner {
         session_list_index: Arc<SessionListMetadataIndex>,
         self_tx: mpsc::Sender<RoomMsg>,
         emit_segment_frames: bool,
+        hermes_compaction_signals: bool,
         replay_store: Option<Arc<ReplayStore>>,
     ) -> Self {
         let mut replay_log = match replay_policy {
@@ -1180,6 +1187,7 @@ impl RoomInner {
             next_segment_id,
             emit_segment_frames,
             replay_store: room_store_handle,
+            hermes_compaction_signals,
             compaction_count: 0,
             compaction_state: CompactionState::default(),
         }
@@ -2899,9 +2907,38 @@ impl RoomInner {
     /// Hermes compaction signals, and emits structured `amux/*`
     /// notifications when warranted. Raw stderr is never broadcast to
     /// subscribers as transcript content — it stays in mux-side logs.
+    #[cfg(not(test))]
+    fn mirror_agent_stderr_to_terminal(&self, line: &str) {
+        eprintln!("[AGENT {room}] {line}", room = self.room_id);
+    }
+
+    #[cfg(test)]
+    fn mirror_agent_stderr_to_terminal(&self, _line: &str) {
+        // Tests assert on broadcast frames and state, not on terminal
+        // output. Keep the test runner's stderr quiet.
+    }
+
     pub(super) fn handle_agent_stderr_line(&mut self, raw: Vec<u8>) {
         let line = String::from_utf8_lossy(&raw);
         let line = line.as_ref();
+
+        // Mirror every stderr line back to the mux operator's terminal
+        // with a clear `[AGENT <room>]` label. This replaces the
+        // previous `Stdio::inherit()` ergonomic so ops folks watching
+        // the terminal still see the agent's stderr, while the mux
+        // also keeps the line in tracing logs and parses it (when
+        // gated by `--hermes-compaction-signals`).
+        self.mirror_agent_stderr_to_terminal(line);
+
+        if !self.hermes_compaction_signals {
+            tracing::debug!(
+                session = %self.room_id,
+                agent_stderr = %line,
+                "agent stderr (hermes parsing disabled)",
+            );
+            return;
+        }
+
         let signal = crate::agent::stderr::parse(line);
         match &signal {
             Some(_) => {
@@ -3425,6 +3462,10 @@ mod tests {
     use crate::protocol::attach::HistoryPolicy;
 
     fn test_inner() -> RoomInner {
+        test_inner_with_signals(true)
+    }
+
+    fn test_inner_with_signals(hermes_compaction_signals: bool) -> RoomInner {
         let (tx, _rx) = mpsc::channel(1);
         RoomInner::new(
             "test-room".to_string(),
@@ -3435,6 +3476,7 @@ mod tests {
             Arc::new(SessionListMetadataIndex::new()),
             tx,
             true,
+            hermes_compaction_signals,
             None,
         )
     }
@@ -3983,6 +4025,7 @@ mod tests {
             Arc::new(SessionListMetadataIndex::new()),
             tx,
             false, // emit_segment_frames OFF
+            true,  // hermes_compaction_signals (unused by this test)
             None,
         );
 
@@ -4187,6 +4230,33 @@ mod tests {
     }
 
     #[test]
+    fn hermes_signals_off_ignores_compaction_lines_for_other_agents() {
+        // Default behavior: claude-agent-acp & co. emit unrelated stderr,
+        // and the mux must not invent compaction events from it. Even a
+        // perfectly-formed Hermes line is ignored when the flag is off.
+        let mut inner = test_inner_with_signals(false);
+        inner.replay_log = Some(VecDeque::new());
+        inner.set_canonical_session_id_with_reason("acp-stable", EndReason::SessionLoad);
+
+        let baseline_frames = inner.replay_log.as_ref().unwrap().len();
+        inner.handle_agent_stderr_line(b"agent.conversation_compression: context compression started: session=hs messages=50 tokens=~1000 model=gpt-5.5".to_vec());
+        inner.handle_agent_stderr_line(b"agent.conversation_compression: context compression done: session=hs messages=50->9 tokens=~700".to_vec());
+
+        assert_eq!(inner.compaction_count, 0, "flag off → no count change");
+        assert!(!inner.compaction_state.active);
+        assert_eq!(
+            inner.segments.len(),
+            1,
+            "flag off → no segment rotation from stderr",
+        );
+        assert_eq!(
+            inner.replay_log.as_ref().unwrap().len(),
+            baseline_frames,
+            "flag off → no amux/* broadcast from stderr",
+        );
+    }
+
+    #[test]
     fn snapshots_carry_compaction_state() {
         let mut inner = test_inner();
         inner.replay_log = Some(VecDeque::new());
@@ -4221,6 +4291,10 @@ pub struct RoomOptions {
     /// lifecycle frames on rotation. Default true. Set false to preserve
     /// byte-equivalence with v0.1.x clients during the rooms rollout.
     pub emit_segment_frames: bool,
+    /// Whether to parse Hermes-specific compaction lines on agent
+    /// stderr and emit `amux/context_compaction_*` lifecycle. Off by
+    /// default so non-Hermes agents can't trip false positives.
+    pub hermes_compaction_signals: bool,
     /// Opt-in on-disk replay persistence. When `Some`, every broadcast
     /// frame is appended to the store and the room is rehydrated from
     /// the store on construction. Has no effect when `replay_policy ==
@@ -4311,6 +4385,7 @@ async fn run_room(
         options.session_list_index.clone(),
         self_tx,
         options.emit_segment_frames,
+        options.hermes_compaction_signals,
         options.replay_store.clone(),
     );
     inner
