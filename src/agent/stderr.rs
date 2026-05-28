@@ -149,10 +149,7 @@ fn key_value_fields(rest: &str) -> std::collections::HashMap<String, String> {
 }
 
 fn parse_number(raw: &str) -> Option<u64> {
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect();
+    let cleaned: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
     if cleaned.is_empty() {
         return None;
     }

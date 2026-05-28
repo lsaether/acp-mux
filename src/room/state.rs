@@ -4142,8 +4142,14 @@ mod tests {
         inner.handle_agent_stderr_line(b"agent.conversation_compression: context compression started: session=hs-old messages=50 tokens=~72,908 model=gpt-5.5".to_vec());
         inner.handle_agent_stderr_line(b"agent.conversation_compression: context compression done: session=hs-old messages=50->9 tokens=~54,700".to_vec());
 
-        assert_eq!(inner.compaction_count, 1, "done line increments exactly once");
-        assert!(!inner.compaction_state.active, "compaction no longer active");
+        assert_eq!(
+            inner.compaction_count, 1,
+            "done line increments exactly once"
+        );
+        assert!(
+            !inner.compaction_state.active,
+            "compaction no longer active"
+        );
         assert!(inner.compaction_state.last_completed_at.is_some());
         assert_eq!(
             inner.compaction_state.last_source.as_deref(),
@@ -4261,7 +4267,10 @@ mod tests {
         let mut inner = test_inner();
         inner.replay_log = Some(VecDeque::new());
         inner.set_canonical_session_id_with_reason("acp-stable", EndReason::SessionLoad);
-        inner.handle_agent_stderr_line(b"agent.conversation_compression: context compression started: session=hs messages=12".to_vec());
+        inner.handle_agent_stderr_line(
+            b"agent.conversation_compression: context compression started: session=hs messages=12"
+                .to_vec(),
+        );
         inner.handle_agent_stderr_line(b"agent.conversation_compression: context compression done: session=hs messages=12->4 tokens=~3000".to_vec());
 
         let room_snap = inner.build_snapshot(false);
@@ -4335,7 +4344,11 @@ pub fn spawn_room(
     let stderr_pump = tokio::spawn(async move {
         let mut rx = stderr_rx;
         while let Some(line) = rx.recv().await {
-            if stderr_tx.send(RoomMsg::AgentStderrLine(line)).await.is_err() {
+            if stderr_tx
+                .send(RoomMsg::AgentStderrLine(line))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
