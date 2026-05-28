@@ -470,20 +470,19 @@ fn rebuild_compaction_from_frame(
                 .unwrap_or_else(|| compaction_count.saturating_add(1));
             *compaction_count = (*compaction_count).max(observed);
         }
-        "amux/turn_complete" => {
-            // Durable mirror of `clear_stale_compaction_at_turn_end`: a
-            // `started` with no matching `done` by the time a turn settles
-            // was abandoned. The live path clears the transient flag in
-            // memory and emits no frame, so without applying the same
-            // bound here, restart hydration would replay the persisted
-            // `started` and resurrect `active = true` forever.
-            // `amux/turn_complete` is broadcast (and therefore persisted)
-            // on every prompt-turn settlement, so it's a reliable durable
-            // bound. Count and history timestamps stay untouched.
-            if compaction_state.active {
-                compaction_state.active = false;
-                compaction_state.pending_hermes_session_id = None;
-            }
+        // Durable mirror of `clear_stale_compaction_at_turn_end`: a
+        // `started` with no matching `done` by the time a turn settles was
+        // abandoned. The live path clears the transient flag in memory and
+        // emits no frame, so without applying the same bound here, restart
+        // hydration would replay the persisted `started` and resurrect
+        // `active = true` forever. `amux/turn_complete` is broadcast (and
+        // therefore persisted) on every prompt-turn settlement, so it's a
+        // reliable durable bound. Count and history timestamps stay
+        // untouched. (Guarded arm rather than a nested `if` to satisfy
+        // clippy::collapsible_match.)
+        "amux/turn_complete" if compaction_state.active => {
+            compaction_state.active = false;
+            compaction_state.pending_hermes_session_id = None;
         }
         _ => {}
     }
