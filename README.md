@@ -100,6 +100,7 @@ Operational notes:
 - To clear history: delete the per-room file (`rm <DIR>/<room_id>.jsonl`) or wipe the directory. `amux` recreates files on next broadcast.
 - Cross-process safety: `amux` does not coordinate access between multiple processes writing to the same store directory. Running two `amux` instances against the same `--replay-store` is a configuration error.
 - After restart, the rehydrated canonical ACP `sessionId` is restored from the latest persisted `amux/segment_started` frame so late joiners can `session/attach` with the original session id. The next `session/new` / `session/load` from a fresh agent rotates the segment as normal.
+- Full restart restoration requires `--emit-segment-frames=true` (the default). With `--emit-segment-frames=false` there are no persisted segment bookends to reconstruct from, so on restart the rehydrated frames are still readable but the canonical session id and segment lineage are not restored — late joiners must drive a fresh `session/new` or `session/load` before `session/attach`. `amux` logs a warning at startup when this combination is detected.
 
 ## Client contract
 

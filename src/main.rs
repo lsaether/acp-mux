@@ -40,6 +40,14 @@ async fn main() -> Result<()> {
             let store = ReplayStore::open(path)
                 .with_context(|| format!("open --replay-store {}", path.display()))?;
             tracing::info!(path = %path.display(), "replay store enabled");
+            if !cli.emit_segment_frames {
+                tracing::warn!(
+                    "--replay-store is enabled with --emit-segment-frames=false; \
+                     restart hydration cannot reconstruct the canonical ACP session id or segment lineage \
+                     without persisted amux/segment_started bookends. Late joiners after a restart will \
+                     need to drive a fresh session/new or session/load before session/attach.",
+                );
+            }
             Some(Arc::new(store))
         }
         None => None,
