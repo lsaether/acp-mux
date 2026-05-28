@@ -82,12 +82,12 @@ use crate::agent::process::AgentProcess;
 use crate::cli::{ClientToolMode, ClientToolPolicy, ReplayTurns};
 use crate::multiplex::subscriber::{OutMsg, Subscriber};
 use crate::protocol::amux::{self, AmuxTurnId, EndReason, HermesProvenance, SegmentId};
-use crate::room::replay_store::ReplayStore;
 use crate::protocol::attach::{self, SegmentSummary};
 use crate::protocol::jsonrpc::{
     Id, Incoming, IncomingRequest, IncomingResponse, JsonRpcError, JsonRpcVersion,
 };
 pub use crate::room::attach::AttachStreamBackfill;
+use crate::room::replay_store::ReplayStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionListAmuxMetadata {
@@ -1091,7 +1091,9 @@ impl RoomInner {
         // enabled and a store is configured; `--replay-turns 0` disables
         // persistence transparently.
         let mut hydrated = Hydrated::default();
-        if replay_log.is_some() && let Some(store) = replay_store.as_ref() {
+        if replay_log.is_some()
+            && let Some(store) = replay_store.as_ref()
+        {
             hydrated = hydrate_from_store(store, &room_id, replay_log.as_mut().unwrap());
         }
         let Hydrated {

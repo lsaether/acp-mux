@@ -4993,11 +4993,7 @@ async fn replay_store_restart_serves_history_to_late_joiner() {
         spawn_server_with_mock_and_replay_store(ReplayTurns::Unbounded, &dir).await;
     let url = format!("ws://{addr}/acp?room=room26r1&peer_id=late&peer_name=Late");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-    let _ = ws_request(
-        &mut ws,
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
-    )
-    .await;
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
     let attach = ws_request(
         &mut ws,
         r#"{"jsonrpc":"2.0","id":2,"method":"session/attach","params":{"sessionId":"sess-mock","historyPolicy":"full_lineage","clientId":"late-client"}}"#,
@@ -5090,7 +5086,11 @@ async fn replay_store_preserves_original_recorded_at_across_restart() {
     let replayed_recorded_at: String = history
         .iter()
         .find(|entry| entry["method"] == serde_json::json!("session/update"))
-        .and_then(|entry| entry["params"]["_meta"]["amux"]["recordedAt"].as_str().map(str::to_string))
+        .and_then(|entry| {
+            entry["params"]["_meta"]["amux"]["recordedAt"]
+                .as_str()
+                .map(str::to_string)
+        })
         .expect("replayed session/update carries amux.recordedAt");
 
     assert_eq!(
@@ -5116,7 +5116,11 @@ async fn replay_store_session_load_segmentation_excludes_stale_frames() {
 
     let url_a = format!("ws://{addr}/acp?room=room26seg&peer_id=A");
     let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
-    let _ = ws_request(&mut ws_a, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
     let _ = ws_request(
         &mut ws_a,
         r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,

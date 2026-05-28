@@ -20,11 +20,11 @@
 //!
 //! Concurrency: each room owns its own `RoomReplayStore` and the room
 //! actor is single-threaded, so writes are serialized by construction.
-//! The file is opened with `O_APPEND`, so even concurrent processes
-//! writing to the same path would not corrupt individual lines for
-//! reasonably-sized records (kernel guarantees atomicity up to
-//! `PIPE_BUF`). We do not coordinate cross-process access — operators
-//! running two `amux` instances against the same store directory is a
+//! The file is opened with `O_APPEND`, which keeps each in-process
+//! write positioned at the current end of file. We do not coordinate
+//! cross-process access and do not rely on any filesystem-level
+//! atomicity guarantee for concurrent writers — operators running two
+//! `amux` instances against the same store directory is a
 //! configuration error.
 
 use std::fs::{File, OpenOptions};
@@ -71,10 +71,7 @@ impl ReplayStore {
 
         let loaded = load_existing(&path)?;
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         Ok(RoomReplayStore {
             path,
@@ -135,8 +132,7 @@ impl RoomReplayStore {
             frame: frame_value,
         };
 
-        let mut line = serde_json::to_vec(&record)
-            .map_err(std::io::Error::other)?;
+        let mut line = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
         line.push(b'\n');
 
         let mut file = self.file.lock().expect("replay store mutex poisoned");
