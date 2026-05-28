@@ -787,6 +787,7 @@ pub enum RoomMsg {
         bytes: Vec<u8>,
     },
     AgentStdoutLine(Vec<u8>),
+    AgentStderrLine(Vec<u8>),
     AgentDied,
     AttachStreamBackfill(AttachStreamBackfill),
     /// Build a JSON snapshot of session state for `/debug/sessions`.
@@ -828,6 +829,23 @@ pub struct RoomSnapshot {
     /// first canonical ACP session id arrives.
     pub segments: Vec<Segment>,
     pub active_segment_id: Option<SegmentId>,
+    /// Mux-observed Hermes compaction count for this room.
+    pub compaction_count: u64,
+    /// Most recent compaction lifecycle state. `None` until the first
+    /// compaction signal arrives.
+    pub compaction: Option<CompactionSnapshot>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionSnapshot {
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1059,6 +1077,31 @@ pub(super) struct RoomInner {
     /// itself is enabled. Disk-write failures are logged and dropped so
     /// live fan-out is never blocked by storage issues.
     replay_store: Option<crate::room::replay_store::RoomReplayStore>,
+    /// Mux-observed Hermes compactions for this room. Incremented on
+    /// each `context compression done` line, exposed in snapshots, and
+    /// echoed back in `amux/context_compaction_done`.
+    pub(super) compaction_count: u64,
+    /// Lifecycle state for the most recent compaction. Tracks whether
+    /// a compaction is currently active (between started and done
+    /// lines) plus the timestamps and source we observed it from. Used
+    /// both for `/debug/sessions` and for correlating the done line
+    /// back to a started line.
+    pub(super) compaction_state: CompactionState,
+}
+
+/// Per-room compaction lifecycle bookkeeping. Distinct from
+/// `compaction_count` because the count is durable across the lifetime
+/// of the room while this state is transient and rotates as
+/// compactions are observed.
+#[derive(Debug, Default, Clone)]
+pub(super) struct CompactionState {
+    pub(super) active: bool,
+    pub(super) last_source: Option<String>,
+    pub(super) last_started_at: Option<String>,
+    pub(super) last_completed_at: Option<String>,
+    /// Hermes session id reported on the most recent `started` line, if
+    /// any. Used to correlate the matching `done` line.
+    pub(super) pending_hermes_session_id: Option<String>,
 }
 
 impl RoomInner {
@@ -1137,6 +1180,8 @@ impl RoomInner {
             next_segment_id,
             emit_segment_frames,
             replay_store: room_store_handle,
+            compaction_count: 0,
+            compaction_state: CompactionState::default(),
         }
     }
 
@@ -1451,7 +1496,45 @@ impl RoomInner {
             last_replay_reset: self.last_replay_reset.clone(),
             next_mux_id: self.next_mux_id,
             next_amux_turn_id: self.next_amux_turn_id,
+            compaction_count: self.compaction_count,
+            compaction: self.compaction_snapshot(),
         }
+    }
+
+    pub(super) fn attach_compaction_summary(
+        &self,
+    ) -> Option<crate::protocol::attach::AttachCompactionSummary> {
+        let state = &self.compaction_state;
+        if !state.active
+            && state.last_source.is_none()
+            && state.last_started_at.is_none()
+            && state.last_completed_at.is_none()
+        {
+            return None;
+        }
+        Some(crate::protocol::attach::AttachCompactionSummary {
+            active: state.active,
+            last_source: state.last_source.clone(),
+            last_started_at: state.last_started_at.clone(),
+            last_completed_at: state.last_completed_at.clone(),
+        })
+    }
+
+    fn compaction_snapshot(&self) -> Option<CompactionSnapshot> {
+        let state = &self.compaction_state;
+        if !state.active
+            && state.last_source.is_none()
+            && state.last_started_at.is_none()
+            && state.last_completed_at.is_none()
+        {
+            return None;
+        }
+        Some(CompactionSnapshot {
+            active: state.active,
+            last_source: state.last_source.clone(),
+            last_started_at: state.last_started_at.clone(),
+            last_completed_at: state.last_completed_at.clone(),
+        })
     }
 
     /// Close every attached subscriber with a structured WS close frame.
@@ -2811,6 +2894,114 @@ impl RoomInner {
 
     /// Process one stdout line from the agent. Returns true if every
     /// subscriber has dropped during fan-out and the session should end.
+    /// Process one stderr line from the agent subprocess. The mux mirrors
+    /// every stderr line into its own logs, parses it for recognized
+    /// Hermes compaction signals, and emits structured `amux/*`
+    /// notifications when warranted. Raw stderr is never broadcast to
+    /// subscribers as transcript content — it stays in mux-side logs.
+    pub(super) fn handle_agent_stderr_line(&mut self, raw: Vec<u8>) {
+        let line = String::from_utf8_lossy(&raw);
+        let line = line.as_ref();
+        let signal = crate::agent::stderr::parse(line);
+        match &signal {
+            Some(_) => {
+                tracing::info!(
+                    session = %self.room_id,
+                    agent_stderr = %line,
+                    "hermes compaction signal observed on agent stderr",
+                );
+            }
+            None => {
+                tracing::debug!(
+                    session = %self.room_id,
+                    agent_stderr = %line,
+                    "agent stderr",
+                );
+            }
+        }
+        let Some(signal) = signal else {
+            return;
+        };
+        match signal {
+            crate::agent::stderr::HermesStderrSignal::CompactionStarted {
+                hermes_session_id,
+                messages_before,
+                tokens_approx_before,
+                model,
+                focus,
+            } => {
+                let now = utc_rfc3339_now();
+                self.compaction_state.active = true;
+                self.compaction_state.last_source =
+                    Some(amux::COMPACTION_SOURCE_HERMES_STDERR.to_string());
+                self.compaction_state.last_started_at = Some(now.clone());
+                self.compaction_state.pending_hermes_session_id = hermes_session_id.clone();
+                let frame = amux::context_compaction_started(amux::ContextCompactionStarted {
+                    room_id: &self.room_id,
+                    source: amux::COMPACTION_SOURCE_HERMES_STDERR,
+                    hermes_session_id: hermes_session_id.as_deref(),
+                    messages_before,
+                    tokens_approx_before,
+                    model: model.as_deref(),
+                    focus: focus.as_deref(),
+                });
+                self.broadcast(frame);
+            }
+            crate::agent::stderr::HermesStderrSignal::CompactionDone {
+                hermes_session_id,
+                messages_before,
+                messages_after,
+                tokens_approx_after,
+            } => {
+                let now = utc_rfc3339_now();
+                self.compaction_count = self.compaction_count.saturating_add(1);
+                self.compaction_state.active = false;
+                self.compaction_state.last_source =
+                    Some(amux::COMPACTION_SOURCE_HERMES_STDERR.to_string());
+                self.compaction_state.last_completed_at = Some(now.clone());
+                self.compaction_state.pending_hermes_session_id = None;
+
+                let previous_segment_id = self.active_segment_id;
+                // Rotate the active segment so the post-compaction head
+                // lives in its own segment. The ACP session id stays
+                // stable across hermes compaction — only the internal
+                // hermes session id changes.
+                if self.active_segment_id.is_some() {
+                    let provenance = HermesProvenance {
+                        hermes_session_id: hermes_session_id.clone(),
+                        last_mode: Some("session_split".to_string()),
+                        last_reason: Some("compaction".to_string()),
+                        ..HermesProvenance::default()
+                    };
+                    let new_acp_id = self.canonical_session_id.clone();
+                    self.rotate_segment(new_acp_id, EndReason::HermesCompression, provenance);
+                }
+                let successor_segment_id = self.active_segment_id;
+
+                let frame = amux::context_compaction_done(amux::ContextCompactionDone {
+                    room_id: &self.room_id,
+                    source: amux::COMPACTION_SOURCE_HERMES_STDERR,
+                    hermes_session_id: hermes_session_id.as_deref(),
+                    messages_before,
+                    messages_after,
+                    tokens_approx_after,
+                    compression_count: self.compaction_count,
+                    previous_segment_id,
+                    successor_segment_id,
+                });
+                self.broadcast(frame);
+            }
+            crate::agent::stderr::HermesStderrSignal::CompactionStatus
+            | crate::agent::stderr::HermesStderrSignal::AuxiliaryCompression { .. }
+            | crate::agent::stderr::HermesStderrSignal::RepeatedCompressionWarning { .. } => {
+                // Status/auxiliary/warning lines are useful operator
+                // signals but carry no durable lifecycle change. We
+                // already mirrored them into mux logs above; no
+                // broadcast and no count increment.
+            }
+        }
+    }
+
     fn handle_agent_line(&mut self, line: Vec<u8>) -> AgentLineAction {
         let frame = match Incoming::parse(&line) {
             Ok(f) => f,
@@ -3847,6 +4038,175 @@ mod tests {
             "session/load must retarget queued prompts to the newly loaded canonical session"
         );
     }
+
+    fn frame_methods(inner: &RoomInner) -> Vec<String> {
+        inner
+            .replay_log
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|e| {
+                serde_json::from_slice::<Value>(&e.frame)
+                    .ok()
+                    .and_then(|v| v.get("method").and_then(Value::as_str).map(String::from))
+            })
+            .collect()
+    }
+
+    fn frame_with_method(inner: &RoomInner, method: &str) -> Option<Value> {
+        inner.replay_log.as_ref().unwrap().iter().find_map(|e| {
+            let v: Value = serde_json::from_slice(&e.frame).ok()?;
+            if v.get("method").and_then(Value::as_str) == Some(method) {
+                Some(v)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn hermes_stderr_started_emits_transient_event() {
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+        inner.set_canonical_session_id_with_reason("acp-1", EndReason::SessionLoad);
+
+        let line = b"2026-05-27 21:27:04 [INFO] agent.conversation_compression: context compression started: session=hs-old messages=50 tokens=~72,908 model=gpt-5.5 focus=None".to_vec();
+        inner.handle_agent_stderr_line(line);
+
+        assert!(inner.compaction_state.active);
+        assert_eq!(inner.compaction_count, 0, "count moves on done, not start");
+        assert_eq!(
+            inner.compaction_state.pending_hermes_session_id.as_deref(),
+            Some("hs-old"),
+        );
+        let frame = frame_with_method(&inner, "amux/context_compaction_started")
+            .expect("started frame must be broadcast");
+        assert_eq!(frame["params"]["source"], json!("hermes_stderr"));
+        assert_eq!(frame["params"]["hermesSessionId"], json!("hs-old"));
+        assert_eq!(frame["params"]["messagesBefore"], json!(50));
+        assert_eq!(frame["params"]["tokensApproxBefore"], json!(72_908));
+        assert_eq!(frame["params"]["model"], json!("gpt-5.5"));
+        assert!(frame["params"].get("focus").is_none(), "focus=None elided");
+    }
+
+    #[test]
+    fn hermes_stderr_done_rotates_segment_and_increments_count() {
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+        inner.set_canonical_session_id_with_reason("acp-stable", EndReason::SessionLoad);
+        let opening_seg = inner.active_segment_id.expect("seg-1 open");
+
+        inner.handle_agent_stderr_line(b"agent.conversation_compression: context compression started: session=hs-old messages=50 tokens=~72,908 model=gpt-5.5".to_vec());
+        inner.handle_agent_stderr_line(b"agent.conversation_compression: context compression done: session=hs-old messages=50->9 tokens=~54,700".to_vec());
+
+        assert_eq!(inner.compaction_count, 1, "done line increments exactly once");
+        assert!(!inner.compaction_state.active, "compaction no longer active");
+        assert!(inner.compaction_state.last_completed_at.is_some());
+        assert_eq!(
+            inner.compaction_state.last_source.as_deref(),
+            Some("hermes_stderr"),
+        );
+
+        assert_eq!(inner.segments.len(), 2, "segment must rotate on done");
+        let closed = inner
+            .segments
+            .iter()
+            .find(|s| s.id == opening_seg)
+            .expect("seg-1 still present");
+        assert_eq!(closed.end_reason, Some(EndReason::HermesCompression));
+        let active = inner
+            .active_segment()
+            .expect("post-rotation active segment");
+        assert_eq!(
+            active.acp_session_id.as_deref(),
+            Some("acp-stable"),
+            "ACP id stays stable across hermes compaction",
+        );
+
+        let done = frame_with_method(&inner, "amux/context_compaction_done")
+            .expect("done frame must be broadcast");
+        assert_eq!(done["params"]["source"], json!("hermes_stderr"));
+        assert_eq!(done["params"]["compressionCount"], json!(1));
+        assert_eq!(done["params"]["messagesBefore"], json!(50));
+        assert_eq!(done["params"]["messagesAfter"], json!(9));
+        assert_eq!(done["params"]["tokensApproxAfter"], json!(54_700));
+        assert_eq!(
+            done["params"]["previousSegmentId"],
+            json!(opening_seg.formatted()),
+        );
+        assert_eq!(
+            done["params"]["successorSegmentId"],
+            json!(active.id.formatted()),
+        );
+    }
+
+    #[test]
+    fn hermes_stderr_done_counts_each_compaction_exactly_once() {
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+        inner.set_canonical_session_id_with_reason("acp-stable", EndReason::SessionLoad);
+
+        for _ in 0..3 {
+            inner.handle_agent_stderr_line(b"agent.conversation_compression: context compression started: session=hs messages=10".to_vec());
+            inner.handle_agent_stderr_line(b"agent.conversation_compression: context compression done: session=hs messages=10->2 tokens=~100".to_vec());
+        }
+
+        assert_eq!(inner.compaction_count, 3);
+        assert_eq!(inner.segments.len(), 4, "three rotations: seg-1..seg-4");
+
+        let methods = frame_methods(&inner);
+        let done_count = methods
+            .iter()
+            .filter(|m| m.as_str() == "amux/context_compaction_done")
+            .count();
+        let started_count = methods
+            .iter()
+            .filter(|m| m.as_str() == "amux/context_compaction_started")
+            .count();
+        assert_eq!(done_count, 3);
+        assert_eq!(started_count, 3);
+    }
+
+    #[test]
+    fn non_hermes_stderr_does_not_broadcast_or_count() {
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+        inner.set_canonical_session_id_with_reason("acp-stable", EndReason::SessionLoad);
+
+        let baseline_frames = inner.replay_log.as_ref().unwrap().len();
+        inner.handle_agent_stderr_line(b"some unrelated traceback line".to_vec());
+        inner.handle_agent_stderr_line(b"[DEBUG] agent.unrelated: nothing to see".to_vec());
+
+        assert_eq!(inner.compaction_count, 0);
+        assert!(!inner.compaction_state.active);
+        assert_eq!(
+            inner.replay_log.as_ref().unwrap().len(),
+            baseline_frames,
+            "non-hermes stderr never broadcasts",
+        );
+    }
+
+    #[test]
+    fn snapshots_carry_compaction_state() {
+        let mut inner = test_inner();
+        inner.replay_log = Some(VecDeque::new());
+        inner.set_canonical_session_id_with_reason("acp-stable", EndReason::SessionLoad);
+        inner.handle_agent_stderr_line(b"agent.conversation_compression: context compression started: session=hs messages=12".to_vec());
+        inner.handle_agent_stderr_line(b"agent.conversation_compression: context compression done: session=hs messages=12->4 tokens=~3000".to_vec());
+
+        let room_snap = inner.build_snapshot(false);
+        assert_eq!(room_snap.compaction_count, 1);
+        let compaction = room_snap.compaction.expect("compaction state present");
+        assert!(!compaction.active);
+        assert_eq!(compaction.last_source.as_deref(), Some("hermes_stderr"));
+        assert!(compaction.last_completed_at.is_some());
+
+        let attach_summary = inner
+            .attach_compaction_summary()
+            .expect("attach summary present");
+        assert!(!attach_summary.active);
+        assert_eq!(attach_summary.last_source.as_deref(), Some("hermes_stderr"));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3879,6 +4239,9 @@ pub fn spawn_room(
     let stdout_rx = agent
         .take_stdout_rx()
         .expect("AgentProcess::take_stdout_rx must succeed on a fresh process");
+    let stderr_rx = agent
+        .take_stderr_rx()
+        .expect("AgentProcess::take_stderr_rx must succeed on a fresh process");
 
     let pump_tx = tx.clone();
     let pump_room_id = room_id.clone();
@@ -3893,12 +4256,25 @@ pub fn spawn_room(
         tracing::debug!(room = %pump_room_id, "stdout pump finished");
     });
 
+    let stderr_tx = tx.clone();
+    let stderr_room_id = room_id.clone();
+    let stderr_pump = tokio::spawn(async move {
+        let mut rx = stderr_rx;
+        while let Some(line) = rx.recv().await {
+            if stderr_tx.send(RoomMsg::AgentStderrLine(line)).await.is_err() {
+                return;
+            }
+        }
+        tracing::debug!(room = %stderr_room_id, "stderr pump finished");
+    });
+
     let actor = tokio::spawn(run_room(
         rx,
         tx.clone(),
         agent,
         initial_subscriber,
         pump,
+        stderr_pump,
         room_id,
         options,
     ));
@@ -3915,12 +4291,14 @@ enum ExitReason {
     ChannelClosed, // registry dropped tx; uncommon
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_room(
     mut rx: mpsc::Receiver<RoomMsg>,
     self_tx: mpsc::Sender<RoomMsg>,
     mut agent: AgentProcess,
     initial_subscriber: Subscriber,
     pump: JoinHandle<()>,
+    stderr_pump: JoinHandle<()>,
     session_id: String,
     options: RoomOptions,
 ) {
@@ -4004,6 +4382,10 @@ async fn run_room(
                             None
                         }
                     }
+                    Some(RoomMsg::AgentStderrLine(line)) => {
+                        inner.handle_agent_stderr_line(line);
+                        None
+                    }
                     Some(RoomMsg::AgentDied) => {
                         Some(ExitReason::AgentDied)
                     }
@@ -4062,5 +4444,6 @@ async fn run_room(
         tracing::warn!(session = %session_id, error = %err, "agent shutdown error");
     }
     pump.abort();
+    stderr_pump.abort();
     tracing::info!(session = %session_id, "session task exiting");
 }

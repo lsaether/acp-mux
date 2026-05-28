@@ -151,6 +151,25 @@ pub struct AttachSnapshot {
     pub segments: Vec<SegmentSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_segment_id: Option<SegmentId>,
+    /// Mux-observed Hermes compactions for this room. Always present so
+    /// clients can tell `0` (no compaction yet) from a missing field.
+    pub compression_count: u64,
+    /// Most recent compaction lifecycle, if any compaction has been
+    /// observed. Omitted on a fresh room.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<AttachCompactionSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachCompactionSummary {
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

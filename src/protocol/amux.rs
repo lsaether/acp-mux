@@ -29,6 +29,14 @@ const METHOD_REPLAY_STARTED: &str = "amux/replay_started";
 const METHOD_REPLAY_COMPLETE: &str = "amux/replay_complete";
 const METHOD_SEGMENT_STARTED: &str = "amux/segment_started";
 const METHOD_SEGMENT_ENDED: &str = "amux/segment_ended";
+const METHOD_CONTEXT_COMPACTION_STARTED: &str = "amux/context_compaction_started";
+const METHOD_CONTEXT_COMPACTION_DONE: &str = "amux/context_compaction_done";
+
+/// Source label for compaction signals that originated from the Hermes
+/// agent's stderr stream. Used in `amux/context_compaction_*` frames so
+/// clients can tell whether they're looking at a stderr-derived signal
+/// (best-effort, may be missing fields) or a future structured signal.
+pub const COMPACTION_SOURCE_HERMES_STDERR: &str = "hermes_stderr";
 
 /// Method name for the amux extension that lets any attached peer steer the
 /// current composer state. If a turn is in flight, current mux-owned semantics
@@ -680,6 +688,97 @@ pub fn segment_ended(
             closed_at,
             end_reason,
             successor_segment_id,
+        },
+    )
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextCompactionStartedParams<'a> {
+    room_id: &'a str,
+    source: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hermes_session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    messages_before: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_approx_before: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextCompactionDoneParams<'a> {
+    room_id: &'a str,
+    source: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hermes_session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    messages_before: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    messages_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_approx_after: Option<u64>,
+    compression_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    successor_segment_id: Option<SegmentId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_segment_id: Option<SegmentId>,
+}
+
+pub struct ContextCompactionStarted<'a> {
+    pub room_id: &'a str,
+    pub source: &'a str,
+    pub hermes_session_id: Option<&'a str>,
+    pub messages_before: Option<u64>,
+    pub tokens_approx_before: Option<u64>,
+    pub model: Option<&'a str>,
+    pub focus: Option<&'a str>,
+}
+
+pub struct ContextCompactionDone<'a> {
+    pub room_id: &'a str,
+    pub source: &'a str,
+    pub hermes_session_id: Option<&'a str>,
+    pub messages_before: Option<u64>,
+    pub messages_after: Option<u64>,
+    pub tokens_approx_after: Option<u64>,
+    pub compression_count: u64,
+    pub previous_segment_id: Option<SegmentId>,
+    pub successor_segment_id: Option<SegmentId>,
+}
+
+pub fn context_compaction_started(event: ContextCompactionStarted<'_>) -> Vec<u8> {
+    encode(
+        METHOD_CONTEXT_COMPACTION_STARTED,
+        ContextCompactionStartedParams {
+            room_id: event.room_id,
+            source: event.source,
+            hermes_session_id: event.hermes_session_id,
+            messages_before: event.messages_before,
+            tokens_approx_before: event.tokens_approx_before,
+            model: event.model,
+            focus: event.focus,
+        },
+    )
+}
+
+pub fn context_compaction_done(event: ContextCompactionDone<'_>) -> Vec<u8> {
+    encode(
+        METHOD_CONTEXT_COMPACTION_DONE,
+        ContextCompactionDoneParams {
+            room_id: event.room_id,
+            source: event.source,
+            hermes_session_id: event.hermes_session_id,
+            messages_before: event.messages_before,
+            messages_after: event.messages_after,
+            tokens_approx_after: event.tokens_approx_after,
+            compression_count: event.compression_count,
+            successor_segment_id: event.successor_segment_id,
+            previous_segment_id: event.previous_segment_id,
         },
     )
 }

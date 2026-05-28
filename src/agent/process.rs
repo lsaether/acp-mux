@@ -12,12 +12,19 @@ use tokio::time::timeout;
 
 /// Bound on the stdout channel. Each item is one NDJSON line.
 const STDOUT_CAPACITY: usize = 1024;
+/// Bound on the stderr channel. Hermes ACP can be chatty during
+/// compaction, so we size this generously; the reader drops oldest if
+/// the consumer falls behind, but in practice the room actor pulls
+/// stderr lines on the same select! as stdout.
+const STDERR_CAPACITY: usize = 1024;
 
 pub struct AgentProcess {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout_rx: Option<mpsc::Receiver<Vec<u8>>>,
     stdout_pump: Option<JoinHandle<()>>,
+    stderr_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    stderr_pump: Option<JoinHandle<()>>,
 }
 
 impl AgentProcess {
@@ -26,7 +33,7 @@ impl AgentProcess {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawn agent {program:?}"))?;
@@ -36,43 +43,23 @@ impl AgentProcess {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("no stdout pipe"))?;
-        let (tx, rx) = mpsc::channel(STDOUT_CAPACITY);
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("no stderr pipe"))?;
+        let (stdout_tx, stdout_rx) = mpsc::channel(STDOUT_CAPACITY);
+        let (stderr_tx, stderr_rx) = mpsc::channel(STDERR_CAPACITY);
 
-        let pump = tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout);
-            let mut buf = Vec::with_capacity(4096);
-            loop {
-                buf.clear();
-                match reader.read_until(b'\n', &mut buf).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let mut line = std::mem::take(&mut buf);
-                        if line.ends_with(b"\n") {
-                            line.pop();
-                            if line.ends_with(b"\r") {
-                                line.pop();
-                            }
-                        }
-                        if line.is_empty() {
-                            continue;
-                        }
-                        if tx.send(line).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "agent stdout read error");
-                        break;
-                    }
-                }
-            }
-        });
+        let stdout_pump = tokio::spawn(pump_lines(stdout, stdout_tx, "stdout"));
+        let stderr_pump = tokio::spawn(pump_lines(stderr, stderr_tx, "stderr"));
 
         Ok(AgentProcess {
             child,
             stdin: Some(stdin),
-            stdout_rx: Some(rx),
-            stdout_pump: Some(pump),
+            stdout_rx: Some(stdout_rx),
+            stdout_pump: Some(stdout_pump),
+            stderr_rx: Some(stderr_rx),
+            stderr_pump: Some(stderr_pump),
         })
     }
 
@@ -82,6 +69,14 @@ impl AgentProcess {
     /// `shutdown` on the AgentProcess handle.
     pub fn take_stdout_rx(&mut self) -> Option<mpsc::Receiver<Vec<u8>>> {
         self.stdout_rx.take()
+    }
+
+    /// Take ownership of the stderr line channel. Each item is one
+    /// stderr line with the trailing newline stripped. The session
+    /// actor consumes these to mirror them into mux logs and parse
+    /// recognized Hermes compaction lifecycle signals.
+    pub fn take_stderr_rx(&mut self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        self.stderr_rx.take()
     }
 
     /// Write one NDJSON frame to the agent. Caller passes the payload
@@ -119,7 +114,43 @@ impl AgentProcess {
         if let Some(handle) = self.stdout_pump.take() {
             handle.abort();
         }
+        if let Some(handle) = self.stderr_pump.take() {
+            handle.abort();
+        }
         Ok(())
+    }
+}
+
+async fn pump_lines<R>(reader: R, tx: mpsc::Sender<Vec<u8>>, stream: &'static str)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::with_capacity(4096);
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let mut line = std::mem::take(&mut buf);
+                if line.ends_with(b"\n") {
+                    line.pop();
+                    if line.ends_with(b"\r") {
+                        line.pop();
+                    }
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                if tx.send(line).await.is_err() {
+                    break;
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, %stream, "agent read error");
+                break;
+            }
+        }
     }
 }
 
