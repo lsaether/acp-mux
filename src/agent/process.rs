@@ -18,6 +18,22 @@ const STDOUT_CAPACITY: usize = 1024;
 /// debug log rather than backpressured. That keeps the child's OS
 /// stderr pipe drained, so a chatty agent can never wedge itself on
 /// the mux's internal channel.
+///
+/// TRADEOFF: because stderr is lossy, Hermes compaction detection that
+/// scrapes these lines (`--hermes-compaction-signals`) is best-effort.
+/// A `context compression done` line dropped under an extreme stderr
+/// flood means no `amux/context_compaction_done` event and no
+/// `compressionCount` increment for that compaction. This is rare in
+/// practice (normal Hermes compaction stderr is sparse) and partially
+/// self-corrects: segment rotation also has an independent stdout-side
+/// detector (`detect_segment_signal_from_agent_notification` reading
+/// `_meta.hermes`), so segment lineage survives even when the count
+/// does not. The durable fix is Hermes emitting a structured
+/// ACP/AMUX compaction signal so we stop scraping logs entirely — at
+/// which point the `source: "hermes_stderr"` label distinguishes the
+/// fallback path from the structured one. Do NOT make this channel
+/// blocking to "fix" the count: that reintroduces the deadlock where a
+/// chatty child with an undrained receiver wedges on the OS pipe.
 const STDERR_CAPACITY: usize = 1024;
 
 pub struct AgentProcess {
