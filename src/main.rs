@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use amux::cli;
 use amux::room::registry::{AgentCmd, RoomRegistry};
+use amux::room::replay_store::ReplayStore;
 use amux::server;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -33,13 +35,32 @@ async fn main() -> Result<()> {
         );
     }
 
-    let registry = RoomRegistry::new_with_options(
+    let replay_store = match cli.replay_store.as_ref() {
+        Some(path) => {
+            let store = ReplayStore::open(path)
+                .with_context(|| format!("open --replay-store {}", path.display()))?;
+            tracing::info!(path = %path.display(), "replay store enabled");
+            if !cli.emit_segment_frames {
+                tracing::warn!(
+                    "--replay-store is enabled with --emit-segment-frames=false; \
+                     restart hydration cannot reconstruct the canonical ACP session id or segment lineage \
+                     without persisted amux/segment_started bookends. Late joiners after a restart will \
+                     need to drive a fresh session/new or session/load before session/attach.",
+                );
+            }
+            Some(Arc::new(store))
+        }
+        None => None,
+    };
+
+    let registry = RoomRegistry::new_with_replay_store(
         agent_cmd,
         cli.replay_turns,
         std::time::Duration::from_secs(cli.session_ttl_seconds),
         cli.meta_propagate,
         client_tool_policy,
         cli.emit_segment_frames,
+        replay_store,
     );
     let app = server::router(server::AppState::new(registry));
 

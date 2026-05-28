@@ -36,6 +36,7 @@ Health and debug endpoints:
 | `--agent-cmd`              | _(none)_      | Command + args (whitespace-split). Without this, subscriber attaches close with WS code 1011. |
 | `--session-ttl-seconds`    | `60`          | Grace window after last subscriber leaves — a reconnect within this window keeps the same subprocess. |
 | `--replay-turns`           | `unbounded`   | `unbounded` keeps the full broadcast log; `0` disables it; `N > 0` is accepted and warned (bounded eviction lands in v0.2). |
+| `--replay-store`           | _(none)_      | Opt-in directory for on-disk replay persistence so late joiners can recover history across `amux` restarts. See [Persistent replay store](#persistent-replay-store). |
 | `--meta-propagate`         | `false`       | Opt into injecting mux trace fields into subscriber → agent requests at `params._meta.amux`. |
 | `--unsafe-debug-client-tool-broadcast` | `false` | **Unsafe/debug only.** Restores raw fanout for agent-initiated `fs/*` and `terminal/*` requests; side effects may duplicate across subscribers. |
 | `--emit-segment-frames`    | `true`        | Emit `amux/segment_started` and `amux/segment_ended` lifecycle frames on segment rotation (`session/load`, hermes compaction). Pass `--emit-segment-frames=false` to preserve byte-equivalence with v0.1.x clients that haven't picked up the new frame methods. Bare `--emit-segment-frames` is equivalent to `=true`. |
@@ -68,6 +69,38 @@ Health and debug endpoints:
 - **Cancellation.** `$/cancel_request` (request-cancellation RFD / unstable schema, not stable ACP v1) works both directions: subscribers can cancel their own in-flight requests; agents can cancel agent-initiated requests (broadcast to peers + `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`). The amux extension `amux/cancel_active_turn` lets *any* attached peer cancel the in-flight turn (not just the driver) — internally it sends ACP-native `session/cancel { sessionId }` toward the agent and emits `amux/turn_cancelled` to peers.
 - **Replay log.** Every broadcast-tier frame (`amux/*` + agent notifications) is appended; each entry is tagged with the segment id it belongs to. A late joiner receives the legacy chronological WebSocket replay before any live event unless it connects with `replay=skip`. Raw collaborative agent-initiated requests are live-only in WebSocket replay, but unresolved `session/request_permission` requests are stored separately and re-issued after `session/attach` so late joiners can answer them. `historyPolicy: "full"` (default) returns the current segment plus pre-segment bootstrap frames, with one carve-out: `amux/turn_started` / `amux/turn_complete` / `amux/turn_cancelled` frames from a prior segment are carried through whenever their `amuxTurnId` brackets the active segment, so a turn that crossed a rotation still arrives bracketed — agent chunks from prior segments stay excluded. `historyPolicy: "full_lineage"` returns every segment's frames in `replaySeq` order so clients can render history that crosses compaction. `historyPolicy: "after_message"` falls back to `"full"` until upstream ACP message IDs are available end-to-end. The attach result's `_meta.amux.snapshot.segments` summarises lineage even for `full` clients so they can surface "× compactions earlier" without paging through every frame. Attach response history can be returned newest-turn-first via `params._meta.amux.replayOrder: "newest_turn_first"`, echoed as `result._meta.amux.appliedReplayOrder`. `--replay-turns 0` disables replay; positive bounded replay is a future-compatible knob.
 - **TTL grace.** Last subscriber leaving starts a countdown; a reconnect within `--session-ttl-seconds` reuses the same subprocess with all of its caches intact.
+
+## Persistent replay store
+
+Pass `--replay-store <DIR>` to have `amux` persist the broadcast replay log to disk. Default behavior (no flag) is unchanged: the replay log is in-memory only and is lost on restart. With the flag set, the broadcast-tier log survives `amux` restarts so a late joiner can recover prior session history.
+
+What's persisted:
+
+- Every broadcast-tier frame that flows through the in-memory replay log: `amux/*` extension notifications plus the agent's `session/update` / other notification-shaped frames.
+- Each persisted frame carries its mux-recorded `replaySeq`, `segmentId`, and `recordedAt`. Late-joiner replays continue to surface the original mux-record time under `params._meta.amux.recordedAt`, not the post-restart send time.
+
+What's not persisted:
+
+- The agent's actual conversation state — that remains the upstream agent's responsibility (e.g. via `session/load` against a real agent that backs it up).
+- In-flight agent tool calls or unresolved `session/request_permission` requests.
+- Per-subscriber frames (responses, raw agent-initiated requests) — only broadcast-tier traffic is recorded.
+
+Storage format: one JSON-lines file per room, named `<DIR>/<room_id>.jsonl`. Each line is:
+
+```json
+{"v":1,"seq":42,"segment_id":3,"recorded_at":"2026-05-27T17:42:01.234Z","frame":{...}}
+```
+
+`frame` is the raw broadcast frame as JSON; replay metadata is re-injected on read using the persisted `recorded_at` / `seq`. Lines are append-only and persisted synchronously; corrupt or unknown-version lines are skipped with a warning.
+
+Operational notes:
+
+- `--replay-turns 0` disables the in-memory log and therefore disables persistence — no per-room files are created.
+- The store is unbounded for v0.1: the file grows with every broadcast frame. Bounded eviction lands with the same v0.2 work that lands bounded in-memory eviction.
+- To clear history: delete the per-room file (`rm <DIR>/<room_id>.jsonl`) or wipe the directory. `amux` recreates files on next broadcast.
+- Cross-process safety: `amux` does not coordinate access between multiple processes writing to the same store directory. Running two `amux` instances against the same `--replay-store` is a configuration error.
+- After restart, the rehydrated canonical ACP `sessionId` is restored from the latest persisted `amux/segment_started` frame so late joiners can `session/attach` with the original session id. The next `session/new` / `session/load` from a fresh agent rotates the segment as normal.
+- Full restart restoration requires `--emit-segment-frames=true` (the default). With `--emit-segment-frames=false` there are no persisted segment bookends to reconstruct from, so on restart the rehydrated frames are still readable but the canonical session id and segment lineage are not restored — late joiners must drive a fresh `session/new` or `session/load` before `session/attach`. `amux` logs a warning at startup when this combination is detected.
 
 ## Client contract
 

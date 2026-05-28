@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 
@@ -33,6 +34,14 @@ pub struct Cli {
     /// eviction lands in v0.2). "0" disables the log entirely.
     #[arg(long, default_value = "unbounded")]
     pub replay_turns: ReplayTurns,
+
+    /// Opt-in: persist the broadcast replay log to the given directory so
+    /// late joiners can recover history across `amux` restarts. One JSONL
+    /// file per room (`<DIR>/<room_id>.jsonl`). Has no effect when
+    /// `--replay-turns 0`. The store is append-only and unbounded; delete
+    /// files (or the directory) to clear history.
+    #[arg(long, value_name = "DIR")]
+    pub replay_store: Option<PathBuf>,
 
     /// Opt into injecting mux-owned trace metadata into subscriber → agent
     /// requests under params._meta.amux.
@@ -214,6 +223,21 @@ mod tests {
             ))
         );
         assert_eq!(split_agent_cmd("   "), None);
+    }
+
+    #[test]
+    fn replay_store_defaults_off() {
+        let cli = Cli::try_parse_from(["amux"]).unwrap();
+        assert!(cli.replay_store.is_none());
+    }
+
+    #[test]
+    fn replay_store_accepts_path() {
+        let cli = Cli::try_parse_from(["amux", "--replay-store", "/tmp/amux-replay"]).unwrap();
+        assert_eq!(
+            cli.replay_store.as_deref(),
+            Some(std::path::Path::new("/tmp/amux-replay"))
+        );
     }
 
     #[test]
