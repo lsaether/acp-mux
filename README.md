@@ -40,6 +40,7 @@ Health and debug endpoints:
 | `--meta-propagate`         | `false`       | Opt into injecting mux trace fields into subscriber → agent requests at `params._meta.amux`. |
 | `--unsafe-debug-client-tool-broadcast` | `false` | **Unsafe/debug only.** Restores raw fanout for agent-initiated `fs/*` and `terminal/*` requests; side effects may duplicate across subscribers. |
 | `--emit-segment-frames`    | `true`        | Emit `amux/segment_started` and `amux/segment_ended` lifecycle frames on segment rotation (`session/load`, hermes compaction). Pass `--emit-segment-frames=false` to preserve byte-equivalence with v0.1.x clients that haven't picked up the new frame methods. Bare `--emit-segment-frames` is equivalent to `=true`. |
+| `--hermes-compaction-signals` | `false`    | Opt-in: parse Hermes-specific compaction lines on the agent's stderr stream and emit `amux/context_compaction_started` / `amux/context_compaction_done` plus a `hermes_compression` segment rotation. Off by default so non-Hermes agents (claude-agent-acp, etc.) cannot trigger false positives on unrelated log lines. Child stderr is captured and mirrored back to the operator's terminal labeled `[AGENT <room>]` regardless of this flag. |
 | `--log-level`              | `info`        | `trace`/`debug`/`info`/`warn`/`error`. `RUST_LOG` wins when set. |
 
 ## Agent compatibility
@@ -175,6 +176,7 @@ This table was audited against the stable ACP v1 schema release [`v0.13.3`](http
 | `amux/agent_request_opened` | proxy → subscribers | Non-actionable context for agent-initiated requests; replay-safe companion to the live raw request. |
 | `amux/agent_request_resolved` | proxy → subscribers | Dismissal signal for agent-initiated requests (`request_permission`, etc.). |
 | `amux/segment_started`, `amux/segment_ended` | proxy → subscribers | Segment lifecycle bookends. `segment_started` opens with the new canonical ACP `sessionId` and any known `provenance`; `segment_ended` closes the prior segment with `endReason` (`session_load`, `hermes_compression`, `acp_session_id_changed`) and `successorSegmentId`. Gated by `--emit-segment-frames`. |
+| `amux/context_compaction_started`, `amux/context_compaction_done` | proxy → subscribers | Hermes context-compaction lifecycle derived from the child's stderr. `done` increments the room's `compressionCount` and rotates the segment with `endReason: hermes_compression`. Gated by `--hermes-compaction-signals` so non-Hermes agents stay quiet. |
 | `amux/cancel_active_turn` | subscriber → proxy | Any peer can cancel the active turn; resolves to ACP-native `session/cancel` toward the agent. |
 
 Detailed shape and semantics: [`docs/design/amux-namespace.md`](docs/design/amux-namespace.md).

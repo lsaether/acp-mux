@@ -12,10 +12,12 @@ use tokio::time::timeout;
 
 /// Bound on the stdout channel. Each item is one NDJSON line.
 const STDOUT_CAPACITY: usize = 1024;
-/// Bound on the stderr channel. Hermes ACP can be chatty during
-/// compaction, so we size this generously; the reader drops oldest if
-/// the consumer falls behind, but in practice the room actor pulls
-/// stderr lines on the same select! as stdout.
+/// Bound on the stderr channel. The pump is *lossy*: if the consumer
+/// falls behind (or never drains the receiver — e.g. the transient
+/// agent spawned for `/acp/sessions`), new lines are dropped with a
+/// debug log rather than backpressured. That keeps the child's OS
+/// stderr pipe drained, so a chatty agent can never wedge itself on
+/// the mux's internal channel.
 const STDERR_CAPACITY: usize = 1024;
 
 pub struct AgentProcess {
@@ -50,8 +52,8 @@ impl AgentProcess {
         let (stdout_tx, stdout_rx) = mpsc::channel(STDOUT_CAPACITY);
         let (stderr_tx, stderr_rx) = mpsc::channel(STDERR_CAPACITY);
 
-        let stdout_pump = tokio::spawn(pump_lines(stdout, stdout_tx, "stdout"));
-        let stderr_pump = tokio::spawn(pump_lines(stderr, stderr_tx, "stderr"));
+        let stdout_pump = tokio::spawn(pump_lines(stdout, stdout_tx, "stdout", PumpMode::Blocking));
+        let stderr_pump = tokio::spawn(pump_lines(stderr, stderr_tx, "stderr", PumpMode::Lossy));
 
         Ok(AgentProcess {
             child,
@@ -121,12 +123,26 @@ impl AgentProcess {
     }
 }
 
-async fn pump_lines<R>(reader: R, tx: mpsc::Sender<Vec<u8>>, stream: &'static str)
+#[derive(Debug, Clone, Copy)]
+enum PumpMode {
+    /// Awaited `send`. Backpressures when the channel is full — the
+    /// only acceptable mode for stdout (NDJSON protocol: dropping a
+    /// line corrupts the stream).
+    Blocking,
+    /// `try_send` with drop-on-full. Acceptable mode for stderr (line
+    /// logs only, no protocol invariant). Keeps the child's OS pipe
+    /// drained even when the receiver is undrained, e.g. for a
+    /// transient subprocess used by `list_sessions_control_plane`.
+    Lossy,
+}
+
+async fn pump_lines<R>(reader: R, tx: mpsc::Sender<Vec<u8>>, stream: &'static str, mode: PumpMode)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::with_capacity(4096);
+    let mut dropped: u64 = 0;
     loop {
         buf.clear();
         match reader.read_until(b'\n', &mut buf).await {
@@ -142,8 +158,29 @@ where
                 if line.is_empty() {
                     continue;
                 }
-                if tx.send(line).await.is_err() {
-                    break;
+                match mode {
+                    PumpMode::Blocking => {
+                        if tx.send(line).await.is_err() {
+                            break;
+                        }
+                    }
+                    PumpMode::Lossy => match tx.try_send(line) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            dropped = dropped.saturating_add(1);
+                            // Throttle the log so a sustained burst doesn't
+                            // spam the operator: log on the first drop and
+                            // then every 256th drop.
+                            if dropped == 1 || dropped.is_multiple_of(256) {
+                                tracing::debug!(
+                                    %stream,
+                                    dropped,
+                                    "agent line dropped: receiver not draining fast enough",
+                                );
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    },
                 }
             }
             Err(err) => {
@@ -181,6 +218,38 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(line, br#"{"jsonrpc":"2.0","method":"session/update"}"#);
+
+        proc.shutdown(Duration::from_secs(2)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stderr_burst_does_not_wedge_stdout_when_stderr_undrained() {
+        // Regression guard for the deadlock: a transient agent
+        // (e.g. spawned by `list_sessions_control_plane`) never drains
+        // the stderr receiver. If the pump backpressured on a chatty
+        // child, the OS stderr pipe would fill and the child would
+        // block, never reading stdin or producing stdout.
+        //
+        // The shell script bursts way more than STDERR_CAPACITY lines
+        // before executing `cat`. With a lossy stderr pump, lines are
+        // dropped, the OS pipe stays drained, the child proceeds to
+        // `cat`, and our loopback completes.
+        let burst = format!(
+            "for i in $(seq 1 {}); do echo noise $i >&2; done; exec cat",
+            STDERR_CAPACITY * 4,
+        );
+        let mut proc = AgentProcess::spawn("sh", &["-c".into(), burst])
+            .await
+            .expect("spawn sh");
+
+        // We intentionally do NOT call take_stderr_rx — leaving the
+        // receiver to sit at capacity is the whole point of the test.
+        proc.send(b"hello").await.unwrap();
+        let line = timeout(Duration::from_secs(5), proc.recv_line())
+            .await
+            .expect("recv timed out — stderr backpressure wedged stdout")
+            .expect("eof before stdout line");
+        assert_eq!(line, b"hello");
 
         proc.shutdown(Duration::from_secs(2)).await.unwrap();
     }

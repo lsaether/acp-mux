@@ -268,6 +268,18 @@ impl RoomRegistry {
             .clone()
             .ok_or(ControlPlaneSessionListError::AgentCmdMissing)?;
         let mut agent = AgentProcess::spawn(&cmd.program, &cmd.args).await?;
+        // The pump is lossy, so a chatty agent can never wedge itself
+        // even if nobody drains stderr. But we still want diagnostic
+        // visibility for the transient agent's stderr lines, so drain
+        // them into the mux's tracing logs here.
+        if let Some(mut stderr_rx) = agent.take_stderr_rx() {
+            tokio::spawn(async move {
+                while let Some(line) = stderr_rx.recv().await {
+                    let text = String::from_utf8_lossy(&line);
+                    tracing::debug!(target: "agent_stderr", control_plane = true, line = %text);
+                }
+            });
+        }
         let result = query_transient_session_list(&mut agent, cwd).await;
         if let Err(err) = agent.shutdown(CONTROL_PLANE_AGENT_TIMEOUT).await {
             tracing::warn!(error = %err, "transient session/list agent shutdown failed");
