@@ -2,6 +2,14 @@
 name = "acp-mux"
 version = "0.1.3"
 edition = "2024"
+rust-version = "1.85"
+description = "Multi-subscriber session-sharing proxy for the Agent Client Protocol (ACP). Lets multiple clients attach to one ACP agent session in real time."
+license = "MIT"
+repository = "https://github.com/lsaether/acp-mux"
+homepage = "https://github.com/lsaether/acp-mux"
+readme = "README.md"
+keywords = ["acp", "agent", "multiplexer", "websocket", "proxy"]
+categories = ["command-line-utilities", "web-programming::websocket"]
 
 # The crate (and GitHub repo) is "acp-mux" but the installed binary is
 # the shorter "amux". `src/bin/mock_acp.rs` is still auto-detected.
