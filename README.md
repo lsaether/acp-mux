@@ -1,8 +1,40 @@
 # acp-mux
 
-Multi-subscriber session-sharing layer for ACP (Agent Client Protocol). Lets multiple clients — desktop, phone, web — attach to one ACP agent session in real time. Each client sees the same conversation, can take turns prompting, and receives streaming updates from the agent.
+**Generic ACP multiplexer / agent mirror.** `acp-mux` runs one stdio ACP agent process behind a WebSocket room and mirrors that live agent session to many clients — desktop, phone, web, TUI, or anything else that can speak JSON-RPC over WebSocket.
 
-**Status:** v0.1.2.
+The mux is provider-neutral. It does not parse provider logs, interpret provider-private metadata, or make one ACP implementation canonical. Provider `_meta` passes through as payload data; mux state is driven by JSON-RPC envelopes, ACP method names, and ACP-visible `sessionId` changes.
+
+```text
+ACP client(s) ── WebSocket JSON-RPC ──► amux ── stdio ACP JSON-RPC ──► ACP agent
+   phone             same room              │             any stdio ACP agent
+   desktop           same transcript         └─ replay, turn control, presence
+   web UI            same permissions
+```
+
+## What it does
+
+`acp-mux` has one job: **mirror one upstream ACP agent session into a collaborative, reconnectable room.**
+
+It owns:
+
+- one agent subprocess per room;
+- WebSocket attach/detach for multiple subscribers;
+- JSON-RPC request-id translation and response routing;
+- broadcast fanout for agent notifications;
+- initialize / `session/new` response caching for late joiners;
+- replay history and optional persistent replay storage;
+- turn serialization, queueing, steering, and active-turn cancellation;
+- first-writer-wins coordination for agent-initiated permission requests;
+- room/segment lineage when the canonical ACP `sessionId` changes;
+- safe defaults for delegated client tools such as `fs/*` and `terminal/*`.
+
+It does **not** own:
+
+- the agent's model, tools, memory, auth, or persisted conversation store;
+- provider-specific lifecycle semantics;
+- provider-specific stderr/log parsing;
+- terminal or filesystem client-tool execution by default;
+- changes to upstream ACP agents or the ACP protocol.
 
 ## Install
 
@@ -13,179 +45,156 @@ cargo build --release
 # binary: ./target/release/amux
 ```
 
-## Run
+## Run with Claude Agent ACP
+
+The most useful smoke path is a real ACP coding agent. Zed's Claude Agent adapter is published as `@agentclientprotocol/claude-agent-acp` (`@zed-industries/claude-agent-acp` was the earlier package name and is still what older Zed docs mention). `acp-mux` can run it like any other stdio ACP agent.
+
+Use `npx` directly:
 
 ```sh
-amux --agent-cmd 'hermes acp' --port 8765
+# Provide auth however the adapter expects it; this is just one common path.
+export ANTHROPIC_API_KEY='<your-api-key>'
+
+target/release/amux \
+  --agent-cmd 'npx -y @agentclientprotocol/claude-agent-acp' \
+  --port 8765
 ```
 
-Then connect WebSocket clients to `ws://127.0.0.1:8765/acp?room=<id>&peer_id=<unique>&peer_name=<display>&role=<optional>`. `?session=` is accepted as a deprecated alias for `?room=` during the v0.2 transition and logs a one-shot WARN per attach. Attach-aware clients can add `&replay=skip` and use `session/attach.result.history` as their single bootstrap history source.
+Or install the adapter globally and use its binary:
 
-Health and debug endpoints:
+```sh
+npm install -g @agentclientprotocol/claude-agent-acp
 
-- `GET /healthz` — `200 ok`
-- `GET /acp/sessions?cwd=<optional>` — cold-start session discovery. Spawns a transient `--agent-cmd`, initializes it, sends `session/list`, returns the agent's `result` JSON, then tears the subprocess down without creating a live mux room.
-- `GET /debug/sessions` — JSON snapshot of every live room (`rooms[]`, `roomCount`, subscribers, cache state, active turn, replay log length, segment lineage)
+target/release/amux \
+  --agent-cmd 'claude-agent-acp' \
+  --host 127.0.0.1 \
+  --port 8765
+```
 
-### CLI flags
+Do **not** put shell-only syntax such as `ANTHROPIC_API_KEY=... claude-agent-acp` inside `--agent-cmd`; `amux` splits the command into argv and does not run it through a shell. Put environment variables on the `amux` process itself.
 
-| Flag                       | Default       | Notes |
-|----------------------------|---------------|-------|
-| `--host`                   | `127.0.0.1`   | Bind address. |
-| `--port`                   | `8765`        | TCP port. |
-| `--agent-cmd`              | _(none)_      | Command + args (whitespace-split). Without this, subscriber attaches close with WS code 1011. |
-| `--session-ttl-seconds`    | `60`          | Grace window after last subscriber leaves — a reconnect within this window keeps the same subprocess. |
-| `--replay-turns`           | `unbounded`   | `unbounded` keeps the full broadcast log; `0` disables it; `N > 0` is accepted and warned (bounded eviction lands in v0.2). |
-| `--replay-store`           | _(none)_      | Opt-in directory for on-disk replay persistence so late joiners can recover history across `amux` restarts. See [Persistent replay store](#persistent-replay-store). |
-| `--meta-propagate`         | `false`       | Opt into injecting mux trace fields into subscriber → agent requests at `params._meta.amux`. |
-| `--unsafe-debug-client-tool-broadcast` | `false` | **Unsafe/debug only.** Restores raw fanout for agent-initiated `fs/*` and `terminal/*` requests; side effects may duplicate across subscribers. |
-| `--emit-segment-frames`    | `true`        | Emit `amux/segment_started` and `amux/segment_ended` lifecycle frames on segment rotation (`session/load`, hermes compaction). Pass `--emit-segment-frames=false` to preserve byte-equivalence with v0.1.x clients that haven't picked up the new frame methods. Bare `--emit-segment-frames` is equivalent to `=true`. |
-| `--hermes-compaction-signals` | `false`    | Opt-in: parse Hermes-specific compaction lines on the agent's stderr stream and emit `amux/context_compaction_started` / `amux/context_compaction_done` plus a `hermes_compression` segment rotation. Off by default so non-Hermes agents (claude-agent-acp, etc.) cannot trigger false positives on unrelated log lines. Child stderr is captured and mirrored back to the operator's terminal labeled `[AGENT <room>]` regardless of this flag. |
-| `--log-level`              | `info`        | `trace`/`debug`/`info`/`warn`/`error`. `RUST_LOG` wins when set. |
+Then connect clients to:
+
+```text
+ws://127.0.0.1:8765/acp?room=<room-id>&peer_id=<unique-peer>&peer_name=<display-name>&role=<optional>
+```
+
+`?room=` is the mux-level collaboration id. Multiple clients using the same `room` share the same upstream Claude Agent subprocess and transcript. `?session=` is accepted as a deprecated alias during the v0.2 transition.
+
+Attach-aware clients can add `&replay=skip` and then call proxy-local `session/attach` so attach history becomes their single bootstrap source. See [`docs/examples/client-contract`](docs/examples/client-contract) for copyable client frames and expected `amux/*` shapes.
+
+## HTTP endpoints
+
+- `GET /healthz` — returns `200 ok`.
+- `GET /acp/sessions?cwd=<optional>` — cold-start session discovery. Spawns a transient `--agent-cmd`, initializes it, sends `session/list`, returns the agent's `result` JSON, then tears the subprocess down without creating a live room.
+- `GET /debug/sessions` — JSON snapshot of live rooms: subscribers, cache state, active turn, queue state, replay length, and segment lineage.
+
+## CLI flags
+
+| Flag | Default | Notes |
+|---|---:|---|
+| `--host` | `127.0.0.1` | Bind address. |
+| `--port` | `8765` | TCP port. |
+| `--agent-cmd` | _(none)_ | Command + args used to spawn a stdio ACP agent for each new room. Without this, attaches close with WS code `1011`. |
+| `--session-ttl-seconds` | `60` | Grace window after the last subscriber leaves. A reconnect within the window keeps the same subprocess alive. |
+| `--replay-turns` | `unbounded` | `unbounded` keeps the broadcast log; `0` disables it; `N > 0` is accepted and currently behaves as unbounded with a warning. |
+| `--replay-store` | _(none)_ | Optional directory for append-only JSONL replay persistence, one file per room. |
+| `--meta-propagate` | `false` | Opt into adding mux trace fields under `params._meta.amux` on subscriber → agent requests. |
+| `--unsafe-debug-client-tool-broadcast` | `false` | **Unsafe/debug only.** Raw-broadcasts agent-initiated `fs/*` and `terminal/*` requests; may duplicate side effects. |
+| `--emit-segment-frames` | `true` | Emit `amux/segment_started` and `amux/segment_ended` when `session/load` or observed ACP `sessionId` changes rotate the room segment. |
+| `--log-level` | `info` | `trace`, `debug`, `info`, `warn`, or `error`. `RUST_LOG` wins when set. |
 
 ## Agent compatibility
 
-`acp-mux` is currently developed and directly tested against the Hermes ACP harness. Other ACP agents may work for the generic conversation, permission, cancellation, and replay paths, but Hermes is the only directly supported harness at the moment.
+`acp-mux` expects a child process that speaks ACP-style newline-delimited JSON-RPC over stdio.
 
-| Agent / harness | Status | Notes |
+| Agent | Status | Notes |
 |---|---|---|
-| **[hermes-agent](https://github.com/hermes-agent/hermes)** | ✅ Directly supported | Hermes self-handles fs/terminal/tool execution inside its own process and does not delegate those calls over ACP. |
-| **Codex (Zed-bundled)**, **claude-code-acp**, **copilot-acp** | ⚠️ Best-effort / partial | Basic ACP envelope routing should work, but these are not directly harnessed right now. Agents that delegate `fs/*` or `terminal/*` to the client are safe-blocked by default; full delegated-client compatibility is tracked in [#37](https://github.com/lsaether/acp-mux/issues/37) and follow-ups. |
+| `@agentclientprotocol/claude-agent-acp` / `claude-agent-acp` | ✅ Preferred real-agent example | Zed's Claude Agent adapter, runnable through `npx -y @agentclientprotocol/claude-agent-acp` or a global `claude-agent-acp` install. |
+| ACP agents that execute tools inside their own process | ✅ Generic path | Conversation, permission, cancellation, replay, attach/detach, and segment lineage are mux-owned and provider-neutral. |
+| ACP agents that delegate `fs/*` or `terminal/*` to the client | ⚠️ Blocked by default | `acp-mux` strips advertised filesystem/terminal client capabilities and returns a structured blocked error if the agent sends these requests anyway. Use `--unsafe-debug-client-tool-broadcast` only for diagnostics. |
+| Agents with provider-specific `_meta` | ✅ Opaque passthrough | Metadata remains in payloads for clients that understand it; the mux does not use it to drive lifecycle state. |
 
-## How it works
+## Room model
 
-- **One subprocess per room.** Each `?room=` value spawns a fresh `--agent-cmd` subprocess. Multiple subscribers on the same room share that subprocess. `?session=` is accepted as a deprecated alias for one release.
-- **Rooms own segmented transcripts.** A room may carry one or more *segments* — intervals during which a single canonical ACP `sessionId` is in force. `session/load` opens a new segment; hermes compaction (detected via `_meta.hermes.sessionProvenance.hermesSessionId` rotation, or an observable ACP `sessionId` change when the metadata is absent) opens another. The transcript continues unbroken across rotations; clients can ask for `historyPolicy: "full_lineage"` on `session/attach` to replay pre-compaction history. Spec in [`docs/design/rooms.md`](docs/design/rooms.md).
-- **JSON-RPC envelope routing.** The mux parses only the envelope (`id`, `method`, `params`, `result`, `error`) unless a mux-owned policy needs a narrow payload check. Payloads are otherwise forwarded byte-for-byte. Policy primarily keys off the `method` string.
-- **Per-session id translation.** Each subscriber's request `id` is rewritten to a per-session `mux_id` before forwarding; the response is rewritten back and sent only to the originator.
-- **`initialize` / `session/new` caching.** First response is cached; later joiners are answered locally without re-sending to the agent.
-- **Collaborative agent-initiated requests.** `session/request_permission` is fanned out live to every attached subscriber; any peer can reply. The mux also emits inert `amux/agent_request_opened` lifecycle metadata for replay/audit context, and re-issues unresolved permission requests to clients that later call `session/attach` with actionable history. The first reply for a given id is forwarded to the agent and later replies for the same id are dropped, so the agent always sees exactly one response. amux-aware clients receive `amux/agent_request_resolved`; generic attach-only clients that lose the race do not receive a standard resolution notification yet.
-- **RFD #533 attach/detach foundation.** In addition to the durable `amux/*` namespace, the mux handles proxy-local `session/attach` / `session/detach`. Attach callers can shape response `history` with `historyPolicy` plus mux-owned `params._meta.amux.replayOrder` (`chronological` or `newest_turn_first`). Attach-aware clients that want attach history as their only bootstrap source can connect with `/acp?...&replay=skip` to suppress the legacy transport replay before sending `session/attach`. It intentionally does **not** fabricate RFD #533 lifecycle `session/update` siblings yet, and it does **not** inject `agentCapabilities.sessionCapabilities.attach` into upstream `initialize` responses; callers discover/use this proxy feature out of band.
-- **Client-tool policy.** By default, agent-initiated `fs/*` and `terminal/*` client-tool requests are blocked in the mux, answered to the agent with JSON-RPC `-32000`, and not broadcast/replayed. `initialize.params.clientCapabilities.fs` and `.terminal` are stripped before the first initialize reaches the agent. `--unsafe-debug-client-tool-broadcast` explicitly restores the old raw fanout for diagnostics only.
-- **Turn serialization.** Concurrent ordinary `session/prompt` while a turn is in flight is rejected with JSON-RPC `-32001`; active-turn controls go through explicit `amux/*` requests. `amux/steer_active_turn` is mux-owned steer/send state: when a turn is active it broadcasts intent, sends ACP `session/cancel`, waits for settlement, then starts a replacement `session/prompt` with prompt-injected context and `supersedesTurnId`; when idle it submits the steer text immediately as the next prompt with `mode: "prompt"`. A second hard steer while one is pending is rejected with `-32002`. `amux/queue_prompt` is mux-owned queue/send state capped at six pending items (`-32003` when full): it broadcasts/replays queue lifecycle, starts immediately when no turn is active, or starts the queued prompt as the next turn after active-turn settlement. `amux/unqueue_prompt` removes a still-pending queue item. The last attached subscriber to issue a substantive request is surfaced as the "driving subscriber" in `/debug/sessions` and `amux/turn_started` for UI attribution.
-- **Opt-in request trace metadata.** With `--meta-propagate`, outbound subscriber → agent requests get mux-owned `params._meta.amux` fields (`peerId`, `peerName`, `role`, `muxId`, and `amuxTurnId` for prompts) for cross-client debugging. Default mode leaves request payload metadata unchanged.
-- **Cold-start session discovery.** `GET /acp/sessions` runs a transient agent-side `session/list` query before any WebSocket attach, useful for dashboards that need to browse persisted sessions before choosing one to resume.
-- **Live `session/list` decoration.** Returned `sessions[]` entries that match a live muxed upstream session get `sessions[i]._meta.amux` fields (`roomId`, `subscriberCount`, optional `drivingSubscriber`), preserving existing `_meta` keys and leaving non-live entries unchanged.
-- **`amux/*` extension namespace.** The mux publishes its own metadata/control plane out-of-band: `amux/session_context`, `amux/peer_joined`, `amux/peer_left`, `amux/turn_started`, `amux/turn_complete`, `amux/turn_cancelled`, `amux/session_busy`, `amux/control_submitted`, `amux/queue_item_added`, `amux/queue_item_submitted`, `amux/queue_item_completed`, `amux/queue_item_removed`, `amux/queue_item_orphaned`, `amux/agent_request_opened`, `amux/agent_request_resolved`, `amux/segment_started`, `amux/segment_ended`, plus subscriber-request controls such as `amux/steer_active_turn`, `amux/queue_prompt`, `amux/unqueue_prompt`, and `amux/cancel_active_turn`. ACP frames stay clean; clients see two distinguishable channels and demultiplex by method prefix.
-- **Cancellation.** `$/cancel_request` (request-cancellation RFD / unstable schema, not stable ACP v1) works both directions: subscribers can cancel their own in-flight requests; agents can cancel agent-initiated requests (broadcast to peers + `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`). The amux extension `amux/cancel_active_turn` lets *any* attached peer cancel the in-flight turn (not just the driver) — internally it sends ACP-native `session/cancel { sessionId }` toward the agent and emits `amux/turn_cancelled` to peers.
-- **Replay log.** Every broadcast-tier frame (`amux/*` + agent notifications) is appended; each entry is tagged with the segment id it belongs to. A late joiner receives the legacy chronological WebSocket replay before any live event unless it connects with `replay=skip`. Raw collaborative agent-initiated requests are live-only in WebSocket replay, but unresolved `session/request_permission` requests are stored separately and re-issued after `session/attach` so late joiners can answer them. `historyPolicy: "full"` (default) returns the current segment plus pre-segment bootstrap frames, with one carve-out: `amux/turn_started` / `amux/turn_complete` / `amux/turn_cancelled` frames from a prior segment are carried through whenever their `amuxTurnId` brackets the active segment, so a turn that crossed a rotation still arrives bracketed — agent chunks from prior segments stay excluded. `historyPolicy: "full_lineage"` returns every segment's frames in `replaySeq` order so clients can render history that crosses compaction. `historyPolicy: "after_message"` falls back to `"full"` until upstream ACP message IDs are available end-to-end. The attach result's `_meta.amux.snapshot.segments` summarises lineage even for `full` clients so they can surface "× compactions earlier" without paging through every frame. Attach response history can be returned newest-turn-first via `params._meta.amux.replayOrder: "newest_turn_first"`, echoed as `result._meta.amux.appliedReplayOrder`. `--replay-turns 0` disables replay; positive bounded replay is a future-compatible knob.
-- **TTL grace.** Last subscriber leaving starts a countdown; a reconnect within `--session-ttl-seconds` reuses the same subprocess with all of its caches intact.
+A **room** is the stable mux container named by `?room=`. It owns one upstream subprocess, one subscriber set, one replay log, and one continuous transcript.
+
+A room can contain multiple **segments**. A segment is the interval where one canonical ACP `sessionId` is active. Segments rotate on provider-neutral signals only:
+
+- a successful `session/load`; or
+- an agent notification whose `params.sessionId` differs from the active segment's ACP session id.
+
+The transcript continues across segments. Clients that want only the current head use `historyPolicy: "full"`; clients that want the whole mirrored room history use `historyPolicy: "full_lineage"` on `session/attach`.
+
+## Routing and replay
+
+- Subscriber request IDs are rewritten to mux-local IDs before forwarding to the agent.
+- Agent responses are rewritten back and sent only to the originating subscriber.
+- Agent notifications are broadcast to every subscriber and appended to replay.
+- First `initialize` and `session/new` responses are cached so late joiners do not accidentally create a second upstream session.
+- Unresolved `session/request_permission` requests are re-issued to attaching clients after `session/attach`; resolved permission history replays as inert `amux/*` lifecycle context, not stale actionable requests.
+
+## `amux/*` extension namespace
+
+`acp-mux` keeps ACP frames and mux facts separate. Agent-owned ACP frames stay in the ACP namespace; mux-owned collaboration/control events use `amux/*`.
+
+Common notifications:
+
+- `amux/session_context`
+- `amux/peer_joined`, `amux/peer_left`
+- `amux/turn_started`, `amux/turn_complete`, `amux/turn_cancelled`
+- `amux/session_busy`
+- `amux/control_submitted`
+- `amux/queue_item_added`, `amux/queue_item_submitted`, `amux/queue_item_completed`, `amux/queue_item_removed`, `amux/queue_item_orphaned`
+- `amux/agent_request_opened`, `amux/agent_request_resolved`
+- `amux/replay_started`, `amux/replay_complete`
+- `amux/segment_started`, `amux/segment_ended`
+
+Subscriber control requests:
+
+- `amux/steer_active_turn`
+- `amux/queue_prompt`
+- `amux/unqueue_prompt`
+- `amux/cancel_active_turn`
+
+See [`docs/design/amux-namespace.md`](docs/design/amux-namespace.md) for wire shapes.
+
+## Safety defaults
+
+ACP includes client-tool methods where an agent can ask the client to read/write files or run terminal commands. In a multi-subscriber room, naïve fanout can duplicate side effects or send a local action to the wrong machine.
+
+So `acp-mux` is fail-closed by default:
+
+- strips `initialize.params.clientCapabilities.fs` and `.terminal` before forwarding initialize to the agent;
+- blocks runtime `fs/*` and `terminal/*` requests with JSON-RPC `-32000`;
+- does not broadcast or replay blocked client-tool requests;
+- preserves collaborative `session/request_permission` fanout.
+
+Use `--unsafe-debug-client-tool-broadcast` only when deliberately debugging delegated-client behavior.
 
 ## Persistent replay store
 
-Pass `--replay-store <DIR>` to have `amux` persist the broadcast replay log to disk. Default behavior (no flag) is unchanged: the replay log is in-memory only and is lost on restart. With the flag set, the broadcast-tier log survives `amux` restarts so a late joiner can recover prior session history.
+Pass `--replay-store <DIR>` to persist broadcast-tier replay frames to disk. The store is append-only JSONL, one file per room:
 
-What's persisted:
-
-- Every broadcast-tier frame that flows through the in-memory replay log: `amux/*` extension notifications plus the agent's `session/update` / other notification-shaped frames.
-- Each persisted frame carries its mux-recorded `replaySeq`, `segmentId`, and `recordedAt`. Late-joiner replays continue to surface the original mux-record time under `params._meta.amux.recordedAt`, not the post-restart send time.
-
-What's not persisted:
-
-- The agent's actual conversation state — that remains the upstream agent's responsibility (e.g. via `session/load` against a real agent that backs it up).
-- In-flight agent tool calls or unresolved `session/request_permission` requests.
-- Per-subscriber frames (responses, raw agent-initiated requests) — only broadcast-tier traffic is recorded.
-
-Storage format: one JSON-lines file per room, named `<DIR>/<room_id>.jsonl`. Each line is:
-
-```json
-{"v":1,"seq":42,"segment_id":3,"recorded_at":"2026-05-27T17:42:01.234Z","frame":{...}}
+```text
+<DIR>/<room_id>.jsonl
 ```
 
-`frame` is the raw broadcast frame as JSON; replay metadata is re-injected on read using the persisted `recorded_at` / `seq`. Lines are append-only and persisted synchronously; corrupt or unknown-version lines are skipped with a warning.
+Persisted frames include mux replay metadata (`replaySeq`, `segmentId`, `recordedAt`) and are rehydrated on restart so late joiners can recover history. The upstream agent's actual conversation state remains the agent's responsibility; use ACP `session/load` or the agent's own persistence for that.
 
 Operational notes:
 
-- `--replay-turns 0` disables the in-memory log and therefore disables persistence — no per-room files are created.
-- The store is unbounded for v0.1: the file grows with every broadcast frame. Bounded eviction lands with the same v0.2 work that lands bounded in-memory eviction.
-- To clear history: delete the per-room file (`rm <DIR>/<room_id>.jsonl`) or wipe the directory. `amux` recreates files on next broadcast.
-- Cross-process safety: `amux` does not coordinate access between multiple processes writing to the same store directory. Running two `amux` instances against the same `--replay-store` is a configuration error.
-- After restart, the rehydrated canonical ACP `sessionId` is restored from the latest persisted `amux/segment_started` frame so late joiners can `session/attach` with the original session id. The next `session/new` / `session/load` from a fresh agent rotates the segment as normal.
-- Full restart restoration requires `--emit-segment-frames=true` (the default). With `--emit-segment-frames=false` there are no persisted segment bookends to reconstruct from, so on restart the rehydrated frames are still readable but the canonical session id and segment lineage are not restored — late joiners must drive a fresh `session/new` or `session/load` before `session/attach`. `amux` logs a warning at startup when this combination is detected.
-
-## Client contract
-
-Clients SHOULD:
-
-- Treat `amux/peer_joined` (with `peerId == self.peer_id`) as the empty-roster signal — used only by replay log late joiners.
-- Treat `amux/turn_started` / `amux/turn_complete` as turn bookends; the `peerId` field attributes the turn.
-- Treat `amux/agent_request_opened` / `amux/agent_request_resolved` as the non-actionable lifecycle for agent-initiated requests. Only raw live `session/request_permission` requests should create a reply affordance; replayed `amux/agent_request_opened` is context, not a request to answer.
-- Filter `amux/*` frames out of the conversation render and use them for presence / turn UI.
-- Allow the mux to rewrite request `id` fields freely (preserve client-side correlation by tracking your own original ids).
-
-Detailed protocol spec: [`docs/design/amux-namespace.md`](docs/design/amux-namespace.md).
-
-## ACP coverage
-
-amux parses only JSON-RPC envelopes (`id`, `method`, `params`, `result`, `error`) and forwards payloads byte-for-byte unless a method has mux-specific semantics. Any ACP method amux does not specifically intercept passes through transparently.
-
-This table was audited against the stable ACP v1 schema release [`v0.13.3`](https://github.com/agentclientprotocol/agent-client-protocol/releases/tag/v0.13.3) (published 2026-05-22) and the upstream docs at `agentclientprotocol/agent-client-protocol@a3b012c`. **Stable v1** means present in `schema/schema.json` and the current `/protocol/*` docs. **Unstable/RFD** means it appears only in `schema.unstable.json`, `docs/rfds/*`, or an unmerged proposal; amux support there is intentionally called out as extension behavior, not stable ACP compliance.
-
-### Client-initiated (subscriber → agent)
-
-| Method | amux | Spec status | Notes |
-|---|---|---|---|
-| `initialize` | ✅ | Stable v1 | Forwarded after stripping blocked client-tool capabilities; first response cached; upstream `agentCapabilities` passed through. |
-| `authenticate` | ✅ (envelope passthrough) | Stable v1 | Auth state belongs to the shared upstream agent subprocess. |
-| `logout` | ✅ (envelope passthrough) | Stable v1 | Stable as of the logout-method RFD completion; amux does not currently clear cached initialize/session state after logout. |
-| `session/new` | ✅ | Stable v1 | Forwarded; first response cached for late joiners. |
-| `session/load` | ✅ | Stable v1 | Forwarded to the agent. On success, amux rebinds the room's canonical session id, rotates the room into a new segment (`amux/segment_ended` + `amux/segment_started` bookends, unless `--emit-segment-frames=false`), and sets a replay-generation boundary on the loaded session; failed loads leave the cache untouched. |
-| `session/resume` | ⚠️ envelope passthrough | Stable v1 | Forwarded, but not yet given `session/load`-style canonical-session rebinding for late joiners. |
-| `session/close` | ⚠️ envelope passthrough | Stable v1 | Forwarded, but amux does not yet tear down the mux room or clear local caches after a successful close. |
-| `session/attach` | ✅ proxy-local | RFD #533-inspired | Answered by the mux, never forwarded to the agent. Returns `sessionId`, `clientId`, effective `historyPolicy`, optional `history`, and amux-specific metadata under `result._meta.amux` (`connectedClients`, `appliedReplayOrder`, `snapshot.segments`, `snapshot.activeSegmentId`). `full` returns the current segment's frames plus pre-segment bootstrap, additionally carrying `amux/turn_{started,complete,cancelled}` bookends from prior segments when their `amuxTurnId` brackets the active segment; `full_lineage` returns every segment in `replaySeq` order; `none` omits history; `pending_only` returns just unresolved permissions; `after_message` falls back to `full` when `afterMessageId` cannot be resolved. `params._meta.amux.historyDelivery: "stream"` switches `full` / `full_lineage` to streamed delivery (snapshot in the result, frames flowing afterward through `amux/replay_started` / `amux/replay_complete` markers). `params._meta.amux.replayOrder: "newest_turn_first"` reverses completed turn groups while preserving frame order within each turn. |
-| `session/detach` | ✅ proxy-local | RFD #533-inspired | Answered by the mux, then the WebSocket is closed normally; remaining peers receive `amux/peer_left`. The mux does not fabricate `session/update` disconnect notifications. |
-| `session/list` | ✅ | Stable v1 | Over WS, forwarded with id translation and optional `params._meta.amux` trace fields. Returned `sessions[]` entries matching live mux state are decorated under `sessions[i]._meta.amux`; non-live entries and agent-owned metadata are preserved. `GET /acp/sessions?cwd=...` performs a transient agent-side `session/list` before any WS attach. |
-| `session/prompt` | ✅ | Stable v1 | Forwarded with id translation; turn serialization; ordinary concurrent prompts rejected with `-32001`. Plain ACP prompts stay serialized/generic; active-turn steering/queueing uses explicit `amux/*` controls. |
-| `session/cancel` | ✅ | Stable v1 | Forwarded unchanged from vanilla clients; also emitted southbound by `amux/cancel_active_turn` for active-turn interruption. |
-| `session/set_mode` | ✅ (envelope passthrough) | Stable v1 | Not specifically handled. Session modes remain in stable v1 but are expected to change in ACP v2. |
-| `session/set_config_option` | ✅ (envelope passthrough) | Stable v1 | Not specifically handled; upstream agent owns config state and any resulting `session/update` notifications. |
-| `$/cancel_request` | ✅ | Unstable/RFD | Optional request-cancellation RFD; not in stable `schema.json`. Strict per-peer semantics; subscribers can cancel their own in-flight requests only. |
-
-### Agent-initiated (agent → subscriber)
-
-| Method | amux | Spec status | Notes |
-|---|---|---|---|
-| `session/update` | ✅ | Stable v1 | Agent-emitted updates are broadcast to every attached subscriber and appended to replay log. The mux does not fabricate proxy-owned lifecycle updates; clients use `amux/*` for mux lifecycle. |
-| `session/request_permission` | ✅ | Stable v1 | Broadcast live with first-writer-wins reply; `amux/agent_request_opened` records inert replay context; `amux/agent_request_resolved` fires when consumed; unresolved permissions are re-issued after `session/attach`; turn-end sweep cleans up abandoned requests. A re-issued permission reply may be dropped if another peer already answered first. |
-| `fs/read_text_file`, `fs/write_text_file` | ✅ safe default / 🚧 not provided | Stable v1 client-tool methods | amux does not advertise filesystem client capabilities by default. If an agent sends `fs/*` anyway, amux returns structured `-32000 { reason: "client_tool_blocked" }` to the agent and does not broadcast/replay. Full delegated-client modes are tracked in [#37](https://github.com/lsaether/acp-mux/issues/37). |
-| `terminal/create`, `terminal/output`, `terminal/wait_for_exit`, `terminal/kill`, `terminal/release` | ✅ safe default / 🚧 not provided | Stable v1 client-tool methods | Same policy as `fs/*`: `terminal` is stripped from advertised client capabilities and runtime requests are blocked unless `--unsafe-debug-client-tool-broadcast` is explicitly enabled. |
-| `$/cancel_request` | ✅ | Unstable/RFD | Optional request-cancellation RFD; not in stable `schema.json`. Marks `agent_pending` Consumed; broadcasts to all peers; emits `amux/agent_request_resolved { resolvedBy: "agent:cancelled" }`. |
-
-### Unstable ACP / RFD surfaces
-
-| Surface | amux | Status | Notes |
-|---|---|---|---|
-| `params._meta.amux` trace propagation | ✅ opt-in | `_meta` stable, propagation convention from RFD | `--meta-propagate` writes mux-owned metadata under the reserved `_meta` extension field without replacing existing agent/client metadata. |
-| `session/delete`, `session/fork`, provider methods, NES methods, MCP-over-ACP, elicitation | ➡️ generic passthrough only | Unstable schema / RFDs | Not intentionally implemented by amux. If experimental peers send them, amux envelope-routes them unless they later need mux-specific state handling. |
-| `session/attach`, `session/detach` | ✅ | RFD #533-inspired | Implemented as proxy-local methods while preserving `amux/*` as the authoritative mux lifecycle namespace. No proxy-owned `session/update` siblings yet, no upstream capability injection, and `after_message` is provisional/falls back to `full` without stable message-id coverage. Attach response history supports mux-owned `params._meta.amux.replayOrder` without URL/query replay modes or streamed replay marker frames. |
-
-### amux extensions (not part of ACP)
-
-| Method | Direction | Purpose |
-|---|---|---|
-| `amux/session_context` | proxy → subscriber | Per-attach mux/agent process context, including the cwd inherited by the agent subprocess. |
-| `amux/peer_joined`, `amux/peer_left` | proxy → subscribers | Presence. |
-| `amux/turn_started`, `amux/turn_complete` | proxy → subscribers | Turn bookends with `amuxTurnId`; replacement turns may include `supersedesTurnId`. |
-| `amux/turn_cancelled` | proxy → subscribers | Intent broadcast when any peer triggers cancellation. |
-| `amux/session_busy` | proxy → subscribers | Companion to `-32001` rejection on concurrent prompts. |
-| `amux/control_submitted` | proxy → subscribers | Replay-safe accepted-control intent for steer controls. |
-| `amux/queue_item_added`, `amux/queue_item_submitted`, `amux/queue_item_completed`, `amux/queue_item_removed`, `amux/queue_item_orphaned` | proxy → subscribers | Replay-safe mux-owned queue lifecycle. |
-| `amux/steer_active_turn` | subscriber → proxy | Steer the active turn if busy; submit the text immediately as the next prompt if idle. |
-| `amux/queue_prompt` | subscriber → proxy | Queue text after the active turn if busy, or submit it immediately if idle; capped at six pending items. |
-| `amux/unqueue_prompt` | subscriber → proxy | Remove a pending `amux/queue_prompt` item by `queueItemId`. |
-| `amux/agent_request_opened` | proxy → subscribers | Non-actionable context for agent-initiated requests; replay-safe companion to the live raw request. |
-| `amux/agent_request_resolved` | proxy → subscribers | Dismissal signal for agent-initiated requests (`request_permission`, etc.). |
-| `amux/segment_started`, `amux/segment_ended` | proxy → subscribers | Segment lifecycle bookends. `segment_started` opens with the new canonical ACP `sessionId` and any known `provenance`; `segment_ended` closes the prior segment with `endReason` (`session_load`, `hermes_compression`, `acp_session_id_changed`) and `successorSegmentId`. Gated by `--emit-segment-frames`. |
-| `amux/context_compaction_started`, `amux/context_compaction_done` | proxy → subscribers | Hermes context-compaction lifecycle derived from the child's stderr. `done` increments the room's `compressionCount` and rotates the segment with `endReason: hermes_compression`. Gated by `--hermes-compaction-signals` so non-Hermes agents stay quiet. |
-| `amux/cancel_active_turn` | subscriber → proxy | Any peer can cancel the active turn; resolves to ACP-native `session/cancel` toward the agent. |
-
-Detailed shape and semantics: [`docs/design/amux-namespace.md`](docs/design/amux-namespace.md).
+- `--replay-turns 0` disables both in-memory replay and replay persistence.
+- The store is unbounded in the current release.
+- Delete the room JSONL file to clear persisted history for that room.
+- Do not run multiple `amux` processes writing to the same replay-store directory.
 
 ## Docs
 
-- Protocol spec: [`docs/design/amux-namespace.md`](docs/design/amux-namespace.md)
-- Rooms / segments / transcripts: [`docs/design/rooms.md`](docs/design/rooms.md)
-- Build plan: [`ROADMAP.md`](ROADMAP.md)
+- Protocol extension spec: [`docs/design/amux-namespace.md`](docs/design/amux-namespace.md)
+- Rooms, segments, and transcript lineage: [`docs/design/rooms.md`](docs/design/rooms.md)
+- Client contract fixtures: [`docs/examples/client-contract`](docs/examples/client-contract)
+- Roadmap: [`ROADMAP.md`](ROADMAP.md)
 - Release notes: [`CHANGELOG.md`](CHANGELOG.md)
 
 ## License

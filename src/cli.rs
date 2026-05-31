@@ -54,7 +54,7 @@ pub struct Cli {
     pub unsafe_debug_client_tool_broadcast: bool,
 
     /// Emit `amux/segment_started` and `amux/segment_ended` lifecycle frames
-    /// on segment rotation (session/load, hermes compaction). Default on;
+    /// on segment rotation (`session/load` or observed ACP `sessionId` changes). Default on;
     /// pass `--emit-segment-frames=false` to keep wire output byte-equivalent
     /// with v0.1.x for clients that haven't picked up the new frame methods
     /// yet. Bare `--emit-segment-frames` is equivalent to `=true`.
@@ -66,16 +66,6 @@ pub struct Cli {
         default_missing_value = "true",
     )]
     pub emit_segment_frames: bool,
-
-    /// Opt-in: parse Hermes-specific compaction lifecycle lines on the
-    /// agent's stderr stream and emit `amux/context_compaction_started`
-    /// / `amux/context_compaction_done` plus a `hermes_compression`
-    /// segment rotation. Off by default so non-Hermes agents
-    /// (claude-agent-acp, etc.) can never trigger a false positive on
-    /// an unrelated log line. Stderr is captured and mirrored to the
-    /// mux terminal labeled `[AGENT ...]` regardless of this flag.
-    #[arg(long, default_value_t = false)]
-    pub hermes_compaction_signals: bool,
 
     /// Logging verbosity. Overridden by RUST_LOG when that variable is set.
     #[arg(long, value_enum, default_value_t = LogLevel::Info)]
@@ -316,18 +306,6 @@ mod tests {
     fn emit_segment_frames_rejects_non_bool() {
         let result = Cli::try_parse_from(["amux", "--emit-segment-frames=maybe"]);
         assert!(result.is_err(), "non-bool values must be rejected");
-    }
-
-    #[test]
-    fn hermes_compaction_signals_defaults_off() {
-        let cli = Cli::try_parse_from(["amux"]).unwrap();
-        assert!(!cli.hermes_compaction_signals);
-    }
-
-    #[test]
-    fn hermes_compaction_signals_can_be_enabled() {
-        let cli = Cli::try_parse_from(["amux", "--hermes-compaction-signals"]).unwrap();
-        assert!(cli.hermes_compaction_signals);
     }
 
     #[test]

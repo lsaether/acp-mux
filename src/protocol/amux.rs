@@ -29,15 +29,6 @@ const METHOD_REPLAY_STARTED: &str = "amux/replay_started";
 const METHOD_REPLAY_COMPLETE: &str = "amux/replay_complete";
 const METHOD_SEGMENT_STARTED: &str = "amux/segment_started";
 const METHOD_SEGMENT_ENDED: &str = "amux/segment_ended";
-const METHOD_CONTEXT_COMPACTION_STARTED: &str = "amux/context_compaction_started";
-const METHOD_CONTEXT_COMPACTION_DONE: &str = "amux/context_compaction_done";
-
-/// Source label for compaction signals that originated from the Hermes
-/// agent's stderr stream. Used in `amux/context_compaction_*` frames so
-/// clients can tell whether they're looking at a stderr-derived signal
-/// (best-effort, may be missing fields) or a future structured signal.
-pub const COMPACTION_SOURCE_HERMES_STDERR: &str = "hermes_stderr";
-
 /// Method name for the amux extension that lets any attached peer steer the
 /// current composer state. If a turn is in flight, current mux-owned semantics
 /// cancel/supersede the active turn and submit a replacement prompt after the
@@ -76,10 +67,9 @@ impl AmuxTurnId {
 }
 
 /// Monotonic, per-room segment counter. A segment is the interval during
-/// which a single canonical ACP `sessionId` is in force. Compaction inside
-/// the agent (hermes rotating its internal session id under a stable ACP
-/// id) ends one segment and opens the next; a client-initiated
-/// `session/load` does the same. The first segment of a room opens once
+/// which a single canonical ACP `sessionId` is in force. A client-initiated
+/// `session/load` or an observable upstream ACP `sessionId` change closes
+/// one segment and opens the next. The first segment of a room opens once
 /// the canonical session id is captured from the agent's `session/new` or
 /// `session/load` response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -101,59 +91,16 @@ impl serde::Serialize for SegmentId {
 }
 
 /// Why a segment closed. Captured on `amux/segment_ended` and exposed via
-/// `/debug/sessions` so operators can distinguish a client-driven session
-/// rotation from a hermes-driven compression rotation.
+/// `/debug/sessions` so operators can distinguish explicit client-driven
+/// loads from upstream session id changes observed in agent output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndReason {
     /// Client called `session/load`, swapping the canonical ACP session id.
     SessionLoad,
-    /// `_meta.hermes` reported a session-split compression — same ACP
-    /// session id, different internal hermes session id.
-    HermesCompression,
     /// Heuristic detection: an agent frame carried a different ACP
-    /// `sessionId` than the active segment's known value. Used when
-    /// `_meta.hermes` is unavailable.
+    /// `sessionId` than the active segment's known value.
     AcpSessionIdChanged,
-}
-
-/// Mirror of the (forthcoming) `_meta.hermes.sessionProvenance` +
-/// `_meta.hermes.compaction` payloads. Fields are populated opportunistic-
-/// ally: heuristic detection (Phase D) leaves most fields `None`; once
-/// hermes ships the metadata, parser fills them in. Late metadata for an
-/// already-open segment is allowed to backfill in place — see
-/// `RoomInner::maybe_rotate_segment` for the policy.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct HermesProvenance {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acp_session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hermes_session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_hermes_session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub root_hermes_session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub creator_kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub edge_kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compression_depth: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lineage_hermes_session_ids: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_reason: Option<String>,
-}
-
-impl HermesProvenance {
-    pub fn is_empty(&self) -> bool {
-        self == &HermesProvenance::default()
-    }
 }
 
 #[derive(Serialize)]
@@ -639,8 +586,6 @@ struct SegmentStartedParams<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     acp_session_id: Option<&'a str>,
     opened_at: &'a str,
-    #[serde(skip_serializing_if = "HermesProvenance::is_empty")]
-    provenance: &'a HermesProvenance,
 }
 
 #[derive(Serialize)]
@@ -659,7 +604,6 @@ pub fn segment_started(
     segment_id: SegmentId,
     acp_session_id: Option<&str>,
     opened_at: &str,
-    provenance: &HermesProvenance,
 ) -> Vec<u8> {
     encode(
         METHOD_SEGMENT_STARTED,
@@ -668,7 +612,6 @@ pub fn segment_started(
             segment_id,
             acp_session_id,
             opened_at,
-            provenance,
         },
     )
 }
@@ -688,97 +631,6 @@ pub fn segment_ended(
             closed_at,
             end_reason,
             successor_segment_id,
-        },
-    )
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ContextCompactionStartedParams<'a> {
-    room_id: &'a str,
-    source: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hermes_session_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    messages_before: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tokens_approx_before: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    focus: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ContextCompactionDoneParams<'a> {
-    room_id: &'a str,
-    source: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hermes_session_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    messages_before: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    messages_after: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tokens_approx_after: Option<u64>,
-    compression_count: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    successor_segment_id: Option<SegmentId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    previous_segment_id: Option<SegmentId>,
-}
-
-pub struct ContextCompactionStarted<'a> {
-    pub room_id: &'a str,
-    pub source: &'a str,
-    pub hermes_session_id: Option<&'a str>,
-    pub messages_before: Option<u64>,
-    pub tokens_approx_before: Option<u64>,
-    pub model: Option<&'a str>,
-    pub focus: Option<&'a str>,
-}
-
-pub struct ContextCompactionDone<'a> {
-    pub room_id: &'a str,
-    pub source: &'a str,
-    pub hermes_session_id: Option<&'a str>,
-    pub messages_before: Option<u64>,
-    pub messages_after: Option<u64>,
-    pub tokens_approx_after: Option<u64>,
-    pub compression_count: u64,
-    pub previous_segment_id: Option<SegmentId>,
-    pub successor_segment_id: Option<SegmentId>,
-}
-
-pub fn context_compaction_started(event: ContextCompactionStarted<'_>) -> Vec<u8> {
-    encode(
-        METHOD_CONTEXT_COMPACTION_STARTED,
-        ContextCompactionStartedParams {
-            room_id: event.room_id,
-            source: event.source,
-            hermes_session_id: event.hermes_session_id,
-            messages_before: event.messages_before,
-            tokens_approx_before: event.tokens_approx_before,
-            model: event.model,
-            focus: event.focus,
-        },
-    )
-}
-
-pub fn context_compaction_done(event: ContextCompactionDone<'_>) -> Vec<u8> {
-    encode(
-        METHOD_CONTEXT_COMPACTION_DONE,
-        ContextCompactionDoneParams {
-            room_id: event.room_id,
-            source: event.source,
-            hermes_session_id: event.hermes_session_id,
-            messages_before: event.messages_before,
-            messages_after: event.messages_after,
-            tokens_approx_after: event.tokens_approx_after,
-            compression_count: event.compression_count,
-            successor_segment_id: event.successor_segment_id,
-            previous_segment_id: event.previous_segment_id,
         },
     )
 }

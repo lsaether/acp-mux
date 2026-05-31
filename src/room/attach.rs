@@ -232,8 +232,6 @@ impl RoomInner {
                 .map(crate::room::state::segment_summary)
                 .collect(),
             active_segment_id: self.active_segment_id,
-            compression_count: self.compaction_count,
-            compaction: self.attach_compaction_summary(),
         }
     }
 
@@ -490,7 +488,7 @@ impl RoomInner {
     /// `amux/turn_started` / `amux/turn_complete` / `amux/turn_cancelled`
     /// bookend from a prior segment whose `amuxTurnId` brackets a frame
     /// in the active segment or matches the currently active turn —
-    /// otherwise hermes compaction mid-turn would leave clients staring
+    /// otherwise mid-turn segment rotation would leave clients staring
     /// at an unmatched `turn_complete` for a turn that started in the
     /// prior segment.
     pub(super) fn history_full(&self) -> Vec<HistoryEntry> {
@@ -507,7 +505,7 @@ impl RoomInner {
 
     /// Every segment's frames concatenated in `replaySeq` order. The
     /// `historyPolicy: full_lineage` view for clients that want to see
-    /// pre-compaction history.
+    /// pre-rotation history.
     pub(super) fn history_full_lineage(&self) -> Vec<HistoryEntry> {
         let Some(log) = self.replay_log.as_ref() else {
             return Vec::new();
@@ -519,7 +517,7 @@ impl RoomInner {
 
     /// Replay entries shaped by `historyPolicy`, used by the streaming
     /// delivery path so `stream + full` honours current-segment-only
-    /// semantics and never leaks pre-compaction lineage to clients that
+    /// semantics and never leaks pre-rotation lineage to clients that
     /// didn't opt in. Carries cross-segment turn bookends for the same
     /// reason `history_full` does.
     pub(crate) fn replay_entries_for_policy(&self, policy: HistoryPolicy) -> Vec<ReplayEntry> {
@@ -572,7 +570,7 @@ impl RoomInner {
     /// `amux/turn_complete`, `amux/turn_cancelled`) is observed in the
     /// pre-segment bootstrap or active segment, or if the turn is the
     /// currently active one (its `turn_started` may sit in a prior
-    /// segment when hermes compacted mid-turn).
+    /// segment when the room rotated mid-turn).
     fn cross_segment_turn_carry(&self) -> HashSet<String> {
         let Some(log) = self.replay_log.as_ref() else {
             return HashSet::new();

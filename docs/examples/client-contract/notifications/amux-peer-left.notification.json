@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "method": "amux/peer_left",
+  "params": {
+    "roomId": "work",
+    "peerId": "phone"
+  }
+}

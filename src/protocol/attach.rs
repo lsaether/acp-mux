@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::protocol::amux::{EndReason, HermesProvenance, SegmentId};
+use crate::protocol::amux::{EndReason, SegmentId};
 
 pub const METHOD_ATTACH: &str = "session/attach";
 pub const METHOD_DETACH: &str = "session/detach";
@@ -31,7 +31,7 @@ pub enum HistoryPolicy {
     #[default]
     Full,
     /// All segments' frames concatenated in `replaySeq` order.
-    /// Surfaces pre-compaction history that `Full` would hide.
+    /// Surfaces earlier segment history that `Full` would hide.
     FullLineage,
     PendingOnly,
     None,
@@ -151,25 +151,6 @@ pub struct AttachSnapshot {
     pub segments: Vec<SegmentSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_segment_id: Option<SegmentId>,
-    /// Mux-observed Hermes compactions for this room. Always present so
-    /// clients can tell `0` (no compaction yet) from a missing field.
-    pub compression_count: u64,
-    /// Most recent compaction lifecycle, if any compaction has been
-    /// observed. Omitted on a fresh room.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compaction: Option<AttachCompactionSummary>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AttachCompactionSummary {
-    pub active: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_started_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,8 +167,6 @@ pub struct SegmentSummary {
     pub closed_replay_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_reason: Option<EndReason>,
-    #[serde(skip_serializing_if = "HermesProvenance::is_empty")]
-    pub provenance: HermesProvenance,
 }
 
 #[derive(Debug, Clone, Serialize)]

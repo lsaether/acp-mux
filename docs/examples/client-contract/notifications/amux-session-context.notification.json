@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "method": "amux/session_context",
+  "params": {
+    "roomId": "work",
+    "cwd": "/home/you/project"
+  }
+}

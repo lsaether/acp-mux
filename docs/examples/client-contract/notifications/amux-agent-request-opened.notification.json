@@ -1,0 +1,24 @@
+{
+  "jsonrpc": "2.0",
+  "method": "amux/agent_request_opened",
+  "params": {
+    "roomId": "work",
+    "requestId": 99,
+    "requestMethod": "session/request_permission",
+    "requestParams": {
+      "sessionId": "sess-claude-1",
+      "toolCall": {
+        "toolCallId": "tc-1",
+        "title": "Edit file"
+      },
+      "options": [
+        {
+          "optionId": "allow",
+          "kind": "allow_once",
+          "name": "Allow once"
+        }
+      ]
+    },
+    "amuxTurnId": "at-1"
+  }
+}

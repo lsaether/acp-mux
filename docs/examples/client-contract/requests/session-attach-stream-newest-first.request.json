@@ -1,0 +1,15 @@
+{
+  "jsonrpc": "2.0",
+  "id": 11,
+  "method": "session/attach",
+  "params": {
+    "sessionId": "sess-claude-1",
+    "historyPolicy": "full_lineage",
+    "_meta": {
+      "amux": {
+        "replayOrder": "newest_turn_first",
+        "historyDelivery": "stream"
+      }
+    }
+  }
+}

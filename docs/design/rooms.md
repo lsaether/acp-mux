@@ -6,16 +6,17 @@ itself, and assumes familiarity with the per-session actor model.
 
 ## Why
 
-Today `acp-mux` exposes one mux session = one ACP session id = one
-subprocess. When hermes performs context compaction it internally
-rotates its `hermesSessionId` while keeping the wire-level ACP
-`sessionId` stable. From every client's perspective that rotation is
-invisible: there's no concept of "this conversation spans multiple agent
-session ids" and no replay primitive that carries history across the
-boundary.
+`acp-mux` exposes one mux room as one mirrored upstream ACP agent process.
+Multiple clients can attach to that room, see one continuous transcript,
+and take turns driving the same upstream conversation. ACP agents can also
+change the canonical `sessionId` over time — most explicitly through
+`session/load`, and in some implementations by emitting notifications with
+a different `params.sessionId` than the mux currently considers active.
 
-Rooms make the multiplexer the place that tracks the lineage and serves
-a continuous transcript across compaction.
+Rooms make the multiplexer the place that tracks those provider-neutral
+session-id segments and serves a continuous transcript across the
+boundaries. Provider-specific metadata is not part of the room state
+machine; it remains opaque payload data for clients that understand it.
 
 ## Vocabulary
 
@@ -26,9 +27,8 @@ a continuous transcript across compaction.
 - **Segment** — an interval during which exactly one canonical ACP
   `sessionId` is in force. The first segment opens when the agent's
   response to `session/new` or `session/load` captures the canonical id.
-  Subsequent segments open on `session/load` (client-initiated) or on
-  hermes compression (`_meta.hermes` rotation, or heuristic-detected
-  ACP `sessionId` change).
+  Subsequent segments open on `session/load` or when the mux observes a
+  different ACP `sessionId` in an agent notification.
 - **Transcript** — the room's append-only sequence of broadcast-tier
   frames plus segment lifecycle markers. Same in-memory storage as the
   v0.1 `replay_log` `VecDeque<ReplayEntry>`, with `segment_id` added to
@@ -44,24 +44,21 @@ a continuous transcript across compaction.
 3. Segment rotation emits exactly two frames in order: `amux/segment_ended`
    for the closing segment, then `amux/segment_started` for the opening
    one. The first segment of a room emits only `amux/segment_started`.
-4. Heuristic-detected and `_meta.hermes`-confirmed segments share one
-   data type. Provenance arriving late backfills `Segment.provenance` in
-   place — no extra frame, no rotation.
-5. Mid-turn rotation does not tear down the active turn. The rotation
+4. Mid-turn rotation does not tear down the active turn. The rotation
    frames interleave between agent chunks. `amux/turn_complete` fires
-   normally when the agent finishes. Clients render this as one turn
-   that crossed compaction.
-6. Frames recorded before any canonical session id arrives carry
-   `SegmentId(0)` (a sentinel). They surface in current-segment
-   replay alongside the active segment so the bootstrap context
-   (`amux/peer_joined` for early subscribers) is preserved.
+   normally when the agent finishes. Clients render this as one turn that
+   crossed a segment boundary.
+5. Frames recorded before any canonical session id arrives carry
+   `SegmentId(0)` (a sentinel). They surface in current-segment replay
+   alongside the active segment so the bootstrap context (`amux/peer_joined`
+   for early subscribers) is preserved.
 
 ## Wire shapes
 
 ### `amux/segment_started`
 
-Emitted once on initial open and once per rotation. The first segment
-of a room emits this alone (no `amux/segment_ended` precedes it).
+Emitted once on initial open and once per rotation. The first segment of a
+room emits this alone (no `amux/segment_ended` precedes it).
 
 ```jsonc
 {
@@ -71,23 +68,16 @@ of a room emits this alone (no `amux/segment_ended` precedes it).
     "roomId": "<room>",
     "segmentId": "seg-3",
     "acpSessionId": "<acp id or null>",
-    "openedAt": "2026-05-27T19:00:00.000000000Z",
-    "provenance": {
-      "hermesSessionId": "...",
-      "compressionDepth": 2,
-      "lastMode": "session_split",
-      "lastReason": "automatic_threshold"
-      // any subset of HermesProvenance; omitted when empty
-    }
+    "openedAt": "2026-05-27T19:00:00.000000000Z"
   }
 }
 ```
 
 ### `amux/segment_ended`
 
-Emitted as the closing bookend on rotation. Carries the closing
-segment id; `successorSegmentId` points at the opening one so clients
-can pair the bookends without state-tracking.
+Emitted as the closing bookend on rotation. Carries the closing segment id;
+`successorSegmentId` points at the opening one so clients can pair the
+bookends without state-tracking.
 
 ```jsonc
 {
@@ -97,7 +87,7 @@ can pair the bookends without state-tracking.
     "roomId": "<room>",
     "segmentId": "seg-2",
     "closedAt": "2026-05-27T19:00:00.000000000Z",
-    "endReason": "hermes_compression",
+    "endReason": "acp_session_id_changed",
     "successorSegmentId": "seg-3"
   }
 }
@@ -105,38 +95,26 @@ can pair the bookends without state-tracking.
 
 `endReason` values:
 
-- `session_load` — client called `session/load`, swapping the
-  canonical ACP session id.
-- `hermes_compression` — `_meta.hermes` reported a session-split
-  compression: same ACP id, different hermes id.
-- `acp_session_id_changed` — heuristic: the agent emitted a frame with
-  a different ACP `sessionId` than the active segment carries, and no
-  `_meta.hermes` was attached.
+- `session_load` — client called `session/load`, swapping the canonical ACP
+  session id.
+- `acp_session_id_changed` — the agent emitted a notification with a
+  different ACP `sessionId` than the active segment carries.
 
 Both bookend frames flow through the existing `broadcast()` path so they
 pick up the same `_meta.amux { recordedAt, replaySeq }` envelope every
 other frame uses. The transcript records `amux/segment_ended` while the
-closing segment is still active (it lands in the closing segment); the
-mux then rotates `active_segment_id` and broadcasts `amux/segment_started`
+closing segment is still active (it lands in the closing segment); the mux
+then rotates `active_segment_id` and broadcasts `amux/segment_started`
 (which lands in the opening segment). Late joiners replaying frames by
 `segment_id` can slice the transcript cleanly.
 
 ## Detection: `RoomInner::detect_segment_signal_from_agent_notification`
 
 Single bottleneck. Every agent notification is peeked for an observable
-`sessionId` and `_meta.hermes`. Rotation is warranted iff *any* of:
-
-1. Observed `acpSessionId != active.acp_session_id`.
-2. Observed `_meta.hermes.sessionProvenance.hermesSessionId !=
-   active.provenance.hermes_session_id` (both must be `Some`).
-3. Observed `_meta.hermes.compaction.lastMode == "session_split"` after
-   the active segment's provenance has not yet recorded a hermes id
-   (first-time compaction observation).
-
-Otherwise the metadata is merged into the active segment in place (no
-rotation, no frame). Rotation reason precedence: hermes signals →
-`HermesCompression`; bare ACP id change → `AcpSessionIdChanged`;
-explicit `session/load` handler → `SessionLoad`.
+`params.sessionId`. Rotation is warranted iff the observed `sessionId`
+differs from the active segment's canonical ACP id. Provider-specific
+metadata is not interpreted by the mux; it remains payload data for
+clients that understand it.
 
 ## `historyPolicy`
 
@@ -145,26 +123,26 @@ explicit `session/load` handler → `SessionLoad`.
 - `full` (default) — frames from the active segment only, plus any
   pre-segment bootstrap frames tagged with `SegmentId(0)`, plus any
   `amux/turn_started` / `amux/turn_complete` / `amux/turn_cancelled`
-  bookend from a prior segment whose `amuxTurnId` brackets at least
-  one frame in the active segment or matches the currently active
-  turn. The lifecycle-frame carry exists so a hermes-compaction
-  rotation that splits a turn across segments doesn't leave clients
-  staring at an unmatched `turn_complete`. Agent chunks from prior
-  segments are still excluded — those belong to `full_lineage`.
+  bookend from a prior segment whose `amuxTurnId` brackets at least one
+  frame in the active segment or matches the currently active turn. The
+  lifecycle-frame carry exists so a mid-turn segment rotation doesn't
+  leave clients staring at an unmatched `turn_complete`. Agent chunks
+  from prior segments are still excluded — those belong to
+  `full_lineage`.
 - `full_lineage` — every frame across every segment, in `replaySeq`
-  order. The view a TUI wants when rendering history that strings
-  along compaction.
+  order. The view a TUI wants when rendering history across session-id
+  rotations.
 - `pending_only`, `none`, `after_message` — unchanged from v0.1.
 
 `replayOrder: newest_turn_first` interacts with `full_lineage` by
 reversing turn order across all segments while preserving chronology
-*within* each turn. Segment order is not reversed independently —
-that would interleave pre- and post-compaction content confusingly.
+*within* each turn. Segment order is not reversed independently — that
+would interleave old and new session content confusingly.
 
 ## Snapshot
 
-`session/attach` result includes a lineage summary so even
-`full`-mode clients can see that earlier segments exist:
+`session/attach` result includes a lineage summary so even `full`-mode
+clients can see that earlier segments exist:
 
 ```jsonc
 "result": {
@@ -176,8 +154,7 @@ that would interleave pre- and post-compaction content confusingly.
         "activeSegmentId": "seg-3",
         "segments": [
           { "id": "seg-1", "acpSessionId": "...", "openedAt": "...",
-            "closedAt": "...", "endReason": "hermes_compression",
-            "provenance": { "compressionDepth": 0, ... } },
+            "closedAt": "...", "endReason": "session_load" },
           { "id": "seg-2", ... },
           { "id": "seg-3", ... }
         ]
@@ -189,9 +166,9 @@ that would interleave pre- and post-compaction content confusingly.
 
 ## Mid-turn rotation
 
-The active turn is keyed by `active_turn_mux_id` and `amuxTurnId`,
-neither of which is tied to a segment. When `detect_segment_signal_*`
-fires mid-turn the rotation frames interleave between agent chunks and
+The active turn is keyed by `active_turn_mux_id` and `amuxTurnId`, neither
+of which is tied to a segment. When `detect_segment_signal_*` fires
+mid-turn the rotation frames interleave between agent chunks and
 `amux/turn_complete` fires normally on the agent's natural settlement.
 Transcript ordering inside that turn is:
 
@@ -204,27 +181,38 @@ agent chunks (new segment)
 amux/turn_complete (new segment)
 ```
 
-Clients render this as one turn that crossed compaction. The `Turn`
+Clients render this as one turn that crossed a segment. The `Turn`
 correlator on the client side does not need to special-case it.
 
 ## Queued prompts across segments
 
 On any rotation where the canonical ACP id observably moves, queued
-prompts are retargeted to the new ACP id. When only `hermesSessionId`
-rotates (ACP id stable), no rewrite is needed — the queued prompts
-already point at the right ACP head.
+prompts are retargeted to the new ACP id.
 
-## Persistence (deferred)
+## Persistence
 
-Out of scope for v0.2. The natural seam is
-`RoomInner::{ replay_log, segments }`: a SQLite layer keyed on
-`(room_id, segment_id, replay_seq)` would persist transcripts across
-mux restarts without changing the in-memory shape. Tracked for v0.3+.
+The room transcript is in-memory by default. With `--replay-store <DIR>`,
+broadcast-tier frames are also appended to one JSONL file per room. On
+restart, the mux rehydrates replay frames and segment bookends so late
+joiners can recover visible room history.
+
+Persistence still has a narrow scope:
+
+- It persists mux broadcast history, not the upstream agent's internal
+  conversation state.
+- It does not persist in-flight agent requests or unresolved permissions.
+- It depends on segment bookends for canonical session-id restoration; keep
+  `--emit-segment-frames=true` if restart replay should preserve lineage.
+- The current store is append-only and unbounded. Bounded eviction remains a
+  follow-up.
+
+The natural future seam is a SQLite layer keyed on
+`(room_id, segment_id, replay_seq)` if JSONL stops being enough.
 
 ## Feature flag
 
 `--emit-segment-frames` (default `true`) gates emission of
 `amux/segment_started` and `amux/segment_ended`. The internal state
 machine rotates regardless; the flag exists only to preserve
-byte-equivalence with v0.1.x for clients that haven't picked up the
-new frame methods yet.
+byte-equivalence with v0.1.x for clients that haven't picked up the new
+frame methods yet.

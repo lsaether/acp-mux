@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "method": "amux/session_busy",
+  "params": {
+    "roomId": "work",
+    "busy": true,
+    "heldBy": "desktop"
+  }
+}

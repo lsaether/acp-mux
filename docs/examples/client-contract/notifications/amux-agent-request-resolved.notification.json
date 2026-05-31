@@ -1,0 +1,15 @@
+{
+  "jsonrpc": "2.0",
+  "method": "amux/agent_request_resolved",
+  "params": {
+    "roomId": "work",
+    "requestId": 99,
+    "resolvedBy": "phone",
+    "result": {
+      "outcome": {
+        "outcome": "selected",
+        "optionId": "allow"
+      }
+    }
+  }
+}

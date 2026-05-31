@@ -1,0 +1,62 @@
+{
+  "jsonrpc": "2.0",
+  "id": 10,
+  "result": {
+    "sessionId": "sess-claude-1",
+    "clientId": "phone",
+    "historyPolicy": "full_lineage",
+    "history": [
+      {
+        "method": "amux/turn_started",
+        "params": {
+          "roomId": "work",
+          "amuxTurnId": "at-1",
+          "peerId": "desktop",
+          "content": [
+            {
+              "type": "text",
+              "text": "Summarize this repository in three bullets."
+            }
+          ]
+        }
+      },
+      {
+        "method": "amux/turn_complete",
+        "params": {
+          "roomId": "work",
+          "amuxTurnId": "at-1",
+          "stopReason": "end_turn"
+        }
+      }
+    ],
+    "_meta": {
+      "amux": {
+        "connectedClients": [
+          {
+            "peerId": "desktop",
+            "peerName": "Desktop",
+            "role": "primary"
+          },
+          {
+            "peerId": "phone",
+            "peerName": "Phone",
+            "role": "mobile"
+          }
+        ],
+        "appliedReplayOrder": "chronological",
+        "appliedHistoryDelivery": "response",
+        "snapshot": {
+          "roomId": "work",
+          "activeSegmentId": "seg-1",
+          "segments": [
+            {
+              "id": "seg-1",
+              "acpSessionId": "sess-claude-1",
+              "openedAt": "2026-05-31T12:00:00Z"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

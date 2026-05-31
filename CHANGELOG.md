@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Added
+
+- **Optional persistent replay store.** `--replay-store <DIR>` persists
+  broadcast-tier room history as append-only JSONL and rehydrates replay
+  frames/segment bookends on restart. The upstream agent still owns actual
+  conversation state.
+- **Client contract fixtures.** `docs/examples/client-contract/` contains
+  copyable request/response/notification JSON fixtures for `session/attach`,
+  turn lifecycle, queue lifecycle, agent-request lifecycle, replay markers,
+  and segment lineage.
+
+### Changed
+
+- **Provider-neutral core contract.** The mainline mux is now documented and
+  implemented as a generic ACP multiplexer / agent mirror rather than a
+  provider-specific adapter. Provider metadata is passed through opaquely;
+  mux-owned lifecycle state is driven only by JSON-RPC envelopes, ACP method
+  names, `session/load`, and observable ACP `params.sessionId` changes.
+- **Docs reframed around rooms, mirrors, and generic ACP clients.** README,
+  roadmap, and design docs now describe `acp-mux` as a reusable ACP room
+  server with provider-neutral safety defaults and an explicit `amux/*`
+  side channel.
+
+### Removed
+
+- Removed provider-specific stderr parsing, provider-specific CLI toggles,
+  provider-named types/end reasons, and provider-only lifecycle frames from
+  the core path.
+
 ## v0.1.3 — 2026-05-27
 
 ### Breaking
@@ -31,11 +60,9 @@
 
 - **Rooms-as-transcripts abstraction.** A room now owns one or more
   segments, each pinned to a single canonical ACP `sessionId`. Rotation
-  is detected from (a) `session/load` responses, (b)
-  `_meta.hermes.sessionProvenance.hermesSessionId` changes (compaction
-  under a stable ACP id), and (c) bare ACP `sessionId` changes in agent
-  notifications (heuristic fallback). See `docs/design/rooms.md` for
-  the full model and invariants. Closes [#56](https://github.com/lsaether/acp-mux/issues/56) via [#58](https://github.com/lsaether/acp-mux/pull/58).
+  is detected from `session/load` responses and observable ACP
+  `sessionId` changes in agent notifications. See `docs/design/rooms.md`
+  for the full model and invariants. Closes [#56](https://github.com/lsaether/acp-mux/issues/56) via [#58](https://github.com/lsaether/acp-mux/pull/58).
 - **Segment lifecycle frames.** `amux/segment_started` and
   `amux/segment_ended` mark rotation boundaries in both live broadcast
   and the replay log. Both flow through the standard `broadcast()` path
@@ -47,10 +74,6 @@
   history (with pre-segment bootstrap frames included), plus any
   `amux/turn_*` lifecycle bookend from a prior segment whose
   `amuxTurnId` brackets the active segment.
-- **`_meta.hermes` recognition.** Provenance fields
-  (`sessionProvenance`, `compaction`) are parsed from agent
-  notifications and stored on the segment they describe. Late-arriving
-  provenance backfills the active segment in place without rotation.
 - **`snapshot.segments`.** `session/attach` results expose lineage at
   `result._meta.amux.snapshot.segments` (with `activeSegmentId`) so
   even `historyPolicy: full` clients can see that earlier segments
@@ -94,8 +117,8 @@
 ### Fixed
 
 - **Cross-segment turn bookends in `historyPolicy: full`.** When a turn
-  straddled a segment boundary (hermes compaction mid-turn, or
-  `session/load` with an in-flight turn that completes after the load
+  straddled a segment boundary (an observable ACP session id change
+  mid-turn, or `session/load` with an in-flight turn that completes after the load
   response), the default `historyPolicy: full` left late joiners with
   an unmatched `amux/turn_complete` because the matching
   `amux/turn_started` lived in the prior segment and was filtered out
@@ -114,16 +137,15 @@
   diagnostics only. `clientCapabilities.fs` / `.terminal` are stripped
   from forwarded `initialize` requests. Fixes [#2](https://github.com/lsaether/acp-mux/issues/2) via [#36](https://github.com/lsaether/acp-mux/pull/36).
 - **AMUX active-turn steer/queue controls.** `amux/steer_active_turn` and `amux/queue_prompt` are now the canonical control surface. Ordinary concurrent `session/prompt` requests—including text that starts with `/steer ...` or `/queue ...`—remain serialized and receive `-32001`. `amux/steer_active_turn` now performs mux-owned hard steer while a turn is active: it broadcasts `amux/control_submitted` and `amux/turn_cancelled`, sends ACP-native `session/cancel`, then starts a replacement turn with prompt-injected superseded-turn context. When idle, the same steer request submits immediately as the next prompt with `mode: "prompt"` and no cancellation or queue lifecycle. A second active hard steer is rejected while the first replacement is still pending. `amux/queue_prompt` now stores mux-owned queue/send state, caps pending public queue items at six (`-32003 "queue full"`), broadcasts/replays `amux/queue_item_*` lifecycle, submits immediately when idle, and submits queued prompts as real follow-up turns after active-turn settlement. Pending queue items survive owner disconnects without creating ghost drivers, emit orphan notifications, and can be removed with `amux/unqueue_prompt`. Fixes [#39](https://github.com/lsaether/acp-mux/issues/39) via [#41](https://github.com/lsaether/acp-mux/pull/41); future native/soft steer is tracked separately in [#42](https://github.com/lsaether/acp-mux/issues/42).
-- **Active-turn cancellation for Hermes-backed sessions.** `amux/cancel_active_turn` now forwards ACP-native `session/cancel { sessionId }` for the active prompt while preserving the immediate `amux/turn_cancelled` intent broadcast and later `amux/turn_complete` settlement event. Fixes [#29](https://github.com/lsaether/acp-mux/issues/29) via [#30](https://github.com/lsaether/acp-mux/pull/30).
+- **Active-turn cancellation for active prompts.** `amux/cancel_active_turn` now forwards ACP-native `session/cancel { sessionId }` for the active prompt while preserving the immediate `amux/turn_cancelled` intent broadcast and later `amux/turn_complete` settlement event. Fixes [#29](https://github.com/lsaether/acp-mux/issues/29) via [#30](https://github.com/lsaether/acp-mux/pull/30).
 - **Control-plane agent timeout.** Raised the transient `session/list`
-  agent-spawn timeout from 2s to 8s to accommodate Hermes/MCP startup
+  agent-spawn timeout from 2s to 8s to accommodate slower agent startup
   budgets. [#34](https://github.com/lsaether/acp-mux/pull/34).
 
 ### Notes
 
 - Persistence (rooms surviving mux restart) is tracked in [#26](https://github.com/lsaether/acp-mux/issues/26); the natural seam is `RoomInner::{ replay_log, segments }` and is left explicit in the source for that follow-up.
 - The deprecated `?session=` alias is one-release-only; remove in v0.1.4.
-- Hermes remains the primary fully supported agent target.
 
 ## v0.1.2 — 2026-05-23
 
@@ -142,7 +164,7 @@
 
 - `--meta-propagate` is still opt-in; default subscriber → agent request payloads remain unchanged.
 - `session/list` decoration is additive and scoped to `_meta.amux`; existing agent-owned `_meta` keys are preserved.
-- Open follow-ups after this release: [#2](https://github.com/lsaether/acp-mux/issues/2) remains the high-priority non-Hermes fs/terminal delegation bug, [#7](https://github.com/lsaether/acp-mux/issues/7) remains upstream RFD tracking, and [PR #3](https://github.com/lsaether/acp-mux/pull/3) remains a conflicting/shelved RFD #533 alignment branch.
+- Open follow-ups after this release: [#2](https://github.com/lsaether/acp-mux/issues/2) remains the high-priority delegated fs/terminal client-tool support bug, [#7](https://github.com/lsaether/acp-mux/issues/7) remains upstream RFD tracking, and [PR #3](https://github.com/lsaether/acp-mux/pull/3) remains a conflicting/shelved RFD #533 alignment branch.
 
 ## v0.1.1 — 2026-05-22
 
@@ -160,7 +182,7 @@
 
 - **Agent-initiated requests broadcast.** `session/request_permission` (and any other agent → subscriber request) fans out to every attached subscriber instead of being delivered only to the driving subscriber. Any peer can reply; the first reply for a given id is forwarded to the agent and later replies are dropped so the agent still sees exactly one response per id. The "driving subscriber" concept remains for UI attribution (`amux/turn_started`, `/debug/sessions`) but no longer gates who can answer the agent.
 - **New `amux/agent_request_resolved` notification.** When the first-reply-wins gate flips a tracked agent-initiated request to consumed, the mux broadcasts `{ sessionId, requestId, resolvedBy, result | error }` to every attached subscriber. Peers that lost the race (or never replied) use this to dismiss the request from their UI; the responder's own UI ignores it (the entry is already gone locally). For `session/request_permission` the `result` body is derived entirely from option metadata already present in the broadcast request, so no new information leaks.
-- **Turn-end cleanup for abandoned agent-initiated requests.** When `session/prompt` completes with `agent_pending` entries still `InFlight` (e.g. hermes' internal 60s permission deadline fired without a response frame), the mux now sweeps those entries to `Consumed` and broadcasts one `amux/agent_request_resolved { resolvedBy: "mux:turn-ended" }` per stale id immediately before `amux/turn_complete`; cleanup frames omit `result` and `error` because no peer reply exists. This unblocks TUI clients that would otherwise show a permission prompt the agent has already given up on. No competing wire-level timeout is added on the mux side — it only emits cleanup after the agent has signaled the turn is done.
+- **Turn-end cleanup for abandoned agent-initiated requests.** When `session/prompt` completes with `agent_pending` entries still `InFlight` (for example, an agent-side permission deadline fired without a response frame), the mux now sweeps those entries to `Consumed` and broadcasts one `amux/agent_request_resolved { resolvedBy: "mux:turn-ended" }` per stale id immediately before `amux/turn_complete`; cleanup frames omit `result` and `error` because no peer reply exists. This unblocks TUI clients that would otherwise show a permission prompt the agent has already given up on. No competing wire-level timeout is added on the mux side — it only emits cleanup after the agent has signaled the turn is done.
 - **`mock_acp` permission emission updated to ACP spec shape.** `MOCK_ACP_EMIT_PERMISSION=1` now emits the canonical `session/request_permission` (was: an ad-hoc `permission/request`) with the proper `params.toolCall` and `params.options[{optionId, kind, name}]`. Reply shape: `result.outcome = {outcome: "selected", optionId} | {outcome: "cancelled"}`.
 - **Crate split into lib + bin.** The crate is now `amux` (lib) consumed by the `amux` binary. Integration tests live under `tests/server.rs` and link the lib directly; pure-unit tests for private helpers (`strip_trailing_newline`, `validate`, `is_valid_session_id`) stay inline in `src/server.rs`. Fixes CI (`cargo test` now builds `mock_acp` automatically as a test dep via `CARGO_BIN_EXE_mock_acp`, no special workflow step). Lib name matches the bin name so `RUST_LOG=amux=trace` covers everything from a single filter.
 
@@ -176,7 +198,7 @@
 ### Notes
 
 - Cancellation is optional per the RFD. amux forwards cancellations honestly; if the agent doesn't honor them and finishes normally, subscribers see the regular response.
-- Hermes 0.14.0 advertises `agentCapabilities.loadSession = true` and `sessionCapabilities.list = {}`, so both the load-rebinding fix and `session/list` passthrough are exercised end-to-end against the canonical agent.
+- The mock ACP harness exercises load-session rebinding and `session/list` passthrough in CI.
 - Cold-start session discovery (listing the agent's persisted sessions *before* WS-attaching) is not supported in this release — amux's WS contract requires a session id on every connection. Tracked as [#10](https://github.com/lsaether/acp-mux/issues/10).
 
 ## v0.1.0
@@ -223,7 +245,7 @@ Spec: [`docs/design/amux-namespace.md`](docs/design/amux-namespace.md).
 ### Testing
 
 - 53 tests, including end-to-end integration against `mock_acp` (a small Rust binary speaking NDJSON ACP over stdin/stdout) and against `cat` for byte-relay tests.
-- Manual verification against real `hermes acp` (hermes-agent 0.14.0): `initialize` cache proven against three sequential requests.
+- Manual verification against a stdio ACP agent: `initialize` cache proven against three sequential requests.
 - `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings` clean in CI.
 
 ### Deferred to v0.2 / future

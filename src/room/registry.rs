@@ -138,7 +138,6 @@ pub struct RoomRegistry {
     meta_propagate: bool,
     client_tool_policy: ClientToolPolicy,
     emit_segment_frames: bool,
-    hermes_compaction_signals: bool,
     replay_store: Option<Arc<ReplayStore>>,
     session_list_index: Arc<SessionListMetadataIndex>,
     sessions: Mutex<HashMap<String, RoomHandle>>,
@@ -226,7 +225,6 @@ impl RoomRegistry {
             meta_propagate,
             client_tool_policy,
             emit_segment_frames,
-            false,
             replay_store,
         )
     }
@@ -239,7 +237,6 @@ impl RoomRegistry {
         meta_propagate: bool,
         client_tool_policy: ClientToolPolicy,
         emit_segment_frames: bool,
-        hermes_compaction_signals: bool,
         replay_store: Option<Arc<ReplayStore>>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -249,7 +246,6 @@ impl RoomRegistry {
             meta_propagate,
             client_tool_policy,
             emit_segment_frames,
-            hermes_compaction_signals,
             replay_store,
             session_list_index: Arc::new(SessionListMetadataIndex::new()),
             sessions: Mutex::new(HashMap::new()),
@@ -375,7 +371,6 @@ impl RoomRegistry {
                 session_list_index: self.session_list_index.clone(),
                 agent_cwd,
                 emit_segment_frames: self.emit_segment_frames,
-                hermes_compaction_signals: self.hermes_compaction_signals,
                 replay_store: self.replay_store.clone(),
             },
         );
@@ -470,7 +465,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn control_plane_agent_timeout_allows_slow_hermes_mcp_startup() {
+    fn control_plane_agent_timeout_allows_slow_agent_startup() {
         assert!(CONTROL_PLANE_AGENT_TIMEOUT >= Duration::from_secs(8));
     }
 }
