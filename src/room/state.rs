@@ -157,6 +157,11 @@ const NO_ACTIVE_TURN_ERROR_CODE: i64 = -32002;
 /// clients can render "queue full" rather than generic turn serialization.
 const QUEUE_FULL_ERROR_CODE: i64 = -32003;
 
+/// JSON-RPC error code returned when a mux-owned queue item no longer
+/// exists. Kept distinct from invalid params so clients can distinguish
+/// malformed input from a remove/submit race.
+const QUEUE_ITEM_NOT_FOUND_ERROR_CODE: i64 = -32004;
+
 /// Standard JSON-RPC invalid params code used when an amux control request
 /// is missing its text/session payload.
 const INVALID_PARAMS_ERROR_CODE: i64 = -32602;
@@ -2033,7 +2038,7 @@ impl RoomInner {
             self.send_error_response(
                 peer_id,
                 req.id,
-                INVALID_PARAMS_ERROR_CODE,
+                QUEUE_ITEM_NOT_FOUND_ERROR_CODE,
                 "queue item not found",
             );
             return None;

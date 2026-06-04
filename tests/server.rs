@@ -2817,6 +2817,30 @@ async fn amux_unqueue_prompt_removes_pending_item_and_replays_removal() {
 }
 
 #[tokio::test]
+async fn amux_unqueue_prompt_missing_item_uses_queue_not_found_error() {
+    let (addr, _) = spawn_server_with_mock_env(&[]).await;
+    let url = format!("ws://{addr}/acp?room=busy-fixes&peer_id=A");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+
+    let response = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":300,"method":"amux/unqueue_prompt","params":{"queueItemId":"q-missing"}}"#,
+    )
+    .await;
+
+    assert_eq!(response["id"], serde_json::json!(300));
+    assert_eq!(response["error"]["code"], serde_json::json!(-32004));
+    assert_eq!(
+        response["error"]["message"],
+        serde_json::json!("queue item not found")
+    );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+#[tokio::test]
 async fn amux_disconnected_queue_owner_persists_without_becoming_driver() {
     let (addr, _) = spawn_server_with_mock_env(&[("MOCK_ACP_PROMPT_DELAY_MS", "500")]).await;
     let url_a = format!("ws://{addr}/acp?room=busy-fixes&peer_id=A");
