@@ -1,6 +1,6 @@
 # acp-mux roadmap
 
-`acp-mux` is a generic ACP multiplexer / agent mirror: one upstream stdio ACP agent process, many WebSocket clients, one shared room transcript.
+`acp-mux` is a generic ACP multiplexer / agent mirror: one upstream stdio ACP agent process, many WebSocket clients, one shared room transcript. The generic mux core stays small and provider-neutral; the AMUX layer adds optional multiplayer room/control events on top.
 
 This file tracks where the project is going. Protocol details live in [`docs/design/amux-namespace.md`](docs/design/amux-namespace.md) and room/segment semantics live in [`docs/design/rooms.md`](docs/design/rooms.md).
 
@@ -11,12 +11,15 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 - **Provider-neutral core.** Any stdio ACP agent can sit behind the mux. Provider metadata passes through; provider-private logs/metadata do not drive mux state.
 - **One job.** Mirror an ACP agent session into a collaborative, reconnectable room.
 - **Envelope-first routing.** Parse JSON-RPC envelopes and method names; keep ACP payloads as opaque `serde_json::Value` unless the method is mux-owned.
-- **Separate channels.** Agent-owned frames stay in ACP namespaces. Mux-owned collaboration/control facts stay in `amux/*`.
+- **Layer boundary.** Core mux behavior is routing, replay, lifecycle, and safe defaults. AMUX behavior is presence, turn bookends, queue/steer/cancel controls, permission UX, and projection events.
+- **Separate channels.** Agent-owned frames stay in ACP namespaces. AMUX collaboration/control facts stay in `amux/*`.
 - **Fail closed on side effects.** Delegated `fs/*` and `terminal/*` client tools are blocked unless an unsafe debug flag explicitly restores raw fanout.
 - **No upstream protocol changes.** `acp-mux` is a consumer/proxy of ACP, not a fork of ACP or a patched agent runtime.
 - **Single static binary.** Runtime dependencies should remain limited to the configured agent subprocess.
 
 ## Current shipped shape
+
+### Generic ACP mux core
 
 - [x] One agent subprocess per `?room=`.
 - [x] Multiple subscribers per room.
@@ -24,24 +27,27 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 - [x] Broadcast fanout for agent notifications.
 - [x] `initialize` and `session/new` caching for late joiners.
 - [x] Turn serialization for ordinary `session/prompt`.
+- [x] Proxy-local `session/attach` / `session/detach` foundation.
+- [x] Attach history policies: `full`, `full_lineage`, `none`, `pending_only`, provisional `after_message`.
+- [x] Attach replay ordering: `chronological`, `newest_turn_first`.
+- [x] Safe default blocking for delegated `fs/*` and `terminal/*` client-tool requests.
+- [x] Cold-start `GET /acp/sessions` control-plane query.
+- [x] `GET /debug/sessions` live room snapshot.
+- [x] Optional append-only JSONL replay store with `--replay-store`.
+- [x] Provider-neutral room/session-id tracking: room id is stable, ACP `sessionId` can rotate inside it.
+- [x] Provider-neutral extraction: no provider-specific stderr parser, metadata interpreter, or lifecycle reason in the core path.
+
+### AMUX collaboration layer
+
 - [x] `amux/*` room/control namespace.
 - [x] Active-turn cancellation via `amux/cancel_active_turn` → ACP `session/cancel`.
 - [x] Hard steer via `amux/steer_active_turn`.
 - [x] Prompt queue via `amux/queue_prompt` / `amux/unqueue_prompt`.
 - [x] First-writer-wins fanout for `session/request_permission`.
 - [x] Replay-safe agent request lifecycle via `amux/agent_request_opened` / `amux/agent_request_resolved`.
-- [x] Proxy-local `session/attach` / `session/detach` foundation.
-- [x] Attach history policies: `full`, `full_lineage`, `none`, `pending_only`, provisional `after_message`.
-- [x] Attach replay ordering: `chronological`, `newest_turn_first`.
 - [x] Optional streamed attach history via `amux/replay_started` / `amux/replay_complete`.
-- [x] Rooms/segments: room id is stable, ACP `sessionId` can rotate inside it.
-- [x] Segment lifecycle frames: `amux/segment_started`, `amux/segment_ended`.
-- [x] Safe default blocking for delegated `fs/*` and `terminal/*` client-tool requests.
-- [x] Cold-start `GET /acp/sessions` control-plane query.
-- [x] `GET /debug/sessions` live room snapshot.
-- [x] Optional append-only JSONL replay store with `--replay-store`.
-- [x] Provider-neutral extraction: no provider-specific stderr parser, metadata interpreter, or lifecycle reason in the core path.
-- [x] Client contract fixtures under `docs/examples/client-contract/`.
+- [x] Segment projection frames: `amux/segment_started`, `amux/segment_ended`.
+- [x] Client contract fixtures under `docs/examples/client-contract/` distinguish raw ACP passthrough from AMUX extension frames.
 
 ## Near-term polish
 

@@ -2,7 +2,9 @@
 
 **Status:** v0.2 design surface.
 
-`acp-mux` mirrors one upstream ACP agent into a multi-client room. The upstream agent owns ACP frames. The mux owns collaboration facts. Those mux-owned facts live under the `amux/*` namespace so clients can tell the two channels apart.
+This document describes the optional AMUX collaboration layer. It is not the generic ACP mux contract: raw ACP passthrough, id translation, subprocess routing, safe client-tool defaults, and basic replay belong to the core mux even when a client ignores every `amux/*` frame.
+
+`acp-mux` mirrors one upstream ACP agent into a multi-client room. The upstream agent owns ACP frames. The AMUX layer owns collaboration facts. Those AMUX-owned facts live under the `amux/*` namespace so clients can tell the two channels apart.
 
 ```text
 session/*, fs/*, terminal/*, ...  agent-owned ACP frames
@@ -11,7 +13,7 @@ amux/*                           mux-owned room / replay / control frames
 
 ## Boundary
 
-The mux is intentionally provider-neutral:
+The generic mux core is intentionally provider-neutral:
 
 - parse JSON-RPC envelopes: `id`, `method`, `params`, `result`, `error`;
 - key mux policy from method names and mux-owned control payloads;
@@ -20,7 +22,9 @@ The mux is intentionally provider-neutral:
 - do not interpret provider-private metadata to drive room lifecycle;
 - rotate room segments only on provider-neutral signals: `session/load` or an observable ACP `params.sessionId` change.
 
-The mux MUST NOT fabricate agent-owned `session/*` notifications. If a frame says `method: "session/update"`, it came from the agent. If the mux needs to say something about peers, turns, replay, queueing, or segment lineage, it emits an `amux/*` frame.
+The mux MUST NOT fabricate agent-owned `session/*` notifications. If a frame says `method: "session/update"`, it came from the agent. If the AMUX layer needs to say something about peers, turns, replay, queueing, or segment lineage, it emits an `amux/*` frame.
+
+Clients that only need the generic mux can treat `amux/*` as extension metadata or request no history/replay where appropriate. Clients that need multiplayer UX should consume this namespace deliberately instead of inferring room state from provider-private payloads.
 
 Proxy-local methods such as `session/attach` and `session/detach` are the exception: clients address those requests to the mux, and the mux answers them. They are not forwarded to the wrapped agent and are not pretending to be agent notifications.
 
