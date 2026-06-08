@@ -15,7 +15,9 @@ ACP client(s) ── WebSocket JSON-RPC ──► amux ── stdio ACP JSON-RPC
 
 `acp-mux` has one job: **mirror one upstream ACP agent session into a collaborative, reconnectable room.**
 
-It owns:
+The project keeps a hard boundary between the generic ACP mux core and the optional AMUX collaboration layer.
+
+The **core mux** owns:
 
 - one agent subprocess per room;
 - WebSocket attach/detach for multiple subscribers;
@@ -23,10 +25,15 @@ It owns:
 - broadcast fanout for agent notifications;
 - initialize / `session/new` response caching for late joiners;
 - replay history and optional persistent replay storage;
-- turn serialization, queueing, steering, and active-turn cancellation;
-- first-writer-wins coordination for agent-initiated permission requests;
-- room/segment lineage when the canonical ACP `sessionId` changes;
+- provider-neutral room/session-id tracking needed for reconnect and replay;
 - safe defaults for delegated client tools such as `fs/*` and `terminal/*`.
+
+The **AMUX layer** owns multiplayer conveniences layered on top of the mux:
+
+- turn bookends and busy-state visibility;
+- queue, steer, and active-turn cancellation controls;
+- first-writer-wins coordination for agent-initiated permission requests;
+- replay-safe room, queue, request, and segment projection frames under `amux/*`.
 
 It does **not** own:
 
@@ -136,7 +143,7 @@ The transcript continues across segments. Clients that want only the current hea
 
 ## `amux/*` extension namespace
 
-`acp-mux` keeps ACP frames and mux facts separate. Agent-owned ACP frames stay in the ACP namespace; mux-owned collaboration/control events use `amux/*`.
+`amux/*` is the optional AMUX collaboration layer, not the generic ACP mux contract. `acp-mux` keeps ACP frames and mux facts separate: agent-owned ACP frames stay in the ACP namespace; mux-owned collaboration/control events use `amux/*`.
 
 Common notifications:
 
