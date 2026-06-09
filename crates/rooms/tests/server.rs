@@ -5217,3 +5217,105 @@ async fn replay_store_session_load_segmentation_excludes_stale_frames() {
     let _ = ws_b.send(ClientMsg::Close(None)).await;
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `rooms/cancel_active_turn` sent as a JSON-RPC *request* (the documented
+/// shape — it carries an `id`) is answered by the mux with a result ack and is
+/// NOT forwarded to the agent. Regression guard for the doc/impl mismatch where
+/// only the notification shape was handled.
+#[tokio::test]
+async fn rooms_cancel_active_turn_request_shape_is_answered_by_mux() {
+    let (addr, _) = spawn_server_with_mock_env(&[
+        ("MOCK_ACP_ECHO_SESSION_CANCELS", "1"),
+        ("MOCK_ACP_PROMPT_DELAY_MS", "1500"),
+    ])
+    .await;
+    let url = format!("ws://{addr}/acp?room=creq&peer_id=A");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    // Open a turn; do not await its response (the mock holds it for 1500ms).
+    ws.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":99,"method":"session/prompt","params":{"sessionId":"sess-mock"}}"#
+            .into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Cancel via the DOCUMENTED request shape (has an id).
+    ws.send(ClientMsg::Text(
+        r#"{"jsonrpc":"2.0","id":21,"method":"rooms/cancel_active_turn","params":{"reason":"stop"}}"#
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let frames = drain_for(&mut ws, Duration::from_secs(3)).await;
+
+    // The mux answered the request: a result for id 21 (only the mux produces this).
+    let ack = frames
+        .iter()
+        .find(|v| v.get("id") == Some(&serde_json::json!(21)) && v.get("result").is_some())
+        .unwrap_or_else(|| {
+            panic!("expected a mux result for cancel request id=21; got {frames:?}")
+        });
+    assert_eq!(ack["result"]["status"], serde_json::json!("cancelling"));
+
+    // It was NOT forwarded to the agent: no error response came back for id 21
+    // (a forwarded rooms/* request would yield a method-not-found error).
+    assert!(
+        !frames
+            .iter()
+            .any(|v| v.get("id") == Some(&serde_json::json!(21)) && v.get("error").is_some()),
+        "cancel request must be answered by the mux, never error back from the agent: {frames:?}",
+    );
+
+    // And the cancel actually took effect.
+    assert!(
+        frames
+            .iter()
+            .any(|v| v.get("method") == Some(&serde_json::json!("rooms/turn_cancelled"))),
+        "expected rooms/turn_cancelled broadcast",
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|v| v.get("method") == Some(&serde_json::json!("mock/session_cancel_echo"))),
+        "agent should have received ACP session/cancel",
+    );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}
+
+/// `rooms/cancel_active_turn` as a request with no active turn is answered by
+/// the mux with -32002 (no active turn), not forwarded to the agent.
+#[tokio::test]
+async fn rooms_cancel_active_turn_request_with_no_active_turn_errors() {
+    let (addr, _) = spawn_server_with_mock().await;
+    let url = format!("ws://{addr}/acp?room=creqnt&peer_id=A");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+
+    let resp = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":7,"method":"rooms/cancel_active_turn"}"#,
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"],
+        serde_json::json!(-32002),
+        "no-active-turn cancel request must be rejected by the mux: {resp:?}",
+    );
+
+    let _ = ws.send(ClientMsg::Close(None)).await;
+}

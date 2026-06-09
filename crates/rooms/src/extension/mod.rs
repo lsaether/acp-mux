@@ -262,6 +262,36 @@ impl RoomsExtension {
             ctx.send_to(peer_id, Bytes::from(bytes));
         }
     }
+
+    /// Cancel the active turn, if any: broadcast `rooms/turn_cancelled` and
+    /// send ACP-native `session/cancel` to the agent. Returns the cancelled
+    /// turn id, or `None` when there is no active turn. Shared by the request
+    /// (`on_subscriber_request`) and notification (`on_subscriber_notification`)
+    /// entry points so both documented shapes behave identically and neither
+    /// is ever forwarded to the agent.
+    fn cancel_active_turn(
+        &self,
+        ctx: &mut MuxCtx,
+        peer_id: &str,
+        reason: Option<&str>,
+    ) -> Option<RoomsTurnId> {
+        let rooms_turn_id = self.active_rooms_turn_id?;
+        let active_session_id = self.active_turn_session_id.clone()?;
+        let original_driver = ctx
+            .prompt_in_flight()
+            .and_then(|mux_id| ctx.pending_peer(mux_id).map(str::to_string))
+            .unwrap_or_else(|| peer_id.to_string());
+        let room_id = ctx.mux_id().to_string();
+        ctx.broadcast(rooms::turn_cancelled(
+            &room_id,
+            rooms_turn_id,
+            peer_id,
+            &original_driver,
+            reason,
+        ));
+        ctx.send_to_agent(build_session_cancel(&active_session_id));
+        Some(rooms_turn_id)
+    }
 }
 
 impl MuxExtension for RoomsExtension {
@@ -276,6 +306,29 @@ impl MuxExtension for RoomsExtension {
             rooms::METHOD_QUEUE_PROMPT => self.handle_rooms_queue_prompt_request(ctx, peer_id, req),
             rooms::METHOD_UNQUEUE_PROMPT => {
                 self.handle_rooms_unqueue_prompt_request(ctx, peer_id, req)
+            }
+            rooms::METHOD_CANCEL_ACTIVE_TURN => {
+                let reason = req
+                    .params
+                    .as_ref()
+                    .and_then(|v| v.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                match self.cancel_active_turn(ctx, peer_id, reason.as_deref()) {
+                    Some(turn_id) => {
+                        self.send_result_response(
+                            ctx,
+                            peer_id,
+                            req.id.clone(),
+                            json!({ "roomsTurnId": turn_id.formatted(), "status": "cancelling" }),
+                        );
+                        Disposition::Handled
+                    }
+                    None => Disposition::Reject {
+                        code: NO_ACTIVE_TURN_ERROR_CODE,
+                        message: "no active turn to cancel".to_string(),
+                    },
+                }
             }
             "session/prompt" if ctx.prompt_in_flight().is_some() => {
                 let held_by = ctx
@@ -376,31 +429,14 @@ impl MuxExtension for RoomsExtension {
         if notif.method != rooms::METHOD_CANCEL_ACTIVE_TURN {
             return NotifyDisposition::Passthrough;
         }
-        let Some(rooms_turn_id) = self.active_rooms_turn_id else {
-            return NotifyDisposition::Handled;
-        };
-        let Some(active_session_id) = self.active_turn_session_id.clone() else {
-            return NotifyDisposition::Handled;
-        };
-        let original_driver = ctx
-            .prompt_in_flight()
-            .and_then(|mux_id| ctx.pending_peer(mux_id).map(str::to_string))
-            .unwrap_or_else(|| peer_id.to_string());
+        // Notification shape: fire-and-forget. A missing active turn is a
+        // silent no-op (unlike the request shape, which returns -32002).
         let reason = notif
             .params
             .as_ref()
             .and_then(|v| v.get("reason"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let room_id = ctx.mux_id().to_string();
-        ctx.broadcast(rooms::turn_cancelled(
-            &room_id,
-            rooms_turn_id,
-            peer_id,
-            &original_driver,
-            reason.as_deref(),
-        ));
-        ctx.send_to_agent(build_session_cancel(&active_session_id));
+            .and_then(Value::as_str);
+        self.cancel_active_turn(ctx, peer_id, reason);
         NotifyDisposition::Handled
     }
 
