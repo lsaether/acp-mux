@@ -314,6 +314,8 @@ Supported `endReason` values:
 - `session_load` — client called `session/load` and the canonical ACP session id changed.
 - `acp_session_id_changed` — the agent emitted a notification with a different `params.sessionId` than the active segment.
 
+`endReason` is best-effort diagnostic metadata, not a strict priority contract: when both signals coincide (e.g. an agent emits loaded-session `session/update`s before its `session/load` response), the segment is labeled by whichever signal the mux observes first, which can be `acp_session_id_changed` even for a load-initiated rotation.
+
 Provider-specific metadata is never a segment-rotation signal. If an agent emits provider metadata, it remains opaque payload data for clients that care.
 
 ## Subscriber control requests
