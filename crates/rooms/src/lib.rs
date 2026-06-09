@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub mod agent;
 pub mod cli;
 pub mod extension;

@@ -1,5 +1,4 @@
 mod attach_views;
-mod permissions;
 mod presence;
 mod queue;
 mod segments;
@@ -223,10 +222,6 @@ pub(super) const INVALID_PARAMS_ERROR_CODE: i64 = -32602;
 pub(super) const SESSION_CANCEL_METHOD: &str = "session/cancel";
 
 impl RoomsExtension {
-    fn room_id<'a>(&self, ctx: &'a MuxCtx<'_>) -> &'a str {
-        ctx.mux_id()
-    }
-
     pub(super) fn send_error_response(
         &self,
         ctx: &mut MuxCtx,
