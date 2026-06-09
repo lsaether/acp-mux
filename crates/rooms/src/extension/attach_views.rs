@@ -3,38 +3,45 @@
 use super::*;
 
 impl RoomsExtension {
+    /// Whether a replay entry belongs in the `historyPolicy: full` view: the
+    /// active segment, plus pre-segment bootstrap frames (`SegmentId(0)`), plus
+    /// `rooms/turn_{started,complete,cancelled}` lifecycle bookends carried from
+    /// a prior segment when their `roomsTurnId` brackets the active view (so a
+    /// mid-rotation turn is never left with an unmatched complete). Prior-segment
+    /// agent chunks are excluded — those belong to `full_lineage`.
+    ///
+    /// Driven purely by per-frame segment tags (`ext_tag`), never by
+    /// `replay_generation`, so it is correct after both load-driven and
+    /// notification-driven segment rotations.
     pub(super) fn should_include_replay_entry(&self, ctx: &MuxCtx, entry: ReplayView<'_>) -> bool {
-        if self.replay_generation == 0 {
+        let active = self.active_segment_id.map(|id| id.0);
+        if entry.ext_tag == PRE_SEGMENT_TAG || Some(entry.ext_tag) == active {
             return true;
         }
-        if let Some(active_id) = self.active_segment_id
-            && entry.ext_tag == active_id.0
-        {
-            return true;
-        }
+        // A prior-segment frame: keep it only if it is a turn-lifecycle bookend
+        // whose turn brackets the active view.
+        turn_lifecycle_turn_id(entry.frame)
+            .map(|turn_id| self.cross_segment_turn_carry(ctx).contains(&turn_id))
+            .unwrap_or(false)
+    }
 
-        let Ok(value) = serde_json::from_slice::<Value>(entry.frame) else {
-            return false;
-        };
-        let Some(method) = value.get("method").and_then(Value::as_str) else {
-            return false;
-        };
-        match method {
-            "rooms/peer_joined" => value
-                .pointer("/params/peerId")
-                .and_then(Value::as_str)
-                .is_some_and(|peer_id| ctx.subscriber(peer_id).is_some()),
-            "session/update" => {
-                let Some(canonical) = ctx.canonical_session_id() else {
-                    return false;
-                };
-                value
-                    .pointer("/params/sessionId")
-                    .and_then(Value::as_str)
-                    .is_some_and(|session_id| session_id == canonical)
+    /// Turn ids whose `rooms/turn_*` bookends should be carried into the `full`
+    /// view from prior segments: any turn id seen in a bootstrap or
+    /// active-segment lifecycle frame, plus the currently-active turn.
+    fn cross_segment_turn_carry(&self, ctx: &MuxCtx) -> std::collections::HashSet<String> {
+        let active = self.active_segment_id.map(|id| id.0);
+        let mut carry = std::collections::HashSet::new();
+        for entry in ctx.replay_entries() {
+            if (entry.ext_tag == PRE_SEGMENT_TAG || Some(entry.ext_tag) == active)
+                && let Some(turn_id) = turn_lifecycle_turn_id(entry.frame)
+            {
+                carry.insert(turn_id);
             }
-            _ => false,
         }
+        if let Some(turn_id) = self.active_rooms_turn_id {
+            carry.insert(turn_id.formatted());
+        }
+        carry
     }
 
     pub(super) fn replay_history(&self, ctx: &MuxCtx, full_lineage: bool) -> Vec<HistoryEntry> {
@@ -109,6 +116,27 @@ impl RoomsExtension {
             )),
         );
     }
+}
+
+/// Replay tag for frames recorded before any segment opened (the pre-segment
+/// bootstrap). Matches the `SegmentId(0)` sentinel used by `set_replay_tag`.
+const PRE_SEGMENT_TAG: u64 = 0;
+
+/// If `frame` is a `rooms/turn_started`, `rooms/turn_complete`, or
+/// `rooms/turn_cancelled` notification, return its `roomsTurnId`.
+fn turn_lifecycle_turn_id(frame: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(frame).ok()?;
+    let method = value.get("method").and_then(Value::as_str)?;
+    if !matches!(
+        method,
+        "rooms/turn_started" | "rooms/turn_complete" | "rooms/turn_cancelled"
+    ) {
+        return None;
+    }
+    value
+        .pointer("/params/roomsTurnId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 pub(super) fn attach_meta_str<'a>(params: &'a AttachParams, key: &str) -> Option<&'a str> {

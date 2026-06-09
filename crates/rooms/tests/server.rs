@@ -5319,3 +5319,87 @@ async fn rooms_cancel_active_turn_request_with_no_active_turn_errors() {
 
     let _ = ws.send(ClientMsg::Close(None)).await;
 }
+
+/// `historyPolicy: full` after a NOTIFICATION-driven segment rotation must be
+/// scoped to the current segment (not the prior segment's agent chunks), while
+/// still carrying the cross-segment `rooms/turn_started` bookend for a turn that
+/// spans the rotation. Regression guard for the `replay_generation`-based filter
+/// that made `full` behave like `full_lineage` after notification rotation
+/// (generation stays 0) and dropped the cross-segment turn-bookend carry.
+#[tokio::test]
+async fn full_history_after_notification_rotation_is_current_segment_with_carry() {
+    let (addr, _) =
+        spawn_server_with_mock_env(&[("MOCK_ACP_ROTATE_SESSION_ID", "sess-rotated")]).await;
+
+    // Driver opens segment 1 (sess-mock) and runs one turn. The mock rotates
+    // the canonical sessionId mid-turn, so `rooms/turn_started` lands in
+    // segment 1 and `rooms/turn_complete` in segment 2.
+    let url_a = format!("ws://{addr}/acp?room=rot&peer_id=A");
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"hi"}]}}"#,
+    )
+    .await;
+
+    // Late joiner attaches with both policies; `replay=skip` so only the
+    // session/attach response history is under test.
+    let url_b = format!("ws://{addr}/acp?room=rot&peer_id=B&replay=skip");
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let full = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":10,"method":"session/attach","params":{"historyPolicy":"full"}}"#,
+    )
+    .await;
+    let lineage = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":11,"method":"session/attach","params":{"historyPolicy":"full_lineage"}}"#,
+    )
+    .await;
+
+    let full_json = serde_json::to_string(&full["result"]["history"]).unwrap();
+    let lineage_json = serde_json::to_string(&lineage["result"]["history"]).unwrap();
+
+    // Carry: full keeps both bookends for the rotation-spanning turn.
+    assert!(
+        full_json.contains("rooms/turn_started"),
+        "full must carry the prior-segment turn_started: {full_json}",
+    );
+    assert!(
+        full_json.contains("rooms/turn_complete"),
+        "full must include the active-segment turn_complete: {full_json}",
+    );
+    // Scoping: full excludes prior-segment agent chunks ("world" is a seg1
+    // chunk), but full_lineage includes them.
+    assert!(
+        !full_json.contains("world"),
+        "full must exclude prior-segment agent chunks (not behave like full_lineage): {full_json}",
+    );
+    assert!(
+        lineage_json.contains("world"),
+        "full_lineage must include prior-segment agent chunks: {lineage_json}",
+    );
+    // Sanity: current (rotated) segment content IS present in full.
+    assert!(
+        full_json.contains("rotated-segment-chunk"),
+        "full must include current-segment frames: {full_json}",
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}

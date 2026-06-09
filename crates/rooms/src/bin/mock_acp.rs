@@ -63,6 +63,12 @@
 //!   two `session/update` history chunks for the requested session before
 //!   returning the load response. Used to verify mux replay generation
 //!   boundaries retain load-time replay frames.
+//! - `MOCK_ACP_ROTATE_SESSION_ID=<id>` — on `session/prompt`, after the normal
+//!   updates and before the response, emit one `session/update` under `<id>`
+//!   (a different sessionId). The mux observes the sessionId change and rotates
+//!   the segment mid-turn, so the turn's `rooms/turn_started` lands in the
+//!   prior segment and its `rooms/turn_complete` in the new one. Used to test
+//!   notification-driven `historyPolicy: full` segment scoping and carry.
 //!
 //! Per-line behavior is logged to stderr at info level so tests can grep
 //! the output if needed. The process exits when stdin closes.
@@ -118,6 +124,14 @@ fn main() {
     let emit_load_history = env::var("MOCK_ACP_EMIT_LOAD_HISTORY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    // Notification-driven segment rotation: on `session/prompt`, after the
+    // normal updates and before the response, emit one `session/update` under
+    // this (different) sessionId. The mux observes the sessionId change and
+    // rotates the segment mid-turn, so the turn's `rooms/turn_started` lands in
+    // the prior segment and its `rooms/turn_complete` in the new one.
+    let rotate_session_id = env::var("MOCK_ACP_ROTATE_SESSION_ID")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
 
     let mut initialize_count: u32 = 0;
     let mut session_new_count: u32 = 0;
@@ -437,6 +451,25 @@ fn main() {
                         },
                     });
                     writeln!(stdout, "{upd}").ok();
+                }
+
+                // Optional mid-turn notification-driven segment rotation: emit
+                // a session/update under a different sessionId so the mux
+                // rotates the segment while the turn is still in flight.
+                if let Some(rotated) = rotate_session_id.as_deref() {
+                    let upd = json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": rotated,
+                            "update": {
+                                "kind": "agent_message_chunk",
+                                "content": { "type": "text", "text": "rotated-segment-chunk" },
+                            },
+                        },
+                    });
+                    writeln!(stdout, "{upd}").ok();
+                    stdout.flush().ok();
                 }
 
                 if prompt_delay_ms > 0 {
