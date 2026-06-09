@@ -36,9 +36,12 @@
 - **Standalone `acp-mux` binary.** A pure one-agent-to-many-clients mux with no
   collaboration layer, for clients that only need raw ACP mirroring.
 - **Optional persistent replay store.** `--replay-store <DIR>` persists
-  broadcast-tier room history as append-only JSONL and rehydrates replay
-  frames/segment bookends on restart. The upstream agent still owns actual
-  conversation state.
+  broadcast-tier room history as append-only JSONL and rehydrates the broadcast
+  replay log on restart so late joiners can recover the transcript via
+  `historyPolicy: full_lineage`. Segment lineage and current-segment (`full`)
+  scoping are not reconstructed across restart yet — see the "cross-restart
+  segment fidelity" limitation in `docs/design/rooms.md`. The upstream agent
+  still owns actual conversation state.
 - **Client contract fixtures.** `docs/examples/client-contract/` contains
   copyable request/response/notification JSON fixtures for `session/attach`,
   turn lifecycle, queue lifecycle, agent-request lifecycle, replay markers,

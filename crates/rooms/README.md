@@ -156,6 +156,11 @@ JSONL file per room:
 This persists visible mux replay history. It does not persist the upstream
 agent's private conversation store or in-flight permissions.
 
+On restart the broadcast log is rehydrated for `historyPolicy: full_lineage`
+recovery, but segment lineage and current-segment (`full`) scoping are not
+reconstructed yet — see "cross-restart segment fidelity" in
+[../../docs/design/rooms.md](../../docs/design/rooms.md).
+
 `--replay-turns 0` disables replay and prevents replay-store writes.
 
 ## Debug Endpoint

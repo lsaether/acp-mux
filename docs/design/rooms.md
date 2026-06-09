@@ -193,18 +193,41 @@ prompts are retargeted to the new ACP id.
 
 The room transcript is in-memory by default. With `--replay-store <DIR>`,
 broadcast-tier frames are also appended to one JSONL file per room. On
-restart, the mux rehydrates replay frames and segment bookends so late
-joiners can recover visible room history.
+restart, the mux rehydrates those persisted broadcast frames so late joiners
+can recover the transcript via `historyPolicy: full_lineage`.
 
-Persistence still has a narrow scope:
+Persistence has a narrow scope:
 
 - It persists mux broadcast history, not the upstream agent's internal
   conversation state.
 - It does not persist in-flight agent requests or unresolved permissions.
-- It depends on segment bookends for canonical session-id restoration; keep
-  `--emit-segment-frames=true` if restart replay should preserve lineage.
 - The current store is append-only and unbounded. Bounded eviction remains a
   follow-up.
+
+### Known limitation: cross-restart segment fidelity
+
+Restart rehydrates the broadcast *frames* but not the *segment lineage* layered
+on top of them. The rooms layer comes back with no `segments`, no
+`activeSegmentId`, and a reset `replayGeneration`, and the core canonical
+session id is not restored. So after a restart only `historyPolicy:
+full_lineage` (the whole transcript) is correct; the segment-aware views —
+current-segment `full`, the attach `snapshot` lineage, `replayGeneration`, and
+the resolved `sessionId` — are wrong until new agent activity re-establishes
+them.
+
+This bites long-lived rooms that span multiple segments across a restart.
+Example: a team keeps a shared coding room open for days, during which the
+agent compacts / `session/load`s several times (many segments), and the mux
+host is redeployed nightly. When a teammate's client reconnects the next
+morning and asks for `historyPolicy: full` — "just the current segment, not the
+whole multi-day lineage" — it gets a near-empty `full` view and a stale session
+id, forcing every client to fall back to replaying the entire `full_lineage`
+history to see the current conversation. Until reconstruction lands, use
+`full_lineage` for cross-restart recovery (and `--emit-segment-frames=true`, the
+default, so the segment bookends are at least persisted for a future rebuild).
+
+Reconstructing segment state and the canonical session id from the persisted
+`rooms/segment_*` frames on restart is a tracked follow-up.
 
 The natural future seam is a SQLite layer keyed on
 `(room_id, segment_id, replay_seq)` if JSONL stops being enough.
