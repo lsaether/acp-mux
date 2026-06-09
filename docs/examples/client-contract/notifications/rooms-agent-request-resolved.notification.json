@@ -1,6 +1,6 @@
 {
   "jsonrpc": "2.0",
-  "method": "amux/agent_request_resolved",
+  "method": "rooms/agent_request_resolved",
   "params": {
     "roomId": "work",
     "requestId": 99,

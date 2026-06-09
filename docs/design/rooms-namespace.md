@@ -1,14 +1,14 @@
-# `amux/*` namespace
+# `rooms/*` namespace
 
 **Status:** v0.2 design surface.
 
-This document describes the optional AMUX collaboration layer. It is not the generic ACP mux contract: raw ACP passthrough, id translation, subprocess routing, safe client-tool defaults, and basic replay belong to the core mux even when a client ignores every `amux/*` frame.
+This document describes the optional Rooms collaboration layer. It is not the generic ACP mux contract: raw ACP passthrough, id translation, subprocess routing, safe client-tool defaults, and basic replay belong to the core mux even when a client ignores every `rooms/*` frame.
 
-`acp-mux` mirrors one upstream ACP agent into a multi-client room. The upstream agent owns ACP frames. The AMUX layer owns collaboration facts. Those AMUX-owned facts live under the `amux/*` namespace so clients can tell the two channels apart.
+`acp-mux` mirrors one upstream ACP agent into a multi-client room. The upstream agent owns ACP frames. The Rooms layer owns collaboration facts. Those Rooms-owned facts live under the `rooms/*` namespace so clients can tell the two channels apart.
 
 ```text
 session/*, fs/*, terminal/*, ...  agent-owned ACP frames
-amux/*                           mux-owned room / replay / control frames
+rooms/*                           mux-owned room / replay / control frames
 ```
 
 ## Boundary
@@ -22,9 +22,9 @@ The generic mux core is intentionally provider-neutral:
 - do not interpret provider-private metadata to drive room lifecycle;
 - rotate room segments only on provider-neutral signals: `session/load` or an observable ACP `params.sessionId` change.
 
-The mux MUST NOT fabricate agent-owned `session/*` notifications. If a frame says `method: "session/update"`, it came from the agent. If the AMUX layer needs to say something about peers, turns, replay, queueing, or segment lineage, it emits an `amux/*` frame.
+The mux MUST NOT fabricate agent-owned `session/*` notifications. If a frame says `method: "session/update"`, it came from the agent. If the Rooms layer needs to say something about peers, turns, replay, queueing, or segment lineage, it emits a `rooms/*` frame.
 
-Clients that only need the generic mux can treat `amux/*` as extension metadata or request no history/replay where appropriate. Clients that need multiplayer UX should consume this namespace deliberately instead of inferring room state from provider-private payloads.
+Clients that only need the generic mux can treat `rooms/*` as extension metadata or request no history/replay where appropriate. Clients that need multiplayer UX should consume this namespace deliberately instead of inferring room state from provider-private payloads.
 
 Proxy-local methods such as `session/attach` and `session/detach` are the exception: clients address those requests to the mux, and the mux answers them. They are not forwarded to the wrapped agent and are not pretending to be agent notifications.
 
@@ -32,12 +32,12 @@ Proxy-local methods such as `session/attach` and `session/detach` are the except
 
 - **roomId** — stable mux-level collaboration id from `?room=`.
 - **peerId** — caller-supplied subscriber id, unique within a room.
-- **amuxTurnId** — mux turn id formatted as `at-<n>`.
+- **roomsTurnId** — mux turn id formatted as `at-<n>`.
 - **queueItemId** — mux queue item id, currently formatted as `aq-<n>`.
 - **segmentId** — mux segment id formatted as `seg-<n>`.
 - **acpSessionId** — upstream ACP `sessionId`, when known.
 
-All `amux/*` payload fields are camelCase.
+All `rooms/*` payload fields are camelCase.
 
 ## Why a separate namespace
 
@@ -50,10 +50,10 @@ ACP is a 1:1 client/agent protocol. A mux room needs extra facts that ACP itself
 - whether an old agent request is replay context or still actionable;
 - when an upstream ACP session id changes inside the same mirrored room.
 
-Keeping these as `amux/*` frames gives clients a clean rule:
+Keeping these as `rooms/*` frames gives clients a clean rule:
 
 - render ACP frames as agent conversation;
-- use `amux/*` frames for room UI, replay bookkeeping, and controls.
+- use `rooms/*` frames for room UI, replay bookkeeping, and controls.
 
 ## Transport replay vs `session/attach`
 
@@ -79,7 +79,7 @@ Request shape:
     "sessionId": "<current ACP session id, if the client knows it>",
     "historyPolicy": "full_lineage",
     "_meta": {
-      "amux": {
+      "rooms": {
         "replayOrder": "chronological",
         "historyDelivery": "response"
       }
@@ -100,7 +100,7 @@ Response shape:
     "historyPolicy": "full_lineage",
     "history": [ /* optional frames, depending on policy/delivery */ ],
     "_meta": {
-      "amux": {
+      "rooms": {
         "connectedClients": [ /* roster */ ],
         "appliedReplayOrder": "chronological",
         "appliedHistoryDelivery": "response",
@@ -125,57 +125,57 @@ Supported `historyPolicy` values:
 | `pending_only` | Only unresolved permission/request state; not a transcript restore path. |
 | `after_message` | Accepted as provisional syntax, currently falls back to `full` until stable ACP message ids are available end-to-end. |
 
-Supported `params._meta.amux.replayOrder` values:
+Supported `params._meta.rooms.replayOrder` values:
 
 | Order | Behavior |
 |---|---|
 | `chronological` | Replay frames in durable `replaySeq` order. |
 | `newest_turn_first` | Keep setup/context frames first, then return completed turn groups newest-first while preserving frame order inside each turn. |
 
-Supported `params._meta.amux.historyDelivery` values:
+Supported `params._meta.rooms.historyDelivery` values:
 
 | Delivery | Behavior |
 |---|---|
 | `response` | Include `history` directly in the attach result. |
-| `stream` | Return snapshot metadata immediately, then stream history through `amux/replay_started` and `amux/replay_complete` markers. |
+| `stream` | Return snapshot metadata immediately, then stream history through `rooms/replay_started` and `rooms/replay_complete` markers. |
 
 ## Proxy-local `session/detach`
 
-`session/detach` is answered by the mux and then the WebSocket closes normally. Remaining peers receive `amux/peer_left`. The mux does not fabricate ACP `session/update` disconnect siblings.
+`session/detach` is answered by the mux and then the WebSocket closes normally. Remaining peers receive `rooms/peer_left`. The mux does not fabricate ACP `session/update` disconnect siblings.
 
 ## Broadcast notifications
 
-### `amux/session_context`
+### `rooms/session_context`
 
 Sent to an attaching peer with the local process context inherited by the upstream agent.
 
 ```json
-{"jsonrpc":"2.0","method":"amux/session_context","params":{"roomId":"work","cwd":"/repo"}}
+{"jsonrpc":"2.0","method":"rooms/session_context","params":{"roomId":"work","cwd":"/repo"}}
 ```
 
-### `amux/peer_joined` / `amux/peer_left`
+### `rooms/peer_joined` / `rooms/peer_left`
 
 Presence notifications.
 
 ```json
-{"jsonrpc":"2.0","method":"amux/peer_joined","params":{"roomId":"work","peerId":"phone","peerName":"Phone","role":"mobile"}}
+{"jsonrpc":"2.0","method":"rooms/peer_joined","params":{"roomId":"work","peerId":"phone","peerName":"Phone","role":"mobile"}}
 ```
 
 ```json
-{"jsonrpc":"2.0","method":"amux/peer_left","params":{"roomId":"work","peerId":"phone"}}
+{"jsonrpc":"2.0","method":"rooms/peer_left","params":{"roomId":"work","peerId":"phone"}}
 ```
 
-### `amux/turn_started`
+### `rooms/turn_started`
 
 Broadcast before the mux forwards a `session/prompt` to the agent.
 
 ```jsonc
 {
   "jsonrpc": "2.0",
-  "method": "amux/turn_started",
+  "method": "rooms/turn_started",
   "params": {
     "roomId": "work",
-    "amuxTurnId": "at-42",
+    "roomsTurnId": "at-42",
     "peerId": "desktop",
     "peerName": "Desktop",
     "role": "primary",
@@ -187,54 +187,54 @@ Broadcast before the mux forwards a `session/prompt` to the agent.
 
 `content` is the originator's `session/prompt.params.prompt` value, mirrored verbatim. `supersedesTurnId` is present for replacement turns created by hard steer.
 
-### `amux/turn_complete`
+### `rooms/turn_complete`
 
 Broadcast when the active `session/prompt` response lands.
 
 ```json
-{"jsonrpc":"2.0","method":"amux/turn_complete","params":{"roomId":"work","amuxTurnId":"at-42","stopReason":"end_turn"}}
+{"jsonrpc":"2.0","method":"rooms/turn_complete","params":{"roomId":"work","roomsTurnId":"at-42","stopReason":"end_turn"}}
 ```
 
-### `amux/turn_cancelled`
+### `rooms/turn_cancelled`
 
-Intent broadcast emitted immediately when a peer uses `amux/cancel_active_turn` or when hard steer cancels/supersedes an active turn. The later `amux/turn_complete` still marks actual settlement.
+Intent broadcast emitted immediately when a peer uses `rooms/cancel_active_turn` or when hard steer cancels/supersedes an active turn. The later `rooms/turn_complete` still marks actual settlement.
 
 ```json
-{"jsonrpc":"2.0","method":"amux/turn_cancelled","params":{"roomId":"work","amuxTurnId":"at-42","cancelledBy":"phone","originalDriver":"desktop","reason":"user clicked stop"}}
+{"jsonrpc":"2.0","method":"rooms/turn_cancelled","params":{"roomId":"work","roomsTurnId":"at-42","cancelledBy":"phone","originalDriver":"desktop","reason":"user clicked stop"}}
 ```
 
-### `amux/session_busy`
+### `rooms/session_busy`
 
 Broadcast when an ordinary `session/prompt` arrives while another turn is active and is rejected with JSON-RPC `-32001`.
 
 ```json
-{"jsonrpc":"2.0","method":"amux/session_busy","params":{"roomId":"work","busy":true,"heldBy":"desktop"}}
+{"jsonrpc":"2.0","method":"rooms/session_busy","params":{"roomId":"work","busy":true,"heldBy":"desktop"}}
 ```
 
-### `amux/control_submitted`
+### `rooms/control_submitted`
 
 Replay-safe intent event for accepted mux controls such as hard steer or immediate idle steer.
 
 ```json
-{"jsonrpc":"2.0","method":"amux/control_submitted","params":{"roomId":"work","kind":"steer","mode":"replace_active","peerId":"phone","text":"try a shorter answer","amuxTurnId":"at-42"}}
+{"jsonrpc":"2.0","method":"rooms/control_submitted","params":{"roomId":"work","kind":"steer","mode":"replace_active","peerId":"phone","text":"try a shorter answer","roomsTurnId":"at-42"}}
 ```
 
 ### Queue lifecycle
 
-`amux/queue_prompt` creates queue state owned by the mux. Queue state is visible through lifecycle notifications:
+`rooms/queue_prompt` creates queue state owned by the mux. Queue state is visible through lifecycle notifications:
 
 | Method | Meaning |
 |---|---|
-| `amux/queue_item_added` | A pending item was accepted. |
-| `amux/queue_item_submitted` | A pending item became an actual `session/prompt`. |
-| `amux/queue_item_completed` | The submitted queued turn settled. |
-| `amux/queue_item_removed` | A still-pending item was removed via `amux/unqueue_prompt`. |
-| `amux/queue_item_orphaned` | The submitting peer detached before the item was submitted; the item remains in queue but no longer has a live owner. |
+| `rooms/queue_item_added` | A pending item was accepted. |
+| `rooms/queue_item_submitted` | A pending item became an actual `session/prompt`. |
+| `rooms/queue_item_completed` | The submitted queued turn settled. |
+| `rooms/queue_item_removed` | A still-pending item was removed via `rooms/unqueue_prompt`. |
+| `rooms/queue_item_orphaned` | The submitting peer detached before the item was submitted; the item remains in queue but no longer has a live owner. |
 
 Representative shape:
 
 ```json
-{"jsonrpc":"2.0","method":"amux/queue_item_added","params":{"roomId":"work","queueItemId":"aq-3","peerId":"phone","text":"next, write tests"}}
+{"jsonrpc":"2.0","method":"rooms/queue_item_added","params":{"roomId":"work","queueItemId":"aq-3","peerId":"phone","text":"next, write tests"}}
 ```
 
 ### Agent-request lifecycle
@@ -243,19 +243,19 @@ Agent-initiated requests such as `session/request_permission` are live actionabl
 
 | Method | Meaning |
 |---|---|
-| `amux/agent_request_opened` | Replay-safe context for an agent-initiated request. |
-| `amux/agent_request_resolved` | The request was consumed by a peer reply, agent cancellation, or mux turn-end cleanup. |
+| `rooms/agent_request_opened` | Replay-safe context for an agent-initiated request. |
+| `rooms/agent_request_resolved` | The request was consumed by a peer reply, agent cancellation, or mux turn-end cleanup. |
 
 ```jsonc
 {
   "jsonrpc": "2.0",
-  "method": "amux/agent_request_opened",
+  "method": "rooms/agent_request_opened",
   "params": {
     "roomId": "work",
     "requestId": 99,
     "requestMethod": "session/request_permission",
     "requestParams": { /* original params */ },
-    "amuxTurnId": "at-42"
+    "roomsTurnId": "at-42"
   }
 }
 ```
@@ -263,7 +263,7 @@ Agent-initiated requests such as `session/request_permission` are live actionabl
 ```jsonc
 {
   "jsonrpc": "2.0",
-  "method": "amux/agent_request_resolved",
+  "method": "rooms/agent_request_resolved",
   "params": {
     "roomId": "work",
     "requestId": 99,
@@ -286,27 +286,27 @@ Unresolved permission requests are stored separately and re-issued after `sessio
 When attach history uses streamed delivery, the stream is bracketed with replay markers.
 
 ```json
-{"jsonrpc":"2.0","method":"amux/replay_started","params":{"roomId":"work","phase":"attach_history","replayOrder":"chronological","generation":3,"replayBoundarySeq":120,"frameCount":42}}
+{"jsonrpc":"2.0","method":"rooms/replay_started","params":{"roomId":"work","phase":"attach_history","replayOrder":"chronological","generation":3,"replayBoundarySeq":120,"frameCount":42}}
 ```
 
 ```json
-{"jsonrpc":"2.0","method":"amux/replay_complete","params":{"roomId":"work","phase":"attach_history","replayOrder":"chronological","generation":3,"replayBoundarySeq":120,"frameCount":42}}
+{"jsonrpc":"2.0","method":"rooms/replay_complete","params":{"roomId":"work","phase":"attach_history","replayOrder":"chronological","generation":3,"replayBoundarySeq":120,"frameCount":42}}
 ```
 
 ### Segment lifecycle
 
 Segments describe ACP session-id lineage inside one mux room.
 
-`amux/segment_started` opens a segment:
+`rooms/segment_started` opens a segment:
 
 ```json
-{"jsonrpc":"2.0","method":"amux/segment_started","params":{"roomId":"work","segmentId":"seg-2","acpSessionId":"sess-child","openedAt":"2026-05-27T19:00:00Z"}}
+{"jsonrpc":"2.0","method":"rooms/segment_started","params":{"roomId":"work","segmentId":"seg-2","acpSessionId":"sess-child","openedAt":"2026-05-27T19:00:00Z"}}
 ```
 
-`amux/segment_ended` closes one:
+`rooms/segment_ended` closes one:
 
 ```json
-{"jsonrpc":"2.0","method":"amux/segment_ended","params":{"roomId":"work","segmentId":"seg-1","closedAt":"2026-05-27T19:00:00Z","endReason":"session_load","successorSegmentId":"seg-2"}}
+{"jsonrpc":"2.0","method":"rooms/segment_ended","params":{"roomId":"work","segmentId":"seg-1","closedAt":"2026-05-27T19:00:00Z","endReason":"session_load","successorSegmentId":"seg-2"}}
 ```
 
 Supported `endReason` values:
@@ -320,48 +320,48 @@ Provider-specific metadata is never a segment-rotation signal. If an agent emits
 
 These requests are addressed to the mux, not the agent.
 
-### `amux/cancel_active_turn`
+### `rooms/cancel_active_turn`
 
-Any peer can cancel the active turn. The mux broadcasts `amux/turn_cancelled`, sends ACP-native `session/cancel { sessionId }` to the agent, and waits for normal turn settlement.
+Any peer can cancel the active turn. The mux broadcasts `rooms/turn_cancelled`, sends ACP-native `session/cancel { sessionId }` to the agent, and waits for normal turn settlement.
 
 ```json
-{"jsonrpc":"2.0","id":10,"method":"amux/cancel_active_turn","params":{"reason":"stop"}}
+{"jsonrpc":"2.0","id":10,"method":"rooms/cancel_active_turn","params":{"reason":"stop"}}
 ```
 
-### `amux/steer_active_turn`
+### `rooms/steer_active_turn`
 
 When a turn is active, hard steer cancels/supersedes it and starts a replacement prompt after settlement. When idle, the steer text is submitted immediately as the next prompt.
 
 ```json
-{"jsonrpc":"2.0","id":11,"method":"amux/steer_active_turn","params":{"text":"make it concise"}}
+{"jsonrpc":"2.0","id":11,"method":"rooms/steer_active_turn","params":{"text":"make it concise"}}
 ```
 
 A second hard steer while one is pending is rejected with JSON-RPC `-32002`.
 
-### `amux/queue_prompt`
+### `rooms/queue_prompt`
 
 Queues text behind the active turn, or submits it immediately if idle. The queue is capped at six pending items; full queue returns JSON-RPC `-32003`.
 
 ```json
-{"jsonrpc":"2.0","id":12,"method":"amux/queue_prompt","params":{"text":"after that, add tests"}}
+{"jsonrpc":"2.0","id":12,"method":"rooms/queue_prompt","params":{"text":"after that, add tests"}}
 ```
 
-### `amux/unqueue_prompt`
+### `rooms/unqueue_prompt`
 
 Removes a still-pending queued item.
 
 ```json
-{"jsonrpc":"2.0","id":13,"method":"amux/unqueue_prompt","params":{"queueItemId":"aq-3"}}
+{"jsonrpc":"2.0","id":13,"method":"rooms/unqueue_prompt","params":{"queueItemId":"aq-3"}}
 ```
 
 ## Replay metadata
 
-Broadcast-tier frames may gain mux metadata under `params._meta.amux` when replayed or persisted:
+Broadcast-tier frames may gain mux metadata under `params._meta.rooms` when replayed or persisted:
 
 ```jsonc
 {
   "_meta": {
-    "amux": {
+    "rooms": {
       "recordedAt": "2026-05-27T19:00:00.000Z",
       "replaySeq": 42,
       "segmentId": "seg-2"
@@ -376,10 +376,10 @@ This metadata describes mux recording/replay, not agent semantics. Live agent pa
 
 Clients SHOULD:
 
-1. Treat ACP frames as agent conversation and `amux/*` frames as room/control metadata.
+1. Treat ACP frames as agent conversation and `rooms/*` frames as room/control metadata.
 2. Use `roomId` for mux state and `sessionId` only for upstream ACP payloads.
-3. Use `amuxTurnId` to bracket turns across streamed agent chunks.
+3. Use `roomsTurnId` to bracket turns across streamed agent chunks.
 4. Prefer `session/attach` with `replay=skip` for reconnect/bootstrap.
 5. Request `historyPolicy: "full_lineage"` when rendering a full room transcript across segment rotations.
-6. Treat replayed `amux/agent_request_opened` as inert context; only live or re-issued raw `session/request_permission` frames are actionable.
-7. Tolerate unknown `amux/*` methods and unknown fields.
+6. Treat replayed `rooms/agent_request_opened` as inert context; only live or re-issued raw `session/request_permission` frames are actionable.
+7. Tolerate unknown `rooms/*` methods and unknown fields.

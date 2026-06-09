@@ -1,6 +1,6 @@
 {
   "jsonrpc": "2.0",
-  "method": "amux/session_busy",
+  "method": "rooms/session_busy",
   "params": {
     "roomId": "work",
     "busy": true,

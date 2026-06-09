@@ -1,6 +1,6 @@
 {
   "jsonrpc": "2.0",
-  "method": "amux/agent_request_opened",
+  "method": "rooms/agent_request_opened",
   "params": {
     "roomId": "work",
     "requestId": 99,
@@ -19,6 +19,6 @@
         }
       ]
     },
-    "amuxTurnId": "at-1"
+    "roomsTurnId": "at-1"
   }
 }

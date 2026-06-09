@@ -2,8 +2,39 @@
 
 ## Unreleased
 
+### Breaking
+
+- **Collaboration layer renamed `amux` → `rooms`.** The crate, library, and
+  binary are now `rooms`, and the wire namespace changed accordingly:
+  - `amux/*` notification/control methods → `rooms/*` (e.g. `amux/turn_started`
+    → `rooms/turn_started`, `amux/queue_prompt` → `rooms/queue_prompt`).
+  - `_meta.amux` → `_meta.rooms` (on `session/attach` results and propagated
+    request metadata); the `session/list` decoration key moved likewise.
+  - The `amuxTurnId` field is now `roomsTurnId`.
+  Clients written against the previous `amux/*` releases must update method
+  names and `_meta` keys. The lower-level core crate/binary stays `acp-mux`.
+
 ### Added
 
+- **Two-crate workspace: core mux vs Rooms layer.** The repo is now a Cargo
+  workspace with a hard, compiler-enforced boundary:
+  - `acp-mux` (lib `acp_mux`, binary `acp-mux`) — the standalone generic 1→N
+    ACP multiplexer. Id translation, response routing, first-writer-wins
+    agent-request fan-in, `initialize`/`session/new` caching, `fs/*`/`terminal/*`
+    safety, plain replay/late-join, and an RFD-#533-baseline
+    `session/attach`/`session/detach`. It contains zero `rooms/*` knowledge and
+    does not depend on the `rooms` crate. The standalone binary attaches on
+    `?mux=<id>`.
+  - `rooms` (lib `rooms`, binary `rooms`) — the Rooms collaboration protocol,
+    implemented as a `MuxExtension` plugged into the core mux actor. Owns turns,
+    queue/steer/cancel, presence, segments, `_meta.rooms` attach
+    enrichment, and all `rooms/*` frames. Depends on `acp-mux`. The `rooms`
+    binary attaches on `?room=<id>`.
+  - The boundary is realized through a `MuxExtension` trait + `MuxCtx`
+    capability surface in core (core ships a no-op extension; `rooms` provides
+    the real one). There is now a single multiplexer implementation.
+- **Standalone `acp-mux` binary.** A pure one-agent-to-many-clients mux with no
+  collaboration layer, for clients that only need raw ACP mirroring.
 - **Optional persistent replay store.** `--replay-store <DIR>` persists
   broadcast-tier room history as append-only JSONL and rehydrates replay
   frames/segment bookends on restart. The upstream agent still owns actual
@@ -15,6 +46,15 @@
 
 ### Changed
 
+- **Library reorganized into two crates.** Core multiplexing moved from
+  `src/room/state.rs` (`RoomInner`) into `crates/acp-mux/src/mux/` (`MuxCore` +
+  actor) with no `rooms/*` concerns; the collaboration behavior moved into
+  `crates/rooms/src/extension/` (`RoomsExtension: MuxExtension`). The `rooms`
+  crate's `RoomRegistry`/`server` are now thin wrappers over the core
+  `MuxRegistry::with_extension(...)`. Aside from the `amux/*` → `rooms/*`
+  namespace rename above, the `rooms` binary's behavior is otherwise unchanged;
+  the integration suite and `docs/examples/client-contract/` fixtures were
+  updated to the new namespace and still pass.
 - **Provider-neutral core contract.** The mainline mux is now documented and
   implemented as a generic ACP multiplexer / agent mirror rather than a
   provider-specific adapter. Provider metadata is passed through opaquely;
@@ -22,7 +62,7 @@
   names, `session/load`, and observable ACP `params.sessionId` changes.
 - **Docs reframed around rooms, mirrors, and generic ACP clients.** README,
   roadmap, and design docs now describe `acp-mux` as a reusable ACP room
-  server with provider-neutral safety defaults and an explicit `amux/*`
+  server with provider-neutral safety defaults and an explicit `rooms/*`
   side channel.
 
 ### Removed

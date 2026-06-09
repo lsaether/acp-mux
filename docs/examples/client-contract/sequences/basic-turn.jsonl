@@ -1,5 +1,5 @@
-{"jsonrpc": "2.0", "method": "amux/session_context", "params": {"roomId": "work", "cwd": "/home/you/project"}}
-{"jsonrpc": "2.0", "method": "amux/peer_joined", "params": {"roomId": "work", "peerId": "phone", "peerName": "Phone", "role": "mobile"}}
-{"jsonrpc": "2.0", "method": "amux/turn_started", "params": {"roomId": "work", "amuxTurnId": "at-1", "peerId": "desktop", "peerName": "Desktop", "role": "primary", "content": [{"type": "text", "text": "Summarize this repository in three bullets."}]}}
+{"jsonrpc": "2.0", "method": "rooms/session_context", "params": {"roomId": "work", "cwd": "/home/you/project"}}
+{"jsonrpc": "2.0", "method": "rooms/peer_joined", "params": {"roomId": "work", "peerId": "phone", "peerName": "Phone", "role": "mobile"}}
+{"jsonrpc": "2.0", "method": "rooms/turn_started", "params": {"roomId": "work", "roomsTurnId": "at-1", "peerId": "desktop", "peerName": "Desktop", "role": "primary", "content": [{"type": "text", "text": "Summarize this repository in three bullets."}]}}
 {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "sess-claude-1", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "This repository..."}}}}
-{"jsonrpc": "2.0", "method": "amux/turn_complete", "params": {"roomId": "work", "amuxTurnId": "at-1", "stopReason": "end_turn"}}
+{"jsonrpc": "2.0", "method": "rooms/turn_complete", "params": {"roomId": "work", "roomsTurnId": "at-1", "stopReason": "end_turn"}}

@@ -1,7 +1,7 @@
 {
   "jsonrpc": "2.0",
   "id": 20,
-  "method": "amux/queue_prompt",
+  "method": "rooms/queue_prompt",
   "params": {
     "text": "After this, propose the smallest next patch."
   }

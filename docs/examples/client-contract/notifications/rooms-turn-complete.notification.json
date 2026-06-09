@@ -1,9 +1,9 @@
 {
   "jsonrpc": "2.0",
-  "method": "amux/turn_complete",
+  "method": "rooms/turn_complete",
   "params": {
     "roomId": "work",
-    "amuxTurnId": "at-1",
+    "roomsTurnId": "at-1",
     "stopReason": "end_turn"
   }
 }

@@ -1,6 +1,6 @@
 {
   "jsonrpc": "2.0",
-  "method": "amux/replay_started",
+  "method": "rooms/replay_complete",
   "params": {
     "roomId": "work",
     "phase": "attach_history",

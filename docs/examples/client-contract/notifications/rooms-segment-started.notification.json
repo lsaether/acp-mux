@@ -1,6 +1,6 @@
 {
   "jsonrpc": "2.0",
-  "method": "amux/segment_started",
+  "method": "rooms/segment_started",
   "params": {
     "roomId": "work",
     "segmentId": "seg-2",

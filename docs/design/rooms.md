@@ -1,7 +1,7 @@
 # Rooms
 
 This document specifies the v0.2 **rooms** abstraction. It complements
-`docs/design/amux-namespace.md`, which spells out the `amux/*` namespace
+`docs/design/rooms-namespace.md`, which spells out the `rooms/*` namespace
 itself, and assumes familiarity with the per-session actor model.
 
 ## Why
@@ -41,29 +41,29 @@ machine; it remains opaque payload data for clients that understand it.
 2. `replaySeq` is one global monotonic counter spanning all segments.
    Per-segment slicing is recoverable via `Segment.opened_replay_seq` /
    `Segment.closed_replay_seq`.
-3. Segment rotation emits exactly two frames in order: `amux/segment_ended`
-   for the closing segment, then `amux/segment_started` for the opening
-   one. The first segment of a room emits only `amux/segment_started`.
+3. Segment rotation emits exactly two frames in order: `rooms/segment_ended`
+   for the closing segment, then `rooms/segment_started` for the opening
+   one. The first segment of a room emits only `rooms/segment_started`.
 4. Mid-turn rotation does not tear down the active turn. The rotation
-   frames interleave between agent chunks. `amux/turn_complete` fires
+   frames interleave between agent chunks. `rooms/turn_complete` fires
    normally when the agent finishes. Clients render this as one turn that
    crossed a segment boundary.
 5. Frames recorded before any canonical session id arrives carry
    `SegmentId(0)` (a sentinel). They surface in current-segment replay
-   alongside the active segment so the bootstrap context (`amux/peer_joined`
+   alongside the active segment so the bootstrap context (`rooms/peer_joined`
    for early subscribers) is preserved.
 
 ## Wire shapes
 
-### `amux/segment_started`
+### `rooms/segment_started`
 
 Emitted once on initial open and once per rotation. The first segment of a
-room emits this alone (no `amux/segment_ended` precedes it).
+room emits this alone (no `rooms/segment_ended` precedes it).
 
 ```jsonc
 {
   "jsonrpc": "2.0",
-  "method": "amux/segment_started",
+  "method": "rooms/segment_started",
   "params": {
     "roomId": "<room>",
     "segmentId": "seg-3",
@@ -73,7 +73,7 @@ room emits this alone (no `amux/segment_ended` precedes it).
 }
 ```
 
-### `amux/segment_ended`
+### `rooms/segment_ended`
 
 Emitted as the closing bookend on rotation. Carries the closing segment id;
 `successorSegmentId` points at the opening one so clients can pair the
@@ -82,7 +82,7 @@ bookends without state-tracking.
 ```jsonc
 {
   "jsonrpc": "2.0",
-  "method": "amux/segment_ended",
+  "method": "rooms/segment_ended",
   "params": {
     "roomId": "<room>",
     "segmentId": "seg-2",
@@ -101,10 +101,10 @@ bookends without state-tracking.
   different ACP `sessionId` than the active segment carries.
 
 Both bookend frames flow through the existing `broadcast()` path so they
-pick up the same `_meta.amux { recordedAt, replaySeq }` envelope every
-other frame uses. The transcript records `amux/segment_ended` while the
+pick up the same `_meta.rooms { recordedAt, replaySeq }` envelope every
+other frame uses. The transcript records `rooms/segment_ended` while the
 closing segment is still active (it lands in the closing segment); the mux
-then rotates `active_segment_id` and broadcasts `amux/segment_started`
+then rotates `active_segment_id` and broadcasts `rooms/segment_started`
 (which lands in the opening segment). Late joiners replaying frames by
 `segment_id` can slice the transcript cleanly.
 
@@ -122,8 +122,8 @@ clients that understand it.
 
 - `full` (default) — frames from the active segment only, plus any
   pre-segment bootstrap frames tagged with `SegmentId(0)`, plus any
-  `amux/turn_started` / `amux/turn_complete` / `amux/turn_cancelled`
-  bookend from a prior segment whose `amuxTurnId` brackets at least one
+  `rooms/turn_started` / `rooms/turn_complete` / `rooms/turn_cancelled`
+  bookend from a prior segment whose `roomsTurnId` brackets at least one
   frame in the active segment or matches the currently active turn. The
   lifecycle-frame carry exists so a mid-turn segment rotation doesn't
   leave clients staring at an unmatched `turn_complete`. Agent chunks
@@ -148,7 +148,7 @@ clients can see that earlier segments exist:
 "result": {
   // …
   "_meta": {
-    "amux": {
+    "rooms": {
       "snapshot": {
         // …
         "activeSegmentId": "seg-3",
@@ -166,19 +166,19 @@ clients can see that earlier segments exist:
 
 ## Mid-turn rotation
 
-The active turn is keyed by `active_turn_mux_id` and `amuxTurnId`, neither
+The active turn is keyed by `active_turn_mux_id` and `roomsTurnId`, neither
 of which is tied to a segment. When `detect_segment_signal_*` fires
 mid-turn the rotation frames interleave between agent chunks and
-`amux/turn_complete` fires normally on the agent's natural settlement.
+`rooms/turn_complete` fires normally on the agent's natural settlement.
 Transcript ordering inside that turn is:
 
 ```
-amux/turn_started (old segment)
+rooms/turn_started (old segment)
 agent chunks (old segment)
-amux/segment_ended (old segment)
-amux/segment_started (new segment)
+rooms/segment_ended (old segment)
+rooms/segment_started (new segment)
 agent chunks (new segment)
-amux/turn_complete (new segment)
+rooms/turn_complete (new segment)
 ```
 
 Clients render this as one turn that crossed a segment. The `Turn`
@@ -212,7 +212,7 @@ The natural future seam is a SQLite layer keyed on
 ## Feature flag
 
 `--emit-segment-frames` (default `true`) gates emission of
-`amux/segment_started` and `amux/segment_ended`. The internal state
+`rooms/segment_started` and `rooms/segment_ended`. The internal state
 machine rotates regardless; the flag exists only to preserve
 byte-equivalence with v0.1.x for clients that haven't picked up the new
 frame methods yet.

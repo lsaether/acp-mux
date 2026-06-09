@@ -1,6 +1,6 @@
 {
   "jsonrpc": "2.0",
-  "method": "amux/peer_joined",
+  "method": "rooms/peer_joined",
   "params": {
     "roomId": "work",
     "peerId": "phone",
