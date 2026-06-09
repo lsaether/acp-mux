@@ -31,9 +31,10 @@ pub struct AgentProcess {
 }
 
 impl AgentProcess {
-    pub async fn spawn(program: &str, args: &[String]) -> Result<Self> {
+    pub async fn spawn(program: &str, args: &[String], env: &[(String, String)]) -> Result<Self> {
         let mut child = Command::new(program)
             .args(args)
+            .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -199,7 +200,9 @@ mod tests {
     /// `cat` echoes stdin to stdout — a deterministic NDJSON loopback.
     #[tokio::test]
     async fn cat_loopback_roundtrip() {
-        let mut proc = AgentProcess::spawn("cat", &[]).await.expect("spawn cat");
+        let mut proc = AgentProcess::spawn("cat", &[], &[])
+            .await
+            .expect("spawn cat");
 
         proc.send(br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#)
             .await
@@ -238,7 +241,7 @@ mod tests {
             "for i in $(seq 1 {}); do echo noise $i >&2; done; exec cat",
             STDERR_CAPACITY * 4,
         );
-        let mut proc = AgentProcess::spawn("sh", &["-c".into(), burst])
+        let mut proc = AgentProcess::spawn("sh", &["-c".into(), burst], &[])
             .await
             .expect("spawn sh");
 
@@ -257,7 +260,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_kills_unresponsive_child() {
         // `sleep 30` never exits on its own within our timeout.
-        let proc = AgentProcess::spawn("sleep", &["30".into()])
+        let proc = AgentProcess::spawn("sleep", &["30".into()], &[])
             .await
             .expect("spawn sleep");
         proc.shutdown(Duration::from_millis(200)).await.unwrap();

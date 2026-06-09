@@ -21,10 +21,13 @@ use crate::subscriber::Subscriber;
 
 const CONTROL_PLANE_AGENT_TIMEOUT: Duration = Duration::from_secs(8);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AgentCmd {
     pub program: String,
     pub args: Vec<String>,
+    /// Extra environment variables set on the spawned agent process, on top
+    /// of the inherited parent environment. Empty for raw `--agent-cmd`.
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Error)]
@@ -147,7 +150,7 @@ impl MuxRegistry {
             .agent_cmd
             .clone()
             .ok_or(ControlPlaneSessionListError::AgentCmdMissing)?;
-        let mut agent = AgentProcess::spawn(&cmd.program, &cmd.args).await?;
+        let mut agent = AgentProcess::spawn(&cmd.program, &cmd.args, &cmd.env).await?;
         if let Some(mut stderr_rx) = agent.take_stderr_rx() {
             tokio::spawn(async move {
                 while let Some(line) = stderr_rx.recv().await {
@@ -214,7 +217,7 @@ impl MuxRegistry {
                 tracing::warn!(error = %err, "failed to read current dir for mux context");
                 String::new()
             });
-        let agent = AgentProcess::spawn(&cmd.program, &cmd.args)
+        let agent = AgentProcess::spawn(&cmd.program, &cmd.args, &cmd.env)
             .await
             .map_err(RegistryError::AgentSpawn)?;
         let (handle, _actor) = spawn_mux_with_extension(

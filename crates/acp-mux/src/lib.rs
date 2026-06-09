@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agent_config;
 pub mod attach;
 pub mod cli;
 pub mod extension;
