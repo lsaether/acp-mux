@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "method": "rooms/peer_joined",
+  "params": {
+    "roomId": "work",
+    "peerId": "phone",
+    "peerName": "Phone",
+    "role": "mobile"
+  }
+}

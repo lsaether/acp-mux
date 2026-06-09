@@ -6,7 +6,7 @@
     "sessionId": "sess-claude-1",
     "historyPolicy": "full_lineage",
     "_meta": {
-      "amux": {
+      "rooms": {
         "replayOrder": "newest_turn_first",
         "historyDelivery": "stream"
       }

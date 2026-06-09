@@ -1,8 +1,13 @@
 # acp-mux roadmap
 
-`acp-mux` is a generic ACP multiplexer / agent mirror: one upstream stdio ACP agent process, many WebSocket clients, one shared room transcript. The generic mux core stays small and provider-neutral; the AMUX layer adds optional multiplayer room/control events on top.
+`acp-mux` is a generic ACP multiplexer / agent mirror: one upstream stdio ACP agent process, many WebSocket clients, one shared transcript. The generic mux core stays small and provider-neutral; the Rooms layer adds optional multiplayer room/control events on top.
 
-This file tracks where the project is going. Protocol details live in [`docs/design/amux-namespace.md`](docs/design/amux-namespace.md) and room/segment semantics live in [`docs/design/rooms.md`](docs/design/rooms.md).
+The two layers are now **two crates in a Cargo workspace**, so the boundary is compiler-enforced:
+
+- `crates/acp-mux` (lib `acp_mux`, binary `acp-mux`) — the standalone generic 1→N mux. No `rooms/*` knowledge; does not depend on the `rooms` crate. Attaches on `?mux=<id>`.
+- `crates/rooms` (lib `rooms`, binary `rooms`) — the Rooms protocol, implemented as a `MuxExtension` plugged into the core mux actor. Depends on `acp-mux`. Attaches on `?room=<id>`.
+
+This file tracks where the project is going. Protocol details live in [`docs/design/rooms-namespace.md`](docs/design/rooms-namespace.md) and room/segment semantics live in [`docs/design/rooms.md`](docs/design/rooms.md).
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
@@ -11,18 +16,26 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 - **Provider-neutral core.** Any stdio ACP agent can sit behind the mux. Provider metadata passes through; provider-private logs/metadata do not drive mux state.
 - **One job.** Mirror an ACP agent session into a collaborative, reconnectable room.
 - **Envelope-first routing.** Parse JSON-RPC envelopes and method names; keep ACP payloads as opaque `serde_json::Value` unless the method is mux-owned.
-- **Layer boundary.** Core mux behavior is routing, replay, lifecycle, and safe defaults. AMUX behavior is presence, turn bookends, queue/steer/cancel controls, permission UX, and projection events.
-- **Separate channels.** Agent-owned frames stay in ACP namespaces. AMUX collaboration/control facts stay in `amux/*`.
+- **Layer boundary (crate-enforced).** Core mux behavior is routing, replay, lifecycle, and safe defaults, and lives in the `acp-mux` crate. Rooms behavior is presence, turn bookends, queue/steer/cancel controls, permission UX, and projection events, and lives in the `rooms` crate as a `MuxExtension`. Core cannot reference Rooms (it is not a dependency).
+- **Separate channels.** Agent-owned frames stay in ACP namespaces. Rooms collaboration/control facts stay in `rooms/*`.
+- **Agent channel is pure ACP.** Core owns the agent subprocess; the Rooms extension can only ask core to perform sanctioned ACP actions, never write raw bytes to the agent. This keeps the mux compatible with any standards-compliant agent.
 - **Fail closed on side effects.** Delegated `fs/*` and `terminal/*` client tools are blocked unless an unsafe debug flag explicitly restores raw fanout.
 - **No upstream protocol changes.** `acp-mux` is a consumer/proxy of ACP, not a fork of ACP or a patched agent runtime.
-- **Single static binary.** Runtime dependencies should remain limited to the configured agent subprocess.
+- **Static binaries.** Each binary's runtime dependencies remain limited to the configured agent subprocess.
 
 ## Current shipped shape
 
+### Crate / layer split
+
+- [x] Cargo workspace with `acp-mux` (core) and `rooms` (protocol) crates; one-way dependency.
+- [x] `MuxExtension` trait + `MuxCtx` capability surface; core ships a no-op extension.
+- [x] Single multiplexer implementation; Rooms is an extension over it, not a fork.
+- [x] Standalone `acp-mux` binary (pure 1→N, `?mux=`) and `rooms` binary (core + Rooms, `?room=`).
+
 ### Generic ACP mux core
 
-- [x] One agent subprocess per `?room=`.
-- [x] Multiple subscribers per room.
+- [x] One agent subprocess per attach key (`?mux=` for the core binary; `?room=` for the `rooms` binary).
+- [x] Multiple subscribers per mux.
 - [x] Per-subscriber JSON-RPC id translation.
 - [x] Broadcast fanout for agent notifications.
 - [x] `initialize` and `session/new` caching for late joiners.
@@ -37,17 +50,17 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 - [x] Provider-neutral room/session-id tracking: room id is stable, ACP `sessionId` can rotate inside it.
 - [x] Provider-neutral extraction: no provider-specific stderr parser, metadata interpreter, or lifecycle reason in the core path.
 
-### AMUX collaboration layer
+### Rooms collaboration layer
 
-- [x] `amux/*` room/control namespace.
-- [x] Active-turn cancellation via `amux/cancel_active_turn` → ACP `session/cancel`.
-- [x] Hard steer via `amux/steer_active_turn`.
-- [x] Prompt queue via `amux/queue_prompt` / `amux/unqueue_prompt`.
+- [x] `rooms/*` room/control namespace.
+- [x] Active-turn cancellation via `rooms/cancel_active_turn` → ACP `session/cancel`.
+- [x] Hard steer via `rooms/steer_active_turn`.
+- [x] Prompt queue via `rooms/queue_prompt` / `rooms/unqueue_prompt`.
 - [x] First-writer-wins fanout for `session/request_permission`.
-- [x] Replay-safe agent request lifecycle via `amux/agent_request_opened` / `amux/agent_request_resolved`.
-- [x] Optional streamed attach history via `amux/replay_started` / `amux/replay_complete`.
-- [x] Segment projection frames: `amux/segment_started`, `amux/segment_ended`.
-- [x] Client contract fixtures under `docs/examples/client-contract/` distinguish raw ACP passthrough from AMUX extension frames.
+- [x] Replay-safe agent request lifecycle via `rooms/agent_request_opened` / `rooms/agent_request_resolved`.
+- [x] Optional streamed attach history via `rooms/replay_started` / `rooms/replay_complete`.
+- [x] Segment projection frames: `rooms/segment_started`, `rooms/segment_ended`.
+- [x] Client contract fixtures under `docs/examples/client-contract/` distinguish raw ACP passthrough from Rooms extension frames.
 
 ## Near-term polish
 
@@ -77,10 +90,11 @@ Default remains fail-closed. Future support should be explicit, scoped, and non-
 
 ## ACP / RFD alignment
 
-- [ ] Track accepted shape of attach/detach lifecycle RFDs.
+- [x] RFD #533 `session/attach` / `session/detach` baseline lives in the core crate (standard roster + history policies; no `rooms/*`); Rooms enrichment rides in `_meta.rooms`.
+- [ ] Track accepted shape of attach/detach lifecycle RFDs; pin to the merged revision when #533 lands.
 - [ ] Only add proxy-owned ACP `session/update` siblings if an accepted schema and a real generic client both need them.
 - [ ] Track `session/resume`, `session/close`, `session/delete`, `session/fork`, and other experimental surfaces as passthrough until mux state must understand them.
-- [ ] Keep `_meta.amux` additive and namespaced.
+- [ ] Keep `_meta.rooms` additive and namespaced.
 
 ## Possible v1.0 scope
 

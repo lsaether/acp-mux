@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "method": "rooms/queue_item_added",
+  "params": {
+    "roomId": "work",
+    "queueItemId": "aq-1",
+    "peerId": "phone",
+    "peerName": "Phone",
+    "role": "mobile",
+    "text": "After this, propose the smallest next patch."
+  }
+}

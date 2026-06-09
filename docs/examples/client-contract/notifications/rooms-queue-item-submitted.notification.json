@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "method": "rooms/queue_item_submitted",
+  "params": {
+    "roomId": "work",
+    "queueItemId": "aq-1",
+    "roomsTurnId": "at-2"
+  }
+}

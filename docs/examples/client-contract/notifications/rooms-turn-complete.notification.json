@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "method": "rooms/turn_complete",
+  "params": {
+    "roomId": "work",
+    "roomsTurnId": "at-1",
+    "stopReason": "end_turn"
+  }
+}

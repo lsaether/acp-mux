@@ -7,10 +7,10 @@
     "historyPolicy": "full_lineage",
     "history": [
       {
-        "method": "amux/turn_started",
+        "method": "rooms/turn_started",
         "params": {
           "roomId": "work",
-          "amuxTurnId": "at-1",
+          "roomsTurnId": "at-1",
           "peerId": "desktop",
           "content": [
             {
@@ -21,40 +21,42 @@
         }
       },
       {
-        "method": "amux/turn_complete",
+        "method": "rooms/turn_complete",
         "params": {
           "roomId": "work",
-          "amuxTurnId": "at-1",
+          "roomsTurnId": "at-1",
           "stopReason": "end_turn"
         }
       }
     ],
     "_meta": {
-      "amux": {
+      "rooms": {
         "connectedClients": [
-          {
-            "peerId": "desktop",
-            "peerName": "Desktop",
-            "role": "primary"
-          },
-          {
-            "peerId": "phone",
-            "peerName": "Phone",
-            "role": "mobile"
-          }
+          { "clientId": "desktop", "name": "Desktop" },
+          { "clientId": "phone", "name": "Phone" }
         ],
         "appliedReplayOrder": "chronological",
         "appliedHistoryDelivery": "response",
         "snapshot": {
-          "roomId": "work",
-          "activeSegmentId": "seg-1",
+          "connectedClients": [
+            { "clientId": "desktop", "name": "Desktop" },
+            { "clientId": "phone", "name": "Phone" }
+          ],
+          "selfPeer": { "clientId": "phone", "name": "Phone" },
+          "activeTurn": null,
+          "queue": [],
+          "pendingPermissions": [],
+          "replayBoundarySeq": 3,
+          "replayGeneration": 0,
           "segments": [
             {
               "id": "seg-1",
               "acpSessionId": "sess-claude-1",
-              "openedAt": "2026-05-31T12:00:00Z"
+              "openedAt": "2026-05-31T12:00:00Z",
+              "openedReplaySeq": 0
             }
-          ]
+          ],
+          "activeSegmentId": "seg-1"
         }
       }
     }

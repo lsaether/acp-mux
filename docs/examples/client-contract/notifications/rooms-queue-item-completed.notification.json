@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "method": "rooms/queue_item_completed",
+  "params": {
+    "roomId": "work",
+    "queueItemId": "aq-1",
+    "roomsTurnId": "at-2",
+    "stopReason": "end_turn"
+  }
+}
