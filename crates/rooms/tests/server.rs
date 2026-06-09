@@ -11,13 +11,13 @@
 
 use std::sync::Arc;
 
+use futures::{SinkExt, StreamExt};
 use rooms::cli::{ClientToolPolicy, ReplayTurns};
 use rooms::room::registry::{AgentCmd, RoomRegistry};
 use rooms::room::replay_store::ReplayStore;
 use rooms::server::{
     AppState, CLOSE_CODE_BAD_QUERY, CLOSE_CODE_INTERNAL, CLOSE_CODE_PEER_CONFLICT, router,
 };
-use futures::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -1985,7 +1985,9 @@ async fn rooms_turn_started_and_complete() {
         let complete = frames
             .iter()
             .find(|v| v.get("method") == Some(&serde_json::json!("rooms/turn_complete")))
-            .unwrap_or_else(|| panic!("{label} should see rooms/turn_complete, frames: {frames:?}"));
+            .unwrap_or_else(|| {
+                panic!("{label} should see rooms/turn_complete, frames: {frames:?}")
+            });
         assert_eq!(complete["params"]["roomsTurnId"], serde_json::json!("at-1"));
         assert_eq!(
             complete["params"]["stopReason"],
@@ -2352,7 +2354,10 @@ async fn rooms_steer_active_turn_without_active_turn_submits_prompt() {
             .iter()
             .find(|v| v.get("method") == Some(&serde_json::json!("rooms/turn_complete")))
             .unwrap_or_else(|| panic!("{label} should see idle steer completion: {frames:?}"));
-        assert_eq!(completed["params"]["roomsTurnId"], serde_json::json!("at-1"));
+        assert_eq!(
+            completed["params"]["roomsTurnId"],
+            serde_json::json!("at-1")
+        );
     }
 
     let _ = ws_a.send(ClientMsg::Close(None)).await;
@@ -2505,14 +2510,20 @@ async fn rooms_queue_prompt_is_mux_owned_and_replays_lifecycle() {
             .find(|v| v.get("method") == Some(&serde_json::json!("rooms/queue_item_submitted")))
             .unwrap_or_else(|| panic!("{label} should see queue item submitted: {frames:?}"));
         assert_eq!(submitted["params"]["queueItemId"], serde_json::json!("q-1"));
-        assert_eq!(submitted["params"]["roomsTurnId"], serde_json::json!("at-2"));
+        assert_eq!(
+            submitted["params"]["roomsTurnId"],
+            serde_json::json!("at-2")
+        );
 
         let completed = frames
             .iter()
             .find(|v| v.get("method") == Some(&serde_json::json!("rooms/queue_item_completed")))
             .unwrap_or_else(|| panic!("{label} should see queue item completed: {frames:?}"));
         assert_eq!(completed["params"]["queueItemId"], serde_json::json!("q-1"));
-        assert_eq!(completed["params"]["roomsTurnId"], serde_json::json!("at-2"));
+        assert_eq!(
+            completed["params"]["roomsTurnId"],
+            serde_json::json!("at-2")
+        );
 
         let turn_started: Vec<_> = frames
             .iter()
@@ -2652,14 +2663,20 @@ async fn rooms_queue_prompt_without_active_turn_submits_immediately() {
             .find(|v| v.get("method") == Some(&serde_json::json!("rooms/queue_item_submitted")))
             .unwrap_or_else(|| panic!("{label} should see queue item submitted: {frames:?}"));
         assert_eq!(submitted["params"]["queueItemId"], serde_json::json!("q-1"));
-        assert_eq!(submitted["params"]["roomsTurnId"], serde_json::json!("at-1"));
+        assert_eq!(
+            submitted["params"]["roomsTurnId"],
+            serde_json::json!("at-1")
+        );
 
         let completed = frames
             .iter()
             .find(|v| v.get("method") == Some(&serde_json::json!("rooms/queue_item_completed")))
             .unwrap_or_else(|| panic!("{label} should see queue item completed: {frames:?}"));
         assert_eq!(completed["params"]["queueItemId"], serde_json::json!("q-1"));
-        assert_eq!(completed["params"]["roomsTurnId"], serde_json::json!("at-1"));
+        assert_eq!(
+            completed["params"]["roomsTurnId"],
+            serde_json::json!("at-1")
+        );
     }
 
     let _ = ws_a.send(ClientMsg::Close(None)).await;
@@ -3627,7 +3644,9 @@ async fn agent_request_opened_replayed_to_late_joiner_without_actionable_request
                 && v["params"]["requestId"] == perm_id
         })
         .unwrap_or_else(|| {
-            panic!("late joiner must replay rooms/agent_request_resolved; frames: {replay_frames:?}")
+            panic!(
+                "late joiner must replay rooms/agent_request_resolved; frames: {replay_frames:?}"
+            )
         });
     assert!(
         opened_idx < resolved_idx,

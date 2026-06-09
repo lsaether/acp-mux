@@ -23,9 +23,8 @@ use futures::{SinkExt, StreamExt};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message as ClientMsg;
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Short TTL so teardown is observable inside a normal test budget.
 const TEST_DEFAULT_TTL: Duration = Duration::from_millis(150);
@@ -113,8 +112,7 @@ async fn ws_request(ws: &mut WsStream, payload: &str) -> serde_json::Value {
 async fn ws_next_method(ws: &mut WsStream, method: &str) -> serde_json::Value {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
-        let Ok(Some(Ok(ClientMsg::Text(t)))) =
-            timeout(Duration::from_millis(100), ws.next()).await
+        let Ok(Some(Ok(ClientMsg::Text(t)))) = timeout(Duration::from_millis(100), ws.next()).await
         else {
             continue;
         };
@@ -173,7 +171,11 @@ async fn attach_history_policy_full_returns_history_and_roster() {
     let mut ws = connect(addr, "mux=full533&peer_id=A&peer_name=Alice").await;
 
     let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
-    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#).await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
     // Seed replay history with agent broadcast frames.
     let _ = ws_request(
         &mut ws,
@@ -197,7 +199,8 @@ async fn attach_history_policy_full_returns_history_and_roster() {
     assert!(
         roster
             .iter()
-            .any(|c| c["clientId"] == serde_json::json!("A") && c["name"] == serde_json::json!("Alice")),
+            .any(|c| c["clientId"] == serde_json::json!("A")
+                && c["name"] == serde_json::json!("Alice")),
         "attach result must expose a top-level connectedClients roster: {attach:?}",
     );
 
@@ -219,7 +222,11 @@ async fn attach_history_policy_none_omits_history_but_keeps_roster() {
     let mut ws = connect(addr, "mux=none533&peer_id=A&peer_name=Alice").await;
 
     let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
-    let _ = ws_request(&mut ws, r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#).await;
+    let _ = ws_request(
+        &mut ws,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
     let _ = ws_request(
         &mut ws,
         r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"seed"}]}}"#,
@@ -240,7 +247,9 @@ async fn attach_history_policy_none_omits_history_but_keeps_roster() {
     );
     let roster = result["connectedClients"].as_array().expect("roster array");
     assert!(
-        roster.iter().any(|c| c["clientId"] == serde_json::json!("A")),
+        roster
+            .iter()
+            .any(|c| c["clientId"] == serde_json::json!("A")),
         "roster should still be present for historyPolicy none: {attach:?}",
     );
 
@@ -256,8 +265,16 @@ async fn attach_history_policy_pending_only_returns_open_permission() {
     .await;
     let mut ws_a = connect(addr, "mux=pending533&peer_id=A&peer_name=Alice").await;
 
-    let _ = ws_request(&mut ws_a, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
-    let _ = ws_request(&mut ws_a, r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#).await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
     // Fire a prompt that triggers an agent-initiated permission request and
     // then stalls (2s delay) so the permission stays open.
     ws_a.send(ClientMsg::Text(
@@ -270,7 +287,11 @@ async fn attach_history_policy_pending_only_returns_open_permission() {
     // A second client attaches with pending_only and should see exactly the
     // open permission in history.
     let mut ws_b = connect(addr, "mux=pending533&peer_id=B&peer_name=Bob").await;
-    let _ = ws_request(&mut ws_b, r#"{"jsonrpc":"2.0","id":10,"method":"initialize"}"#).await;
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":10,"method":"initialize"}"#,
+    )
+    .await;
     let attach = ws_request(
         &mut ws_b,
         r#"{"jsonrpc":"2.0","id":11,"method":"session/attach","params":{"sessionId":"sess-mock","historyPolicy":"pending_only"}}"#,
@@ -279,7 +300,9 @@ async fn attach_history_policy_pending_only_returns_open_permission() {
 
     let result = &attach["result"];
     assert_eq!(result["historyPolicy"], serde_json::json!("pending_only"));
-    let history = result["history"].as_array().expect("pending_only history array");
+    let history = result["history"]
+        .as_array()
+        .expect("pending_only history array");
     assert_eq!(history.len(), 1, "pending_only history: {attach:?}");
     assert_eq!(
         history[0]["method"],
@@ -300,11 +323,23 @@ async fn attach_history_policy_pending_only_returns_open_permission() {
 async fn detach_returns_standard_result_shape() {
     let (addr, _) = spawn_server_with_mock().await;
     let mut ws_a = connect(addr, "mux=detach533&peer_id=A&peer_name=Alice").await;
-    let _ = ws_request(&mut ws_a, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
-    let _ = ws_request(&mut ws_a, r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#).await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
 
     let mut ws_b = connect(addr, "mux=detach533&peer_id=B&peer_name=Bob").await;
-    let _ = ws_request(&mut ws_b, r#"{"jsonrpc":"2.0","id":10,"method":"initialize"}"#).await;
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":10,"method":"initialize"}"#,
+    )
+    .await;
     let _ = ws_request(
         &mut ws_b,
         r#"{"jsonrpc":"2.0","id":11,"method":"session/attach","params":{"sessionId":"sess-mock","historyPolicy":"none"}}"#,
@@ -336,8 +371,16 @@ async fn permission_resolution_is_first_writer_wins() {
     let mut ws_a = connect(addr, "mux=fww533&peer_id=A&peer_name=Alice").await;
     let mut ws_b = connect(addr, "mux=fww533&peer_id=B&peer_name=Bob").await;
 
-    let _ = ws_request(&mut ws_a, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
-    let _ = ws_request(&mut ws_a, r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#).await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
 
     // Prompt triggers an agent-initiated permission, fanned out to both A and B.
     ws_a.send(ClientMsg::Text(
@@ -349,7 +392,10 @@ async fn permission_resolution_is_first_writer_wins() {
     let perm_a = ws_next_method(&mut ws_a, "session/request_permission").await;
     let perm_b = ws_next_method(&mut ws_b, "session/request_permission").await;
     let permission_id = perm_a["id"].clone();
-    assert_eq!(perm_a["id"], perm_b["id"], "both clients see the same request id");
+    assert_eq!(
+        perm_a["id"], perm_b["id"],
+        "both clients see the same request id"
+    );
 
     // A replies first; this reply should be forwarded to the agent.
     let reply = serde_json::json!({
@@ -417,9 +463,21 @@ async fn core_never_emits_rooms_frames() {
 
     // Full handshake + a prompt (with permission) + attach/detach lifecycle
     // exercises every code path that produces outbound frames.
-    let _ = ws_request(&mut ws_a, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
-    let _ = ws_request(&mut ws_a, r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#).await;
-    let _ = ws_request(&mut ws_b, r#"{"jsonrpc":"2.0","id":10,"method":"initialize"}"#).await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":10,"method":"initialize"}"#,
+    )
+    .await;
     let _ = ws_request(
         &mut ws_b,
         r#"{"jsonrpc":"2.0","id":11,"method":"session/attach","params":{"sessionId":"sess-mock","historyPolicy":"full"}}"#,

@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anyhow::{Context, Result};
+use clap::Parser;
 use rooms::cli;
 use rooms::room::registry::{AgentCmd, RoomRegistry};
 use rooms::room::replay_store::ReplayStore;
 use rooms::server;
-use anyhow::{Context, Result};
-use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]

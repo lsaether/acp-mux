@@ -426,7 +426,11 @@ impl RoomsExtension {
         );
         if let Some(queue_item_id) = queue_item_id.as_deref() {
             let room_id = ctx.mux_id().to_string();
-            ctx.broadcast(rooms::queue_item_submitted(&room_id, queue_item_id, turn_id));
+            ctx.broadcast(rooms::queue_item_submitted(
+                &room_id,
+                queue_item_id,
+                turn_id,
+            ));
         }
         Some(mux_id)
     }
@@ -515,6 +519,9 @@ pub(super) fn inject_request_trace_metadata(req: &mut IncomingRequest, trace: Re
         Value::Number(serde_json::Number::from(trace.mux_id)),
     );
     if let Some(turn_id) = trace.rooms_turn_id {
-        rooms.insert("roomsTurnId".to_string(), Value::String(turn_id.formatted()));
+        rooms.insert(
+            "roomsTurnId".to_string(),
+            Value::String(turn_id.formatted()),
+        );
     }
 }

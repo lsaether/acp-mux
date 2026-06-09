@@ -18,7 +18,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::protocol::rooms::{self, RoomsTurnId, EndReason, SegmentId};
+use crate::protocol::rooms::{self, EndReason, RoomsTurnId, SegmentId};
 
 use attach_views::{
     attach_meta_str, inject_replay_metadata, newest_turn_first_history, replay_stream_phases,
@@ -245,7 +245,13 @@ impl RoomsExtension {
         }
     }
 
-    pub(super) fn send_result_response(&self, ctx: &mut MuxCtx, peer_id: &str, id: Id, result: Value) {
+    pub(super) fn send_result_response(
+        &self,
+        ctx: &mut MuxCtx,
+        peer_id: &str,
+        id: Id,
+        result: Value,
+    ) {
         let resp = IncomingResponse {
             jsonrpc: JsonRpcVersion,
             id,
@@ -564,7 +570,11 @@ impl MuxExtension for RoomsExtension {
             .filter_map(|item| item.queue_item_id.clone())
             .collect();
         for queue_item_id in orphaned_queue_item_ids {
-            ctx.broadcast(rooms::queue_item_orphaned(&room_id, &queue_item_id, peer_id));
+            ctx.broadcast(rooms::queue_item_orphaned(
+                &room_id,
+                &queue_item_id,
+                peer_id,
+            ));
         }
         if self.driving_subscriber_peer_id.as_deref() == Some(peer_id) {
             self.driving_subscriber_peer_id = None;
