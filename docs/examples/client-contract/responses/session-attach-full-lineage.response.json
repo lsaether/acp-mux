@@ -32,29 +32,31 @@
     "_meta": {
       "rooms": {
         "connectedClients": [
-          {
-            "peerId": "desktop",
-            "peerName": "Desktop",
-            "role": "primary"
-          },
-          {
-            "peerId": "phone",
-            "peerName": "Phone",
-            "role": "mobile"
-          }
+          { "clientId": "desktop", "name": "Desktop" },
+          { "clientId": "phone", "name": "Phone" }
         ],
         "appliedReplayOrder": "chronological",
         "appliedHistoryDelivery": "response",
         "snapshot": {
-          "roomId": "work",
-          "activeSegmentId": "seg-1",
+          "connectedClients": [
+            { "clientId": "desktop", "name": "Desktop" },
+            { "clientId": "phone", "name": "Phone" }
+          ],
+          "selfPeer": { "clientId": "phone", "name": "Phone" },
+          "activeTurn": null,
+          "queue": [],
+          "pendingPermissions": [],
+          "replayBoundarySeq": 3,
+          "replayGeneration": 0,
           "segments": [
             {
               "id": "seg-1",
               "acpSessionId": "sess-claude-1",
-              "openedAt": "2026-05-31T12:00:00Z"
+              "openedAt": "2026-05-31T12:00:00Z",
+              "openedReplaySeq": 0
             }
-          ]
+          ],
+          "activeSegmentId": "seg-1"
         }
       }
     }
