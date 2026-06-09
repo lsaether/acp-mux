@@ -7,7 +7,7 @@ The two layers are now **two crates in a Cargo workspace**, so the boundary is c
 - `crates/acp-mux` (lib `acp_mux`, binary `acp-mux`) — the standalone generic 1→N mux. No `rooms/*` knowledge; does not depend on the `rooms` crate. Attaches on `?mux=<id>`.
 - `crates/rooms` (lib `rooms`, binary `rooms`) — the Rooms protocol, implemented as a `MuxExtension` plugged into the core mux actor. Depends on `acp-mux`. Attaches on `?room=<id>`.
 
-This file tracks where the project is going. The split itself is specified in [`docs/design/core-rooms-refactor-plan.md`](docs/design/core-rooms-refactor-plan.md). Protocol details live in [`docs/design/rooms-namespace.md`](docs/design/rooms-namespace.md) and room/segment semantics live in [`docs/design/rooms.md`](docs/design/rooms.md).
+This file tracks where the project is going. Protocol details live in [`docs/design/rooms-namespace.md`](docs/design/rooms-namespace.md) and room/segment semantics live in [`docs/design/rooms.md`](docs/design/rooms.md).
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
