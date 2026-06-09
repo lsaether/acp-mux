@@ -532,6 +532,24 @@ impl MuxCore {
                 if notif.method == CANCEL_REQUEST_METHOD {
                     self.handle_agent_cancel(ext, notif, line);
                 } else {
+                    // Provider-neutral canonical session-id tracking: an agent
+                    // notification whose sessionId differs from the established
+                    // canonical id means the agent switched its active ACP
+                    // session. Update core's canonical id (which notifies the
+                    // extension, e.g. to rotate segments) BEFORE broadcasting,
+                    // so any rotation frames precede this notification in the
+                    // transcript.
+                    if let Some(sid) = notif
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("sessionId"))
+                        .and_then(Value::as_str)
+                        && self.canonical_session_id.is_some()
+                        && self.canonical_session_id.as_deref() != Some(sid)
+                    {
+                        let sid = sid.to_string();
+                        self.set_canonical_session_id(ext, &sid, false);
+                    }
                     ext.on_agent_notification(&mut MuxCtx::new(self), &notif);
                     self.broadcast(Bytes::from(line));
                 }

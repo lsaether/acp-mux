@@ -440,26 +440,6 @@ impl MuxExtension for RoomsExtension {
         NotifyDisposition::Handled
     }
 
-    fn on_agent_notification(&mut self, ctx: &mut MuxCtx, notif: &IncomingNotification) {
-        let Some(params) = notif.params.as_ref() else {
-            return;
-        };
-        let Some(acp_session_id) = params.get("sessionId").and_then(Value::as_str) else {
-            return;
-        };
-        let Some(active) = self.active_segment() else {
-            return;
-        };
-        if active.acp_session_id.as_deref() == Some(acp_session_id) {
-            return;
-        }
-        self.rotate_segment(
-            ctx,
-            Some(acp_session_id.to_string()),
-            EndReason::AcpSessionIdChanged,
-        );
-    }
-
     fn on_agent_request(&mut self, ctx: &mut MuxCtx, id: &Id, req: &IncomingRequest) {
         let request_id_value = serde_json::to_value(id).unwrap_or(Value::Null);
         let room_id = ctx.mux_id().to_string();

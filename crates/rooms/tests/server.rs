@@ -5403,3 +5403,67 @@ async fn full_history_after_notification_rotation_is_current_segment_with_carry(
     let _ = ws_a.send(ClientMsg::Close(None)).await;
     let _ = ws_b.send(ClientMsg::Close(None)).await;
 }
+
+/// After a notification-driven sessionId rotation, the core canonical session
+/// id tracks the new id, so `session/attach` reports and accepts the current
+/// id (not the stale pre-rotation one). Regression guard: the segment used to
+/// rotate in the rooms layer while core's canonical stayed pinned to the old
+/// id, so attach returned the stale id and rejected the actually-current one.
+#[tokio::test]
+async fn attach_tracks_canonical_session_id_after_notification_rotation() {
+    let (addr, _) =
+        spawn_server_with_mock_env(&[("MOCK_ACP_ROTATE_SESSION_ID", "sess-rotated")]).await;
+
+    let url_a = format!("ws://{addr}/acp?room=cantrack&peer_id=A");
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(url_a).await.unwrap();
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/new"}"#,
+    )
+    .await;
+    // This turn rotates the canonical sessionId sess-mock -> sess-rotated.
+    let _ = ws_request(
+        &mut ws_a,
+        r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"sess-mock","prompt":[{"type":"text","text":"hi"}]}}"#,
+    )
+    .await;
+
+    let url_b = format!("ws://{addr}/acp?room=cantrack&peer_id=B&replay=skip");
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(url_b).await.unwrap();
+    let _ = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    )
+    .await;
+
+    // Attach with no sessionId reports the CURRENT (post-rotation) canonical id.
+    let attach = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":10,"method":"session/attach","params":{"historyPolicy":"none"}}"#,
+    )
+    .await;
+    assert_eq!(
+        attach["result"]["sessionId"],
+        serde_json::json!("sess-rotated"),
+        "attach must report the post-rotation canonical sessionId: {attach:?}",
+    );
+
+    // Attach explicitly requesting the current id is accepted (not 'not found').
+    let attach_current = ws_request(
+        &mut ws_b,
+        r#"{"jsonrpc":"2.0","id":11,"method":"session/attach","params":{"sessionId":"sess-rotated","historyPolicy":"none"}}"#,
+    )
+    .await;
+    assert!(
+        attach_current.get("result").is_some(),
+        "the current sessionId must be accepted, not rejected as not-found: {attach_current:?}",
+    );
+
+    let _ = ws_a.send(ClientMsg::Close(None)).await;
+    let _ = ws_b.send(ClientMsg::Close(None)).await;
+}
