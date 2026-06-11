@@ -134,6 +134,33 @@ proxy-local `session/attach` to receive a shaped snapshot/history:
 ws://127.0.0.1:8765/acp?room=demo&peer_id=desktop&replay=skip
 ```
 
+## Named Agents
+
+Instead of passing a raw `--agent-cmd`, register agents in a TOML config (shape
+mirrors Zed's `agent_servers`) and launch one by name:
+
+```toml
+# ~/.config/acp-mux/agents.toml   (override with --config <path>)
+[agents.claude]
+command = "npx"
+args = ["-y", "@agentclientprotocol/claude-agent-acp"]
+# env = { ANTHROPIC_API_KEY = "x" }        # optional; use a real value only in your private config
+
+[agents.gemini]
+command = "gemini"
+args = ["acp"]
+```
+
+```sh
+acp-mux --agent claude          # or: rooms --agent claude
+acp-mux --list-agents           # show configured agents
+```
+
+Default config path is `$XDG_CONFIG_HOME/acp-mux/agents.toml` (falling back to
+`~/.config/acp-mux/agents.toml`). `--agent` and `--agent-cmd` are mutually
+exclusive; `--agent-cmd` remains the raw escape hatch. A copyable example lives
+at [`docs/examples/agents.toml`](docs/examples/agents.toml).
+
 ## Tests
 
 ```sh

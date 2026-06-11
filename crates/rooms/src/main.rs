@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use acp_mux::agent_config;
 use anyhow::{Context, Result};
 use clap::Parser;
 use rooms::cli;
-use rooms::room::registry::{AgentCmd, RoomRegistry};
+use rooms::room::registry::RoomRegistry;
 use rooms::room::replay_store::ReplayStore;
 use rooms::server;
 use tracing_subscriber::EnvFilter;
@@ -13,18 +14,23 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     let cli = cli::Cli::parse();
 
+    if cli.list_agents {
+        print!("{}", agent_config::list_agents_text(cli.config.as_deref())?);
+        return Ok(());
+    }
+
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(cli.log_level.as_filter()));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let agent_cmd = cli
-        .agent_cmd
-        .as_deref()
-        .and_then(cli::split_agent_cmd)
-        .map(|(program, args)| AgentCmd { program, args });
+    let agent_cmd = agent_config::resolve_agent_cmd(
+        cli.agent.as_deref(),
+        cli.agent_cmd.as_deref(),
+        cli.config.as_deref(),
+    )?;
     if agent_cmd.is_none() {
         tracing::warn!(
-            "--agent-cmd not configured; subscriber attaches will be rejected with close 1011",
+            "no agent configured (--agent <name> or --agent-cmd <command>); subscriber attaches will be rejected with close 1011",
         );
     }
 

@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 
@@ -18,9 +19,25 @@ pub struct Cli {
     pub port: u16,
 
     /// Command (and args, whitespace-separated) used to spawn an agent
-    /// subprocess for each new `?mux=`.
+    /// subprocess for each new `?mux=`. The raw escape hatch; mutually
+    /// exclusive with `--agent`.
     #[arg(long)]
     pub agent_cmd: Option<String>,
+
+    /// Launch a named agent from the agent config file (see `--config`).
+    /// Mutually exclusive with `--agent-cmd`.
+    #[arg(long, value_name = "NAME")]
+    pub agent: Option<String>,
+
+    /// Path to the agent config file (TOML). Defaults to
+    /// `$XDG_CONFIG_HOME/acp-mux/agents.toml` (or
+    /// `~/.config/acp-mux/agents.toml`).
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// List the agents available in the config file and exit.
+    #[arg(long, default_value_t = false)]
+    pub list_agents: bool,
 
     /// Seconds to retain a mux after the last subscriber leaves before
     /// tearing down the subprocess.

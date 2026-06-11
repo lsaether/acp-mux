@@ -1,0 +1,26 @@
+# Example acp-mux / rooms agent config.
+#
+# Default location: $XDG_CONFIG_HOME/acp-mux/agents.toml
+#                   (or ~/.config/acp-mux/agents.toml)
+# Override with --config <path>.
+#
+# Launch a named agent with:  acp-mux --agent claude   (or: rooms --agent claude)
+# List configured agents with: acp-mux --list-agents
+#
+# Each [agents.<name>] mirrors Zed's agent_servers shape: command + args + env.
+# `env` is optional and is layered on top of the inherited process environment
+# (the spawned agent already sees your shell's variables), so use it for
+# per-agent overrides or additions.
+
+[agents.claude]
+command = "npx"
+args = ["-y", "@agentclientprotocol/claude-agent-acp"]
+# env = { ANTHROPIC_API_KEY = "x" }  # use a real value only in your private config
+
+# A globally-installed adapter binary instead of npx:
+[agents.claude-global]
+command = "claude-agent-acp"
+
+[agents.gemini]
+command = "gemini"
+args = ["acp"]

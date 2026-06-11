@@ -16,6 +16,15 @@
 
 ### Added
 
+- **Named agents via a config file.** Register ACP agents in a small TOML file
+  (`[agents.<name>]` with `command` / `args` / optional `env`, mirroring Zed's
+  `agent_servers`) and launch one by name: `acp-mux --agent claude` /
+  `rooms --agent claude`. Default config path is
+  `$XDG_CONFIG_HOME/acp-mux/agents.toml` (or `~/.config/acp-mux/agents.toml`);
+  override with `--config <path>`. `--list-agents` prints the configured
+  agents. `--agent` and the raw `--agent-cmd` escape hatch are mutually
+  exclusive. Per-agent `env` is layered on top of the inherited process
+  environment, so the agent also sees the parent shell's variables.
 - **Two-crate workspace: core mux vs Rooms layer.** The repo is now a Cargo
   workspace with a hard, compiler-enforced boundary:
   - `acp-mux` (lib `acp_mux`, binary `acp-mux`) — the standalone generic 1→N

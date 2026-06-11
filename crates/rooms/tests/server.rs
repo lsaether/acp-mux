@@ -29,6 +29,7 @@ async fn spawn_server_with_cat() -> (SocketAddr, Arc<RoomRegistry>) {
     spawn_server(Some(AgentCmd {
         program: "cat".into(),
         args: vec![],
+        env: Vec::new(),
     }))
     .await
 }
@@ -306,6 +307,7 @@ fn mock_agent_cmd() -> AgentCmd {
     AgentCmd {
         program: mock_acp_path(),
         args: vec![],
+        env: Vec::new(),
     }
 }
 
@@ -1013,6 +1015,7 @@ async fn meta_propagate_opt_in_adds_peer_trace_to_outbound_requests() {
         Some(AgentCmd {
             program: "cat".into(),
             args: vec![],
+            env: Vec::new(),
         }),
         true,
     )
@@ -1058,6 +1061,7 @@ async fn meta_propagate_prompt_includes_rooms_turn_id() {
         Some(AgentCmd {
             program: "cat".into(),
             args: vec![],
+            env: Vec::new(),
         }),
         true,
     )
@@ -1325,6 +1329,7 @@ fn mock_agent_cmd_with_env(env: &[(&str, &str)]) -> AgentCmd {
     AgentCmd {
         program: "/usr/bin/env".to_string(),
         args,
+        env: Vec::new(),
     }
 }
 
@@ -1555,6 +1560,7 @@ async fn agent_death_closes_subscribers_with_1011() {
     let agent_cmd = AgentCmd {
         program: "sleep".into(),
         args: vec!["0.4".into()],
+        env: Vec::new(),
     };
     let (addr, _) = spawn_server_with_ttl(Some(agent_cmd), Duration::from_secs(30)).await;
     let url = format!("ws://{addr}/acp?room=die&peer_id=A");

@@ -37,6 +37,7 @@ fn mock_agent_cmd() -> AgentCmd {
     AgentCmd {
         program: mock_acp_path(),
         args: vec![],
+        env: Vec::new(),
     }
 }
 
