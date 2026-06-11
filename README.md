@@ -144,7 +144,7 @@ mirrors Zed's `agent_servers`) and launch one by name:
 [agents.claude]
 command = "npx"
 args = ["-y", "@agentclientprotocol/claude-agent-acp"]
-# env = { ANTHROPIC_API_KEY = "sk-..." }   # optional; layered over the inherited env
+# env = { ANTHROPIC_API_KEY = "x" }        # optional; use a real value only in your private config
 
 [agents.gemini]
 command = "gemini"

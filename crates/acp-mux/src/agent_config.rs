@@ -12,7 +12,7 @@
 //! [agents.claude]
 //! command = "npx"
 //! args = ["-y", "@agentclientprotocol/claude-agent-acp"]
-//! env = { ANTHROPIC_API_KEY = "sk-..." }   # optional; layered over the inherited env
+//! env = { ANTHROPIC_API_KEY = "x" }        # optional; use a real value only in your private config
 //!
 //! [agents.gemini]
 //! command = "gemini"
@@ -173,7 +173,7 @@ mod tests {
 [agents.claude]
 command = "npx"
 args = ["-y", "@agentclientprotocol/claude-agent-acp"]
-env = { ANTHROPIC_API_KEY = "sk-test" }
+env = { ANTHROPIC_API_KEY = "x" }
 
 [agents.gemini]
 command = "gemini"
@@ -185,7 +185,7 @@ command = "gemini"
         let claude = config.agents.get("claude").expect("claude present");
         assert_eq!(claude.command, "npx");
         assert_eq!(claude.args, ["-y", "@agentclientprotocol/claude-agent-acp"]);
-        assert_eq!(claude.env.get("ANTHROPIC_API_KEY").unwrap(), "sk-test");
+        assert_eq!(claude.env.get("ANTHROPIC_API_KEY").unwrap(), "x");
         let gemini = config.agents.get("gemini").expect("gemini present");
         assert_eq!(gemini.command, "gemini");
         assert!(gemini.args.is_empty());
@@ -199,7 +199,7 @@ command = "gemini"
         assert_eq!(cmd.program, "npx");
         assert_eq!(
             cmd.env,
-            vec![("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())]
+            vec![("ANTHROPIC_API_KEY".to_string(), "x".to_string())]
         );
     }
 
@@ -249,7 +249,7 @@ bogus = true
         assert_eq!(cmd.program, "npx");
         assert_eq!(
             cmd.env,
-            vec![("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())]
+            vec![("ANTHROPIC_API_KEY".to_string(), "x".to_string())]
         );
         std::fs::remove_file(&path).ok();
     }
