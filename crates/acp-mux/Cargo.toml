@@ -2,6 +2,14 @@
 name = "acp-mux"
 version = "0.1.3"
 edition = "2024"
+rust-version = "1.87"
+description = "Provider-neutral WebSocket multiplexer for sharing one Agent Client Protocol (ACP) session across clients."
+license = "MIT"
+repository = "https://github.com/lsaether/acp-mux"
+homepage = "https://github.com/lsaether/acp-mux"
+readme = "README.md"
+keywords = ["acp", "agent", "multiplexer", "websocket", "proxy"]
+categories = ["command-line-utilities", "web-programming::websocket"]
 
 [lib]
 name = "acp_mux"
