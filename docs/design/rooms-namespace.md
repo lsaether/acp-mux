@@ -350,7 +350,7 @@ Queues text behind the active turn, or submits it immediately if idle. The queue
 
 ### `rooms/unqueue_prompt`
 
-Removes a still-pending queued item.
+Removes a still-pending queued item. If the requested `queueItemId` no longer exists, the mux returns JSON-RPC `-32004` (`queue item not found`) so clients can distinguish stale queue state from malformed params.
 
 ```json
 {"jsonrpc":"2.0","id":13,"method":"rooms/unqueue_prompt","params":{"queueItemId":"aq-3"}}
