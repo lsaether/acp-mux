@@ -20,6 +20,11 @@ This crate intentionally contains no TUI, Tauri, webview, or terminal concerns. 
   - `rooms/steer_active_turn`
   - `rooms/cancel_active_turn`
   - `rooms/unqueue_prompt`
+- WebSocket transport that:
+  - connects to `build_attach_url(config)`;
+  - sends `initialize` then `session/attach` bootstrap frames;
+  - streams JSON-RPC frames through typed inbound messages with parsed `Event` values where available;
+  - exposes a typed outbound command channel for JSON frame sends and shutdown.
 - Event parser for key `rooms/*` lifecycle frames and actionable `session/request_permission`.
 
 ## Intended consumers
@@ -34,10 +39,9 @@ A Tauri app can either use browser-native WebSocket from the webview or call int
 
 ## Next slice
 
-Add websocket transport behind this crate, not inside `rooms-tui`:
+Add a UI-neutral room state reducer behind this crate, not inside `rooms-tui`:
 
-1. connect to `build_attach_url(config)`;
-2. send `protocol::build_initialize`;
-3. send `protocol::build_attach`;
-4. stream frames through `events::event_from_value`;
-5. expose a UI-neutral command API for prompt, queue, steer, cancel, and permission replies.
+1. fold attach snapshots, streamed replay, and live frames into one `RoomState`;
+2. track connection status, session id, peers, transcript items, active turn, queue, pending permissions, and debug/errors;
+3. keep reducer output reusable by both `rooms-tui` and a future Tauri client;
+4. expose higher-level command helpers for prompt, queue, steer, cancel, unqueue, and permission replies on top of the outbound channel.
