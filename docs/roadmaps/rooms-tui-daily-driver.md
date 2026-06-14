@@ -22,10 +22,18 @@ Add the core operator controls needed during daily use: submit a prompt when idl
 
 Make `session/request_permission` a first-class TUI surface. Show pending permission requests with enough detail to make a decision, support keyboard selection for allow/deny/custom option ids, send exactly one reply, and remove or mark the request once resolved. This is required before the client can safely replace ad-hoc debugging clients for real agent work.
 
-## 6. `feat: add reconnect, replay recovery, and daily-driver smoke`
+## 6. `feat: add reconnect and replay recovery`
 
-Handle practical failure modes: server restart, laptop sleep, broken websocket, peer-id collision, wrong port, and wrong endpoint. Reconnect should re-run attach/replay, fold history without duplicating visible state, and produce actionable errors. Add an end-to-end smoke harness that starts a Rooms server/mock agent, attaches the client, sends a prompt/control, observes state changes, and exits cleanly.
+Handle practical failure modes: server restart, laptop sleep, broken websocket, peer-id collision, wrong port, and wrong endpoint. Reconnect should re-run attach/replay, fold history without duplicating visible state, and produce actionable errors. This is the last implementation feature before a manual daily-driver pass.
+
+## Manual gate after feat 6
+
+After the first six feats land, pause automated roadmap work and manually test the TUI in real use: attach to a room, submit prompts, queue/steer/cancel while busy, answer permissions, restart the server, and confirm reconnect/replay behavior feels correct. Use the manual findings to tighten the final testing harness instead of guessing the test shape too early.
+
+## 7. `test: add daily-driver smoke and regression harness`
+
+After manual validation, add the durable automated test layer. The harness should start a local `rooms` server with a mock agent, attach through `rooms-client`, drive prompt/control/permission/reconnect flows, observe reducer state changes, and exit cleanly. Keep this as the regression suite for the behaviors proven manually in the first six feats.
 
 ## Acceptance for daily-driver readiness
 
-`rooms-tui` is daily-driver ready when one terminal can attach to an existing room, show transcript/queue/permissions, send all core controls, survive reconnect/replay, and pass both unit tests and an end-to-end smoke against the local `rooms` server.
+`rooms-tui` is daily-driver ready when one terminal can attach to an existing room, show transcript/queue/permissions, send all core controls, survive reconnect/replay, pass the manual gate after feat 6, and pass both unit tests and the final daily-driver smoke harness.
