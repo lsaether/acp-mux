@@ -25,6 +25,7 @@ This crate intentionally contains no TUI, Tauri, webview, or terminal concerns. 
   - sends `initialize` then `session/attach` bootstrap frames;
   - streams JSON-RPC frames through typed inbound messages with parsed `Event` values where available;
   - exposes a typed outbound command channel for JSON frame sends and shutdown.
+- Room state reducer that folds attach snapshots, replay/live frames, roster, transcript, active turn, queue, permissions, debug frames, and transport errors into a UI-neutral `RoomState`.
 - Event parser for key `rooms/*` lifecycle frames and actionable `session/request_permission`.
 
 ## Intended consumers
@@ -39,9 +40,9 @@ A Tauri app can either use browser-native WebSocket from the webview or call int
 
 ## Next slice
 
-Add a UI-neutral room state reducer behind this crate, not inside `rooms-tui`:
+Wire the shared transport and reducer into `rooms-tui`, not new room semantics:
 
-1. fold attach snapshots, streamed replay, and live frames into one `RoomState`;
-2. track connection status, session id, peers, transcript items, active turn, queue, pending permissions, and debug/errors;
-3. keep reducer output reusable by both `rooms-tui` and a future Tauri client;
-4. expose higher-level command helpers for prompt, queue, steer, cancel, unqueue, and permission replies on top of the outbound channel.
+1. connect to the attach URL from the TUI loop;
+2. feed `InboundMessage` values into `RoomState`;
+3. replace the scaffold status pane with connection/bootstrap progress and reducer snapshots;
+4. render transcript, roster, queue, and permission summaries from reducer output.

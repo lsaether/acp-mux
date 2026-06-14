@@ -6,11 +6,12 @@ This crate is the Rust home for the earlier `vibe-textual` room-client experimen
 
 ## Current status
 
-Kickoff scaffold plus reusable client transport:
+Kickoff scaffold plus reusable client transport/state:
 
 - CLI parser for a room-native terminal peer
 - reusable client core imported from `rooms-client`
 - `rooms-client` WebSocket transport for `initialize` → `session/attach` bootstrap and typed inbound/outbound channels
+- `rooms-client` UI-neutral `RoomState` reducer for roster, transcript, active turn, queue, permissions, replay/debug/errors
 - minimal ratatui shell with `q` / `Esc` exit
 
 Shared non-UI logic lives in `../rooms-client` so a future Tauri app can reuse the same attach URL, protocol builders, event parser, websocket transport, and reducer.
@@ -46,9 +47,9 @@ cargo run -p rooms-tui -- \
 
 ## Next slice
 
-Wire the new `rooms-client` transport into this TUI, then render reducer state:
+Wire the shared `rooms-client` transport and reducer into this TUI:
 
-1. build the UI-neutral `RoomState` reducer in `rooms-client`;
-2. fold `rooms/replay_started` → replay frames → `rooms/replay_complete` plus live frames into the reducer;
+1. connect to the attach URL from the TUI loop;
+2. feed `InboundMessage` values into `RoomState`;
 3. replace the scaffold status pane with connection/bootstrap progress and reducer snapshots;
-4. render transcript, roster, queue, and permission affordances.
+4. render transcript, roster, queue, and permission summaries.
