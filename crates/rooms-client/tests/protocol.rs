@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use rooms_tui::protocol::{
+use rooms_client::protocol::{
     build_attach, build_cancel_active_turn, build_initialize, build_queue_prompt,
     build_session_prompt, build_steer_active_turn, build_unqueue_prompt,
 };

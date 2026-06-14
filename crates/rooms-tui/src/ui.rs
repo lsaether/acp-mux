@@ -11,8 +11,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{Frame, Stylize};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-
-use crate::cli::AttachConfig;
+use rooms_client::AttachConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiModel {

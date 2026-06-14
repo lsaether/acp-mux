@@ -1,4 +1,4 @@
-use rooms_tui::cli::AttachConfig;
+use rooms_client::AttachConfig;
 use rooms_tui::ui::UiModel;
 
 #[test]

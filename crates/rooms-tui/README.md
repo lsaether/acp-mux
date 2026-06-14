@@ -2,16 +2,17 @@
 
 Rust terminal client for the `acp-mux` Rooms collaboration layer.
 
-This crate is the Rust home for the earlier `vibe-textual` room-client experiment. It speaks the current `rooms/*` namespace and `_meta.rooms` attach metadata; do not port old `amux/*` frames literally.
+This crate is the Rust home for the earlier `vibe-textual` room-client experiment. It speaks the current `rooms/*` namespace and `_meta.rooms` attach metadata through the reusable `rooms-client` crate; do not port old `amux/*` frames literally.
 
 ## Current status
 
 Kickoff scaffold:
 
-- CLI attach URL builder (`room=`, `peer_id=`, `peer_name=`, `replay=skip`)
-- protocol builders for `initialize`, `session/attach`, `session/prompt`, and Rooms controls
-- event parser for key `rooms/*` lifecycle frames and actionable `session/request_permission`
+- CLI parser for a room-native terminal peer
+- reusable client core imported from `rooms-client`
 - minimal ratatui shell with `q` / `Esc` exit
+
+Shared non-UI logic lives in `../rooms-client` so a future Tauri app can reuse the same attach URL, protocol builders, event parser, websocket transport, and reducer.
 
 ## Run
 
@@ -44,7 +45,7 @@ cargo run -p rooms-tui -- \
 
 ## Next slice
 
-Wire websocket transport and bootstrap:
+Wire websocket transport in `rooms-client`, then render it in this TUI:
 
 1. connect to the attach URL;
 2. send `initialize`;

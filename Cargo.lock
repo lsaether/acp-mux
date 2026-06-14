@@ -1702,14 +1702,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rooms-client"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "rooms-tui"
 version = "0.1.0"
 dependencies = [
  "clap",
  "crossterm",
  "ratatui",
- "serde_json",
- "url",
+ "rooms-client",
 ]
 
 [[package]]

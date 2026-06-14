@@ -1,0 +1,12 @@
+[package]
+name = "rooms-client"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rooms_client"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = "1.0.149"
+url = "2.5.8"

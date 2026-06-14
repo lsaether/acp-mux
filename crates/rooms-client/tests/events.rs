@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use rooms_tui::events::{Event, event_from_value};
+use rooms_client::{Event, event_from_value};
 
 #[test]
 fn parses_rooms_turn_started_into_attributed_text_event() {

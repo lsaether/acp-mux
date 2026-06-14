@@ -3,30 +3,34 @@
 `acp-mux` is a Rust workspace for running one stdio ACP agent behind a
 WebSocket multiplexer.
 
-It contains three binaries:
+It contains three binaries and one reusable client crate:
 
 - `acp-mux`: the provider-neutral core mux.
 - `rooms`: the Rooms collaboration layer built on top of the core mux.
-- `rooms-tui`: the Rust terminal client for Rooms.
+- `rooms-client`: reusable Rust client core for Rooms UIs, including future Tauri apps.
+- `rooms-tui`: the Rust terminal client for Rooms, built on `rooms-client`.
 
 The split is intentional. The core knows how to multiplex JSON-RPC ACP traffic.
 Rooms adds room UX such as peers, turn lifecycle, queueing, segment lineage, and
-streamed replay markers. `rooms-tui` consumes that Rooms surface as a room-native
-client instead of trying to make generic ACP clients infer multiplayer state.
+streamed replay markers. `rooms-client` is the shared Rust client core for those
+room-native semantics; `rooms-tui` consumes it instead of trying to make generic
+ACP clients infer multiplayer state.
 
 ## Workspace Layout
 
 ```text
-crates/acp-mux/   core ACP mux library and `acp-mux` binary
-crates/rooms/      Rooms collaboration extension and `rooms` binary
-crates/rooms-tui/  Rust room-native terminal client
-docs/             protocol and design notes
+crates/acp-mux/       core ACP mux library and `acp-mux` binary
+crates/rooms/         Rooms collaboration extension and `rooms` binary
+crates/rooms-client/  shared Rust client core for Rooms UIs
+crates/rooms-tui/     Rust room-native terminal client
+docs/                 protocol and design notes
 ```
 
 Use the crate READMEs for exact behavior:
 
 - [crates/acp-mux/README.md](crates/acp-mux/README.md) describes the core mux.
 - [crates/rooms/README.md](crates/rooms/README.md) describes the Rooms layer.
+- [crates/rooms-client/README.md](crates/rooms-client/README.md) describes the reusable Rust client core for TUI/Tauri clients.
 - [crates/rooms-tui/README.md](crates/rooms-tui/README.md) describes the room-native terminal client.
 
 ## What The Core Does

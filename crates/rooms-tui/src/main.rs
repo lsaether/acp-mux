@@ -1,5 +1,6 @@
 use clap::Parser;
-use rooms_tui::cli::{Args, build_attach_url};
+use rooms_client::build_attach_url;
+use rooms_tui::cli::Args;
 use rooms_tui::ui::{UiModel, run_tui};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
