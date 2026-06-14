@@ -3,20 +3,23 @@
 `acp-mux` is a Rust workspace for running one stdio ACP agent behind a
 WebSocket multiplexer.
 
-It contains two binaries:
+It contains three binaries:
 
 - `acp-mux`: the provider-neutral core mux.
 - `rooms`: the Rooms collaboration layer built on top of the core mux.
+- `rooms-tui`: the Rust terminal client for Rooms.
 
 The split is intentional. The core knows how to multiplex JSON-RPC ACP traffic.
 Rooms adds room UX such as peers, turn lifecycle, queueing, segment lineage, and
-streamed replay markers.
+streamed replay markers. `rooms-tui` consumes that Rooms surface as a room-native
+client instead of trying to make generic ACP clients infer multiplayer state.
 
 ## Workspace Layout
 
 ```text
 crates/acp-mux/   core ACP mux library and `acp-mux` binary
 crates/rooms/      Rooms collaboration extension and `rooms` binary
+crates/rooms-tui/  Rust room-native terminal client
 docs/             protocol and design notes
 ```
 
@@ -24,6 +27,7 @@ Use the crate READMEs for exact behavior:
 
 - [crates/acp-mux/README.md](crates/acp-mux/README.md) describes the core mux.
 - [crates/rooms/README.md](crates/rooms/README.md) describes the Rooms layer.
+- [crates/rooms-tui/README.md](crates/rooms-tui/README.md) describes the room-native terminal client.
 
 ## What The Core Does
 
@@ -86,6 +90,7 @@ Binaries:
 ```text
 target/debug/acp-mux
 target/debug/rooms
+target/debug/rooms-tui
 ```
 
 Release build:
