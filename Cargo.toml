@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/acp-mux", "crates/rooms"]
+members = ["crates/acp-mux", "crates/rooms", "crates/rooms-client", "crates/rooms-tui"]
 resolver = "3"
