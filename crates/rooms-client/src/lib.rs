@@ -10,4 +10,6 @@ pub use state::{
     ActiveTurn, ConnectionStatus, DebugFrame, Peer, PermissionRequest, QueueItem, QueueItemStatus,
     ReplayStatus, RoomState, TranscriptItem, TranscriptKind,
 };
-pub use transport::{ClientCommand, InboundMessage, Transport, TransportError, connect};
+pub use transport::{
+    ClientCommand, InboundMessage, Transport, TransportError, connect, connect_error_hint,
+};

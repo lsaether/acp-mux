@@ -264,6 +264,177 @@ fn resolved_events_remove_only_exact_typed_permission_id() {
 }
 
 #[test]
+fn reattach_history_does_not_duplicate_visible_transcript_items() {
+    let mut state = RoomState::default();
+
+    state
+        .apply_frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "rooms/turn_started",
+            "params": {
+                "roomId": "demo",
+                "roomsTurnId": "turn-1",
+                "peerId": "desktop",
+                "peerName": "Desktop",
+                "content": [{ "type": "text", "text": "already visible" }]
+            }
+        }))
+        .unwrap();
+    state
+        .apply_frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-1",
+                "update": {
+                    "kind": "agent_message_chunk",
+                    "content": { "type": "text", "text": "already streamed" }
+                }
+            }
+        }))
+        .unwrap();
+
+    state
+        .apply_frame(&json!({
+            "jsonrpc": "2.0",
+            "id": "rooms-client.attach",
+            "result": {
+                "sessionId": "sess-1",
+                "history": [
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "rooms/turn_started",
+                        "params": {
+                            "roomId": "demo",
+                            "roomsTurnId": "turn-1",
+                            "peerId": "desktop",
+                            "peerName": "Desktop",
+                            "content": [{ "type": "text", "text": "already visible" }]
+                        }
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": "sess-1",
+                            "update": {
+                                "kind": "agent_message_chunk",
+                                "content": { "type": "text", "text": "already streamed" }
+                            }
+                        }
+                    }
+                ],
+                "_meta": {
+                    "rooms": {
+                        "snapshot": {
+                            "roomId": "demo",
+                            "connectedClients": [{ "clientId": "desktop", "name": "Desktop" }],
+                            "selfPeer": { "clientId": "desktop", "name": "Desktop" },
+                            "activeTurn": null,
+                            "queue": [],
+                            "pendingPermissions": []
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+    assert_eq!(state.connection_status, ConnectionStatus::Attached);
+    assert_eq!(state.transcript.len(), 2);
+    assert_eq!(
+        state
+            .transcript
+            .iter()
+            .filter(|item| item.text == "already visible")
+            .count(),
+        1
+    );
+    assert_eq!(
+        state
+            .transcript
+            .iter()
+            .filter(|item| item.text == "already streamed")
+            .count(),
+        1
+    );
+    assert!(
+        !state.transcript[0].replayed,
+        "live transcript row should win over replay duplicates"
+    );
+}
+
+#[test]
+fn repeated_live_session_updates_with_same_text_remain_visible() {
+    let mut state = RoomState::default();
+
+    for _ in 0..2 {
+        state
+            .apply_frame(&json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "sess-1",
+                    "update": {
+                        "kind": "agent_message_chunk",
+                        "content": { "type": "text", "text": "ok" }
+                    }
+                }
+            }))
+            .unwrap();
+    }
+
+    assert_eq!(state.transcript.len(), 2);
+    assert!(state.transcript.iter().all(|item| !item.replayed));
+}
+
+#[test]
+fn repeated_replayed_session_updates_use_replay_seq_to_avoid_data_loss() {
+    let mut state = RoomState::default();
+
+    state
+        .apply_frame(&json!({
+            "jsonrpc": "2.0",
+            "id": "rooms-client.attach",
+            "result": {
+                "sessionId": "sess-1",
+                "history": [
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": "sess-1",
+                            "update": {
+                                "kind": "agent_message_chunk",
+                                "content": { "type": "text", "text": "ok" }
+                            },
+                            "_meta": { "rooms": { "replaySeq": 10 } }
+                        }
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": "sess-1",
+                            "update": {
+                                "kind": "agent_message_chunk",
+                                "content": { "type": "text", "text": "ok" }
+                            },
+                            "_meta": { "rooms": { "replaySeq": 11 } }
+                        }
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+
+    assert_eq!(state.transcript.len(), 2);
+    assert!(state.transcript.iter().all(|item| item.replayed));
+    assert_eq!(state.transcript[0].replay_seq, Some(10));
+    assert_eq!(state.transcript[1].replay_seq, Some(11));
+}
+
+#[test]
 fn streamed_replay_marks_frames_replayed_and_does_not_replace_snapshot_state() {
     let mut state = RoomState::default();
     state

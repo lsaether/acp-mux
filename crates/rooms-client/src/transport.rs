@@ -4,6 +4,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use url::Url;
 
 use crate::connection::{AttachConfig, build_attach_url};
 use crate::events::{Event, event_from_value};
@@ -34,6 +37,48 @@ pub enum InboundMessage {
     Closed,
 }
 
+pub fn connect_error_hint(error: &str, attach_url: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    let endpoint = endpoint_summary(attach_url);
+    let peer_id = peer_id_from_url(attach_url).unwrap_or_else(|| "this peer".to_string());
+
+    if lower.contains("peer_id")
+        || lower.contains("peer-id")
+        || lower.contains("peer id")
+        || lower.contains("4409")
+        || lower.contains("409 conflict")
+    {
+        return format!(
+            "peer-id collision for {peer_id}; choose a different --peer-id or close the existing client before reconnecting ({error})"
+        );
+    }
+
+    if lower.contains("404") || lower.contains("not found") {
+        return format!(
+            "wrong endpoint {endpoint}; rooms-tui expects the websocket attach path /acp on the rooms server ({error})"
+        );
+    }
+
+    if lower.contains("connection refused")
+        || lower.contains("os error 111")
+        || lower.contains("failed to connect")
+    {
+        return format!(
+            "could not reach rooms server at {endpoint}; start the rooms server or check the --url host/port ({error})"
+        );
+    }
+
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return format!(
+            "websocket attach timed out at {endpoint}; check sleep/network recovery, server availability, and the --url port ({error})"
+        );
+    }
+
+    format!(
+        "websocket attach failed at {endpoint}; check rooms server availability, the --url port, and the /acp endpoint ({error})"
+    )
+}
+
 pub struct Transport {
     pub inbound: mpsc::Receiver<InboundMessage>,
     pub outbound: mpsc::Sender<ClientCommand>,
@@ -59,6 +104,7 @@ pub async fn connect(config: AttachConfig) -> Result<Transport, TransportError> 
     let (mut write, mut read) = ws.split();
     let (inbound_tx, inbound_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
     let (outbound_tx, mut outbound_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
+    let task_attach_url = attach_url.clone();
 
     let task = tokio::spawn(async move {
         loop {
@@ -91,7 +137,12 @@ pub async fn connect(config: AttachConfig) -> Result<Transport, TransportError> 
                                 }
                             }
                         }
-                        Some(Ok(Message::Close(_))) => {
+                        Some(Ok(Message::Close(frame))) => {
+                            if let Some(frame) = frame
+                                && let Some(hint) = close_frame_hint(&frame, &task_attach_url)
+                            {
+                                let _ = inbound_tx.send(InboundMessage::Error(hint)).await;
+                            }
                             let _ = inbound_tx.send(InboundMessage::Closed).await;
                             return Ok(());
                         }
@@ -142,4 +193,33 @@ async fn parse_optional_event(
             None
         }
     }
+}
+
+fn close_frame_hint(frame: &CloseFrame, attach_url: &str) -> Option<String> {
+    if matches!(frame.code, CloseCode::Normal | CloseCode::Away) && frame.reason.is_empty() {
+        return None;
+    }
+    Some(connect_error_hint(
+        &format!("websocket closed: {:?}: {}", frame.code, frame.reason),
+        attach_url,
+    ))
+}
+
+fn endpoint_summary(attach_url: &str) -> String {
+    let Ok(url) = Url::parse(attach_url) else {
+        return attach_url.to_string();
+    };
+    let host = url.host_str().unwrap_or("<unknown-host>");
+    let host_port = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    format!("{}{}", host_port, url.path())
+}
+
+fn peer_id_from_url(attach_url: &str) -> Option<String> {
+    let url = Url::parse(attach_url).ok()?;
+    url.query_pairs()
+        .find(|(key, _)| key == "peer_id")
+        .map(|(_, value)| value.into_owned())
 }

@@ -1,5 +1,7 @@
+use std::time::Duration;
+
 use rooms_client::{AttachConfig, ConnectionStatus, InboundMessage, TranscriptKind};
-use rooms_tui::ui::UiModel;
+use rooms_tui::ui::{ReconnectPolicy, UiModel};
 use serde_json::json;
 
 fn model() -> UiModel {
@@ -141,4 +143,40 @@ fn transport_errors_are_visible_without_losing_prior_event_context() {
             .snapshot_text()
             .contains("errors: websocket error: refused")
     );
+}
+
+#[test]
+fn reconnect_policy_backs_off_and_model_surfaces_retry_state() {
+    let policy = ReconnectPolicy::new(
+        Duration::from_millis(100),
+        Duration::from_millis(500),
+        Duration::from_secs(2),
+    );
+
+    assert_eq!(policy.delay_for_attempt(1), Duration::from_millis(100));
+    assert_eq!(policy.delay_for_attempt(2), Duration::from_millis(200));
+    assert_eq!(policy.delay_for_attempt(4), Duration::from_millis(500));
+    assert_eq!(policy.connect_timeout(), Duration::from_secs(2));
+
+    let mut model = model();
+    model.mark_reconnecting(
+        "websocket closed: laptop slept or server restarted",
+        2,
+        policy.delay_for_attempt(2),
+    );
+
+    assert_eq!(
+        model.state().connection_status,
+        ConnectionStatus::Reconnecting
+    );
+    assert!(
+        model
+            .event_log()
+            .last()
+            .unwrap()
+            .contains("reconnect attempt 2 in 200ms")
+    );
+    let snapshot = model.snapshot_text();
+    assert!(snapshot.contains("status: Reconnecting"));
+    assert!(snapshot.contains("websocket closed: laptop slept or server restarted"));
 }

@@ -2,13 +2,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use rooms_client::transport::{ClientCommand, InboundMessage, connect};
+use rooms_client::transport::{ClientCommand, InboundMessage, connect, connect_error_hint};
 use rooms_client::{AttachConfig, Event};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 #[tokio::test]
 #[allow(clippy::result_large_err)]
@@ -210,6 +212,77 @@ async fn outbound_channel_drop_closes_the_websocket_task() {
 
     task.await.unwrap().unwrap();
     assert!(close_rx.await.unwrap());
+    server.await.unwrap();
+}
+
+#[test]
+fn connect_error_hints_are_actionable_for_common_operator_mistakes() {
+    let wrong_port = connect_error_hint(
+        "IO error: Connection refused (os error 111)",
+        "ws://127.0.0.1:8765/acp?room=demo&peer_id=desktop&replay=skip",
+    );
+    assert!(wrong_port.contains("rooms server"));
+    assert!(wrong_port.contains("127.0.0.1:8765"));
+
+    let wrong_endpoint = connect_error_hint(
+        "HTTP error: 404 Not Found",
+        "ws://127.0.0.1:8765/wrong?room=demo&peer_id=desktop&replay=skip",
+    );
+    assert!(wrong_endpoint.contains("wrong endpoint"));
+    assert!(wrong_endpoint.contains("/acp"));
+
+    let peer_collision = connect_error_hint(
+        "HTTP error: 409 Conflict: peer_id already connected",
+        "ws://127.0.0.1:8765/acp?room=demo&peer_id=desktop&replay=skip",
+    );
+    assert!(peer_collision.contains("peer-id collision"));
+    assert!(peer_collision.contains("desktop"));
+}
+
+#[tokio::test]
+async fn peer_id_collision_close_is_reported_as_actionable_error() {
+    let (listener, addr) = server_listener().await;
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+        let _initialize = read_json(&mut ws).await;
+        let _attach = read_json(&mut ws).await;
+        ws.send(Message::Close(Some(CloseFrame {
+            code: CloseCode::Library(4409),
+            reason: "already connected".into(),
+        })))
+        .await
+        .unwrap();
+    });
+
+    let mut transport = connect(AttachConfig {
+        url: format!("ws://{addr}/acp"),
+        room: "demo".into(),
+        peer_id: "desktop".into(),
+        peer_name: None,
+    })
+    .await
+    .unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(2), transport.inbound.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        error,
+        InboundMessage::Error(ref message)
+            if message.contains("peer-id collision") && message.contains("desktop")
+    ));
+
+    let closed = tokio::time::timeout(Duration::from_secs(2), transport.inbound.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(closed, InboundMessage::Closed);
+
+    transport.task.await.unwrap().unwrap();
     server.await.unwrap();
 }
 

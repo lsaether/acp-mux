@@ -1,5 +1,5 @@
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -17,13 +17,50 @@ use rooms_client::protocol::{
 };
 use rooms_client::{
     AttachConfig, ClientCommand, ConnectionStatus, InboundMessage, PermissionRequest,
-    QueueItemStatus, RoomState, Transport, connect,
+    QueueItemStatus, RoomState, Transport, connect, connect_error_hint,
 };
 use serde_json::Value;
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc::error::TryRecvError;
 
 const EVENT_LOG_LIMIT: usize = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconnectPolicy {
+    initial_delay: Duration,
+    max_delay: Duration,
+    connect_timeout: Duration,
+}
+
+impl ReconnectPolicy {
+    pub fn new(initial_delay: Duration, max_delay: Duration, connect_timeout: Duration) -> Self {
+        Self {
+            initial_delay,
+            max_delay,
+            connect_timeout,
+        }
+    }
+
+    pub fn daily_driver() -> Self {
+        Self::new(
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+    }
+
+    pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
+        let mut delay = self.initial_delay;
+        for _ in 1..attempt.max(1) {
+            delay = (delay * 2).min(self.max_delay);
+        }
+        delay
+    }
+
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiModel {
@@ -31,6 +68,7 @@ pub struct UiModel {
     attach_url: String,
     state: RoomState,
     event_log: Vec<String>,
+    reconnect_message: Option<String>,
     draft: String,
     selected_queue: usize,
     selected_permission: usize,
@@ -45,6 +83,7 @@ impl UiModel {
             attach_url,
             state: RoomState::default(),
             event_log: vec!["boot: rooms-tui ready".to_string()],
+            reconnect_message: None,
             draft: String::new(),
             selected_queue: 0,
             selected_permission: 0,
@@ -262,11 +301,31 @@ impl UiModel {
         self.push_event(format!("status: {status:?}"));
     }
 
+    pub fn mark_reconnecting(&mut self, reason: impl Into<String>, attempt: u32, delay: Duration) {
+        let reason = reason.into();
+        let message = format!(
+            "reconnect attempt {attempt} in {}ms: {reason}",
+            delay.as_millis()
+        );
+        self.state
+            .set_connection_status(ConnectionStatus::Reconnecting);
+        self.reconnect_message = Some(message.clone());
+        self.push_event(format!("transport: {message}"));
+    }
+
     pub fn apply_inbound(&mut self, message: InboundMessage) -> Result<(), String> {
         let summary = inbound_summary(&message);
         match self.state.apply_inbound(&message) {
             Ok(()) => {
                 self.clamp_selections();
+                if matches!(
+                    self.state.connection_status,
+                    ConnectionStatus::Attached
+                        | ConnectionStatus::Replaying
+                        | ConnectionStatus::Live
+                ) {
+                    self.reconnect_message = None;
+                }
                 self.push_event(summary);
                 Ok(())
             }
@@ -301,6 +360,9 @@ impl UiModel {
             format!("permissions: {}", permissions_text(self)),
         ];
 
+        if let Some(message) = &self.reconnect_message {
+            lines.push(format!("reconnect: {message}"));
+        }
         if let Some(replay) = &self.state.replay {
             lines.push(format!(
                 "replay: {} {} frames gen {}",
@@ -513,16 +575,7 @@ pub fn run_tui(mut model: UiModel) -> io::Result<()> {
         .map_err(io::Error::other)?;
 
     model.set_connection_status(ConnectionStatus::Connecting);
-    let mut transport = match runtime.block_on(connect(model.attach_config.clone())) {
-        Ok(transport) => {
-            model.push_event("transport: websocket connected");
-            Some(transport)
-        }
-        Err(err) => {
-            let _ = model.apply_inbound(InboundMessage::Error(err.to_string()));
-            None
-        }
-    };
+    let mut transport = None;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -530,7 +583,7 @@ pub fn run_tui(mut model: UiModel) -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &mut model, &mut transport);
+    let result = run_loop(&runtime, &mut terminal, &mut model, &mut transport);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -551,12 +604,27 @@ pub fn run_tui(mut model: UiModel) -> io::Result<()> {
 }
 
 fn run_loop(
+    runtime: &Runtime,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     model: &mut UiModel,
     transport: &mut Option<Transport>,
 ) -> io::Result<()> {
+    let policy = ReconnectPolicy::daily_driver();
+    let mut reconnect_attempts = 0;
+    let mut next_reconnect_at = Some(Instant::now());
+
     loop {
-        drain_transport(model, transport);
+        if drain_transport(runtime, model, transport) {
+            next_reconnect_at = Some(Instant::now());
+        }
+        reconnect_if_due(
+            runtime,
+            model,
+            transport,
+            policy,
+            &mut reconnect_attempts,
+            &mut next_reconnect_at,
+        );
         terminal.draw(|frame| render_scaffold(frame, model))?;
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
@@ -596,13 +664,18 @@ fn send_command(transport: &Option<Transport>, command: ClientCommand, model: &m
     }
 }
 
-fn drain_transport(model: &mut UiModel, transport: &mut Option<Transport>) {
-    let Some(transport) = transport else {
-        return;
+fn drain_transport(
+    runtime: &Runtime,
+    model: &mut UiModel,
+    transport: &mut Option<Transport>,
+) -> bool {
+    let Some(current_transport) = transport else {
+        return false;
     };
 
+    let mut disconnected = false;
     loop {
-        match transport.inbound.try_recv() {
+        match current_transport.inbound.try_recv() {
             Ok(message) => {
                 let _ = model.apply_inbound(message);
             }
@@ -610,14 +683,112 @@ fn drain_transport(model: &mut UiModel, transport: &mut Option<Transport>) {
             Err(TryRecvError::Disconnected) => {
                 if !matches!(
                     model.state.connection_status,
-                    ConnectionStatus::Closed | ConnectionStatus::Error
+                    ConnectionStatus::Closed
+                        | ConnectionStatus::Error
+                        | ConnectionStatus::Reconnecting
                 ) {
                     let _ = model.apply_inbound(InboundMessage::Closed);
                 }
+                disconnected = true;
                 break;
             }
         }
     }
+
+    if disconnected && let Some(finished_transport) = transport.take() {
+        let _ = runtime.block_on(finished_transport.task);
+    }
+
+    disconnected
+}
+
+fn reconnect_if_due(
+    runtime: &Runtime,
+    model: &mut UiModel,
+    transport: &mut Option<Transport>,
+    policy: ReconnectPolicy,
+    reconnect_attempts: &mut u32,
+    next_reconnect_at: &mut Option<Instant>,
+) {
+    if transport.is_some() {
+        return;
+    }
+
+    let Some(due_at) = *next_reconnect_at else {
+        return;
+    };
+    if Instant::now() < due_at {
+        return;
+    }
+
+    *reconnect_attempts += 1;
+    model
+        .state
+        .set_connection_status(ConnectionStatus::Connecting);
+    model.push_event(format!(
+        "transport: reconnect attempt {}",
+        *reconnect_attempts
+    ));
+
+    let connect_result = runtime.block_on(async {
+        tokio::time::timeout(
+            policy.connect_timeout(),
+            connect(model.attach_config.clone()),
+        )
+        .await
+    });
+
+    match connect_result {
+        Ok(Ok(new_transport)) => {
+            let attempt = *reconnect_attempts;
+            *transport = Some(new_transport);
+            *reconnect_attempts = 0;
+            *next_reconnect_at = None;
+            model.reconnect_message = None;
+            if attempt <= 1 {
+                model.push_event("transport: websocket connected");
+            } else {
+                model.push_event(format!(
+                    "transport: websocket reconnected on attempt {attempt}"
+                ));
+            }
+        }
+        Ok(Err(err)) => {
+            schedule_reconnect(
+                model,
+                policy,
+                *reconnect_attempts + 1,
+                next_reconnect_at,
+                err.to_string(),
+            );
+        }
+        Err(_) => {
+            schedule_reconnect(
+                model,
+                policy,
+                *reconnect_attempts + 1,
+                next_reconnect_at,
+                format!(
+                    "connect timed out after {}ms",
+                    policy.connect_timeout().as_millis()
+                ),
+            );
+        }
+    }
+}
+
+fn schedule_reconnect(
+    model: &mut UiModel,
+    policy: ReconnectPolicy,
+    next_attempt: u32,
+    next_reconnect_at: &mut Option<Instant>,
+    reason: String,
+) {
+    let delay = policy.delay_for_attempt(next_attempt);
+    let hint = connect_error_hint(&reason, model.attach_url());
+    model.state.errors.push(hint.clone());
+    model.mark_reconnecting(hint, next_attempt, delay);
+    *next_reconnect_at = Some(Instant::now() + delay);
 }
 
 pub fn render_scaffold(frame: &mut Frame<'_>, model: &UiModel) {

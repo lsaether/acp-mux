@@ -7,6 +7,7 @@ pub enum ConnectionStatus {
     #[default]
     Disconnected,
     Connecting,
+    Reconnecting,
     Attached,
     Replaying,
     Live,
@@ -263,7 +264,7 @@ impl RoomState {
                 cancelled: false,
             });
         }
-        self.transcript.push(TranscriptItem {
+        self.push_transcript(TranscriptItem {
             kind: TranscriptKind::Prompt,
             method: "rooms/turn_started".to_string(),
             room_id: self.room_id.clone(),
@@ -272,6 +273,7 @@ impl RoomState {
             peer_id: Some(peer_id),
             peer_name,
             text,
+            replay_seq: replay_seq_from_params(params),
             replayed,
         });
     }
@@ -435,7 +437,7 @@ impl RoomState {
         if mutate_current && let Some(session_id) = &frame_session_id {
             self.session_id = Some(session_id.clone());
         }
-        self.transcript.push(TranscriptItem {
+        self.push_transcript(TranscriptItem {
             kind: TranscriptKind::AgentUpdate,
             method: "session/update".to_string(),
             room_id: self.room_id.clone(),
@@ -448,6 +450,7 @@ impl RoomState {
             peer_id: None,
             peer_name: None,
             text: text_from_params(params),
+            replay_seq: replay_seq_from_params(params),
             replayed,
         });
     }
@@ -510,6 +513,65 @@ impl RoomState {
             self.pending_permissions.push(permission);
         }
     }
+
+    fn push_transcript(&mut self, item: TranscriptItem) {
+        let duplicate = self
+            .transcript
+            .iter_mut()
+            .find(|existing| same_visible_transcript_item(existing, &item));
+
+        match duplicate {
+            Some(existing) if item.replayed => {
+                // Replay/reattach backfills should recover missing history without duplicating
+                // transcript rows that are already visible from the live stream. When replay
+                // metadata exists, claim exactly one visible live row so repeated identical
+                // replay payloads remain distinct.
+                if existing.replay_seq.is_none() {
+                    existing.replay_seq = item.replay_seq;
+                }
+            }
+            Some(existing) if existing.replayed => {
+                // A live frame is fresher than a previously replayed copy of the same visible row.
+                let mut live_item = item;
+                if live_item.replay_seq.is_none() {
+                    live_item.replay_seq = existing.replay_seq;
+                }
+                *existing = live_item;
+            }
+            _ => self.transcript.push(item),
+        }
+    }
+}
+
+fn same_visible_transcript_item(left: &TranscriptItem, right: &TranscriptItem) -> bool {
+    if let (Some(left_seq), Some(right_seq)) = (left.replay_seq, right.replay_seq) {
+        return left_seq == right_seq;
+    }
+
+    if left.method == "rooms/turn_started"
+        && right.method == "rooms/turn_started"
+        && left.turn_id.is_some()
+        && left.turn_id == right.turn_id
+    {
+        return true;
+    }
+
+    if left.method == "session/update"
+        && right.method == "session/update"
+        && left.session_id.is_some()
+        && left.session_id == right.session_id
+        && left.text == right.text
+    {
+        return true;
+    }
+
+    left.kind == right.kind
+        && left.method == right.method
+        && left.room_id == right.room_id
+        && left.session_id == right.session_id
+        && left.turn_id == right.turn_id
+        && left.peer_id == right.peer_id
+        && left.text == right.text
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -535,6 +597,7 @@ pub struct TranscriptItem {
     pub peer_id: Option<String>,
     pub peer_name: Option<String>,
     pub text: String,
+    pub replay_seq: Option<u64>,
     pub replayed: bool,
 }
 
@@ -632,6 +695,17 @@ fn u64_field(value: &Value, names: &[&str]) -> u64 {
         .iter()
         .find_map(|name| value.get(*name).and_then(Value::as_u64))
         .unwrap_or_default()
+}
+
+fn replay_seq_from_params(params: &Value) -> Option<u64> {
+    params
+        .get("_meta")
+        .and_then(|meta| meta.get("rooms"))
+        .and_then(|rooms| {
+            ["replaySeq", "replay_seq"]
+                .iter()
+                .find_map(|name| rooms.get(*name).and_then(Value::as_u64))
+        })
 }
 
 fn usize_field(value: &Value, names: &[&str]) -> usize {
