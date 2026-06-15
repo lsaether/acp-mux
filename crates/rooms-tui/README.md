@@ -14,6 +14,7 @@ Live TUI foundation plus reusable client transport/state:
 - `rooms-client` UI-neutral `RoomState` reducer for roster, transcript, active turn, queue, permissions, replay/debug/errors
 - event-driven ratatui loop that connects through `rooms-client`, folds inbound frames into `RoomState`, and renders connection/bootstrap progress, reducer snapshot, and event summaries
 - keyboard controls for draft entry, idle prompt submit, busy queue, active-turn steer/cancel, and selected prompt unqueue
+- first-class permission request surface with request/option selection and one-shot JSON-RPC replies
 - `Ctrl-Q` / `Esc` exit
 
 Shared non-UI logic lives in `../rooms-client` so a future Tauri app can reuse the same attach URL, protocol builders, event parser, websocket transport, and reducer.
@@ -49,9 +50,9 @@ cargo run -p rooms-tui -- \
 
 ## Next slice
 
-Add first-class permission handling on top of the live reducer snapshot:
+Add reconnect and replay recovery for daily-driver failure modes:
 
-1. highlight actionable `session/request_permission` requests;
-2. support allow/deny/custom option selection;
-3. send exactly one JSON-RPC response for the selected request;
-4. mark or remove the request once answered/resolved.
+1. recover cleanly from server restarts, laptop sleep, and broken websockets;
+2. surface actionable peer-id collision, wrong port, and wrong endpoint errors;
+3. re-run attach/replay without duplicating visible reducer state;
+4. preserve enough context for manual daily-driver validation after feat 6.

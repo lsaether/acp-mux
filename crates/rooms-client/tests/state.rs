@@ -222,6 +222,48 @@ fn live_frames_track_active_turn_queue_permissions_and_peers() {
 }
 
 #[test]
+fn resolved_events_remove_only_exact_typed_permission_id() {
+    let mut state = RoomState::default();
+
+    state
+        .apply_frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 10001,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess-1",
+                "toolCall": { "title": "Numeric" },
+                "options": [{ "optionId": "allow_once" }]
+            }
+        }))
+        .unwrap();
+    state
+        .apply_frame(&json!({
+            "jsonrpc": "2.0",
+            "id": "10001",
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess-1",
+                "toolCall": { "title": "String" },
+                "options": [{ "optionId": "allow_once" }]
+            }
+        }))
+        .unwrap();
+
+    assert_eq!(state.pending_permissions.len(), 2);
+    state
+        .apply_frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "rooms/agent_request_resolved",
+            "params": { "roomId": "demo", "requestId": 10001, "resolvedBy": "desktop" }
+        }))
+        .unwrap();
+
+    assert_eq!(state.pending_permissions.len(), 1);
+    assert_eq!(state.pending_permissions[0].response_id, json!("10001"));
+}
+
+#[test]
 fn streamed_replay_marks_frames_replayed_and_does_not_replace_snapshot_state() {
     let mut state = RoomState::default();
     state

@@ -98,6 +98,14 @@ pub fn build_unqueue_prompt(request_id: impl Into<Value>, queue_item_id: &str) -
     })
 }
 
+pub fn build_permission_response(request_id: impl Into<Value>, option_id: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id.into(),
+        "result": { "outcome": { "outcome": "selected", "optionId": option_id.trim() } }
+    })
+}
+
 fn build_text_control(
     request_id: impl Into<Value>,
     method: &str,

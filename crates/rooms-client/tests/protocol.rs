@@ -1,8 +1,8 @@
 use serde_json::json;
 
 use rooms_client::protocol::{
-    build_attach, build_cancel_active_turn, build_initialize, build_queue_prompt,
-    build_session_prompt, build_steer_active_turn, build_unqueue_prompt,
+    build_attach, build_cancel_active_turn, build_initialize, build_permission_response,
+    build_queue_prompt, build_session_prompt, build_steer_active_turn, build_unqueue_prompt,
 };
 
 #[test]
@@ -75,6 +75,18 @@ fn control_builders_use_rooms_namespace_and_trim_text() {
             "id": "rt-6",
             "method": "rooms/unqueue_prompt",
             "params": { "queueItemId": "aq-1" }
+        })
+    );
+}
+
+#[test]
+fn permission_response_builder_selects_trimmed_option_id() {
+    assert_eq!(
+        build_permission_response(json!(10001), "  deny  "),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10001,
+            "result": { "outcome": { "outcome": "selected", "optionId": "deny" } }
         })
     );
 }

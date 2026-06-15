@@ -12,12 +12,12 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{Frame, Stylize};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use rooms_client::protocol::{
-    build_cancel_active_turn, build_queue_prompt, build_session_prompt, build_steer_active_turn,
-    build_unqueue_prompt,
+    build_cancel_active_turn, build_permission_response, build_queue_prompt, build_session_prompt,
+    build_steer_active_turn, build_unqueue_prompt,
 };
 use rooms_client::{
-    AttachConfig, ClientCommand, ConnectionStatus, InboundMessage, QueueItemStatus, RoomState,
-    Transport, connect,
+    AttachConfig, ClientCommand, ConnectionStatus, InboundMessage, PermissionRequest,
+    QueueItemStatus, RoomState, Transport, connect,
 };
 use serde_json::Value;
 use tokio::runtime::Builder;
@@ -33,6 +33,8 @@ pub struct UiModel {
     event_log: Vec<String>,
     draft: String,
     selected_queue: usize,
+    selected_permission: usize,
+    selected_permission_option: usize,
     request_counter: u64,
 }
 
@@ -45,6 +47,8 @@ impl UiModel {
             event_log: vec!["boot: rooms-tui ready".to_string()],
             draft: String::new(),
             selected_queue: 0,
+            selected_permission: 0,
+            selected_permission_option: 0,
             request_counter: 0,
         }
     }
@@ -90,6 +94,22 @@ impl UiModel {
         }
     }
 
+    pub fn selected_permission_index(&self) -> Option<usize> {
+        self.selected_actionable_permission_index()
+    }
+
+    pub fn selected_permission_option_index(&self) -> Option<usize> {
+        let permission = self.selected_permission()?;
+        if permission.options.is_empty() {
+            None
+        } else {
+            Some(
+                self.selected_permission_option
+                    .min(permission.options.len() - 1),
+            )
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<ClientCommand> {
         match key.code {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -101,6 +121,16 @@ impl UiModel {
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.unqueue_selected_command()
             }
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.selected_permission_response_command()
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.permission_shortcut_response_command(|option| option.starts_with("allow"))
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => self
+                .permission_shortcut_response_command(|option| {
+                    option == "deny" || option.starts_with("deny_")
+                }),
             KeyCode::Enter => self.submit_or_queue_prompt_command(),
             KeyCode::Backspace => {
                 self.draft.pop();
@@ -112,6 +142,18 @@ impl UiModel {
             }
             KeyCode::Down => {
                 self.select_next_queue_item();
+                None
+            }
+            KeyCode::Tab => {
+                self.select_next_permission_request();
+                None
+            }
+            KeyCode::Left => {
+                self.select_previous_permission_option();
+                None
+            }
+            KeyCode::Right => {
+                self.select_next_permission_option();
                 None
             }
             KeyCode::Char(ch)
@@ -196,6 +238,25 @@ impl UiModel {
         Some(ClientCommand::SendFrame(build_unqueue_prompt(id, &item)))
     }
 
+    pub fn selected_permission_response_command(&mut self) -> Option<ClientCommand> {
+        let permission = self.selected_permission()?.clone();
+        let option_id = self.selected_permission_option_id(&permission)?;
+        self.resolve_permission(permission.request_id, permission.response_id, option_id)
+    }
+
+    pub fn permission_shortcut_response_command(
+        &mut self,
+        matches_option: impl Fn(&str) -> bool,
+    ) -> Option<ClientCommand> {
+        let permission = self.selected_permission()?.clone();
+        let option_id = permission
+            .options
+            .iter()
+            .find(|option| matches_option(&option.to_ascii_lowercase()))
+            .cloned()?;
+        self.resolve_permission(permission.request_id, permission.response_id, option_id)
+    }
+
     pub fn set_connection_status(&mut self, status: ConnectionStatus) {
         self.state.set_connection_status(status);
         self.push_event(format!("status: {status:?}"));
@@ -205,6 +266,7 @@ impl UiModel {
         let summary = inbound_summary(&message);
         match self.state.apply_inbound(&message) {
             Ok(()) => {
+                self.clamp_selections();
                 self.push_event(summary);
                 Ok(())
             }
@@ -236,7 +298,7 @@ impl UiModel {
             format!("transcript: {} items", self.state.transcript.len()),
             format!("active: {}", active_turn_text(&self.state)),
             format!("queue: {}", queue_text(&self.state)),
-            format!("permissions: {}", permissions_text(&self.state)),
+            format!("permissions: {}", permissions_text(self)),
         ];
 
         if let Some(replay) = &self.state.replay {
@@ -282,6 +344,127 @@ impl UiModel {
             .chain(self.state.queue.iter().enumerate().take(start))
             .find(|(_, item)| item.status == QueueItemStatus::Queued)
             .map(|(_, item)| item.queue_item_id.clone())
+    }
+
+    fn selected_actionable_permission_index(&self) -> Option<usize> {
+        let count = self.actionable_permission_count();
+        (count > 0).then(|| self.selected_permission.min(count - 1))
+    }
+
+    fn selected_permission(&self) -> Option<&PermissionRequest> {
+        let selected = self.selected_actionable_permission_index()?;
+        self.state
+            .pending_permissions
+            .iter()
+            .filter(|permission| permission.actionable)
+            .nth(selected)
+    }
+
+    fn selected_permission_option_id(&self, permission: &PermissionRequest) -> Option<String> {
+        let selected = self
+            .selected_permission_option_index()
+            .unwrap_or(0)
+            .min(permission.options.len().saturating_sub(1));
+        permission.options.get(selected).cloned()
+    }
+
+    fn resolve_permission(
+        &mut self,
+        request_id: impl Into<String>,
+        response_id: Value,
+        option_id: impl Into<String>,
+    ) -> Option<ClientCommand> {
+        let request_id = request_id.into();
+        let option_id = option_id.into();
+        if request_id.trim().is_empty() || option_id.trim().is_empty() {
+            self.push_event("control: permission response missing request or option");
+            return None;
+        }
+
+        let response_id_for_frame = response_id.clone();
+        self.state
+            .pending_permissions
+            .retain(|permission| permission.response_id != response_id);
+        self.clamp_selections();
+        self.push_event(format!(
+            "control: permission {request_id} -> {}",
+            option_id.trim()
+        ));
+        Some(ClientCommand::SendFrame(build_permission_response(
+            response_id_for_frame,
+            &option_id,
+        )))
+    }
+
+    fn select_next_permission_request(&mut self) {
+        let count = self.actionable_permission_count();
+        if count == 0 {
+            self.selected_permission = 0;
+        } else {
+            self.selected_permission = (self.selected_permission + 1) % count;
+        }
+        self.selected_permission_option = 0;
+    }
+
+    fn select_previous_permission_option(&mut self) {
+        let Some(permission) = self.selected_permission() else {
+            self.selected_permission_option = 0;
+            return;
+        };
+        let len = permission.options.len();
+        if len == 0 {
+            self.selected_permission_option = 0;
+        } else if self.selected_permission_option == 0 {
+            self.selected_permission_option = len - 1;
+        } else {
+            self.selected_permission_option -= 1;
+        }
+    }
+
+    fn select_next_permission_option(&mut self) {
+        let Some(permission) = self.selected_permission() else {
+            self.selected_permission_option = 0;
+            return;
+        };
+        let len = permission.options.len();
+        if len == 0 {
+            self.selected_permission_option = 0;
+        } else {
+            self.selected_permission_option = (self.selected_permission_option + 1) % len;
+        }
+    }
+
+    fn actionable_permission_count(&self) -> usize {
+        self.state
+            .pending_permissions
+            .iter()
+            .filter(|permission| permission.actionable)
+            .count()
+    }
+
+    fn clamp_selections(&mut self) {
+        if self.state.queue.is_empty() {
+            self.selected_queue = 0;
+        } else {
+            self.selected_queue = self.selected_queue.min(self.state.queue.len() - 1);
+        }
+
+        let permission_count = self.actionable_permission_count();
+        if permission_count == 0 {
+            self.selected_permission = 0;
+            self.selected_permission_option = 0;
+            return;
+        }
+        self.selected_permission = self.selected_permission.min(permission_count - 1);
+        let option_count = self
+            .selected_permission()
+            .map(|permission| permission.options.len())
+            .unwrap_or_default();
+        if option_count == 0 {
+            self.selected_permission_option = 0;
+        } else {
+            self.selected_permission_option = self.selected_permission_option.min(option_count - 1);
+        }
     }
 
     fn select_next_queue_item(&mut self) {
@@ -484,7 +667,7 @@ pub fn render_scaffold(frame: &mut Frame<'_>, model: &UiModel) {
 
     frame.render_widget(
         Paragraph::new(format!(
-            "draft: {}\nEnter submit/queue · Ctrl-S steer · Ctrl-X cancel · Ctrl-U unqueue · ↑/↓ select · Ctrl-Q/Esc quit",
+            "draft: {}\nEnter submit/queue · Ctrl-S steer · Ctrl-X cancel · Ctrl-U unqueue · Ctrl-P permission · Ctrl-A/Ctrl-D allow/deny · Tab/←/→ select · Ctrl-Q/Esc quit",
             if model.draft.is_empty() {
                 "<empty>"
             } else {
@@ -576,12 +759,17 @@ fn queue_text(state: &RoomState) -> String {
         .join(", ")
 }
 
-fn permissions_text(state: &RoomState) -> String {
-    if state.pending_permissions.is_empty() {
+fn permissions_text(model: &UiModel) -> String {
+    if model.state.pending_permissions.is_empty() {
         return "none".to_string();
     }
 
-    state
+    let selected_request = model
+        .selected_permission()
+        .map(|permission| &permission.response_id);
+
+    model
+        .state
         .pending_permissions
         .iter()
         .map(|permission| {
@@ -590,7 +778,46 @@ fn permissions_text(state: &RoomState) -> String {
             } else {
                 "replayed"
             };
-            format!("{} ({marker})", permission.request_id)
+            let selected = if selected_request == Some(&permission.response_id) {
+                ">"
+            } else {
+                " "
+            };
+            let title = permission.title.as_deref().unwrap_or("permission request");
+            let options = permission_options_text(permission, model);
+            format!(
+                "{selected}{}: {title} ({marker}) {options}",
+                permission.request_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn permission_options_text(permission: &PermissionRequest, model: &UiModel) -> String {
+    if permission.options.is_empty() {
+        return "[]".to_string();
+    }
+
+    let selected_request = model
+        .selected_permission()
+        .map(|selected| &selected.response_id);
+    let selected_option = if selected_request == Some(&permission.response_id) {
+        model.selected_permission_option_index()
+    } else {
+        None
+    };
+
+    permission
+        .options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            if selected_option == Some(index) {
+                format!("[{option}]")
+            } else {
+                option.clone()
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")

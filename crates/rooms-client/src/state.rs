@@ -208,11 +208,16 @@ impl RoomState {
         if let Some(permissions) = snapshot.get("pendingPermissions").and_then(Value::as_array) {
             self.pending_permissions.clear();
             for permission in permissions {
+                let request_id = permission
+                    .get("requestId")
+                    .map(json_id_to_string)
+                    .unwrap_or_default();
                 self.upsert_permission(PermissionRequest {
-                    request_id: permission
+                    response_id: permission
                         .get("requestId")
-                        .map(json_id_to_string)
-                        .unwrap_or_default(),
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(request_id.clone())),
+                    request_id,
                     session_id: optional_string_field(permission, &["sessionId", "session_id"]),
                     title: permission_title(permission),
                     options: permission_options(permission),
@@ -387,8 +392,13 @@ impl RoomState {
             .get("requestId")
             .map(json_id_to_string)
             .unwrap_or_default();
+        let response_id = params
+            .get("requestId")
+            .cloned()
+            .unwrap_or_else(|| Value::String(request_id.clone()));
         let request_params = params.get("requestParams").unwrap_or(&Value::Null);
         self.upsert_permission(PermissionRequest {
+            response_id,
             request_id,
             session_id: optional_string_field(request_params, &["sessionId", "session_id"]),
             title: permission_title(request_params),
@@ -399,18 +409,20 @@ impl RoomState {
 
     fn apply_agent_request_resolved(&mut self, params: &Value) {
         self.update_room_id(params);
-        let request_id = params
-            .get("requestId")
-            .map(json_id_to_string)
-            .unwrap_or_default();
+        let request_id = params.get("requestId").cloned().unwrap_or(Value::Null);
         self.pending_permissions
-            .retain(|permission| permission.request_id != request_id);
+            .retain(|permission| permission.response_id != request_id);
     }
 
     fn apply_permission_request(&mut self, frame: &Value, params: &Value, actionable: bool) {
         self.update_room_id(params);
+        let request_id = frame.get("id").map(json_id_to_string).unwrap_or_default();
         self.upsert_permission(PermissionRequest {
-            request_id: frame.get("id").map(json_id_to_string).unwrap_or_default(),
+            response_id: frame
+                .get("id")
+                .cloned()
+                .unwrap_or_else(|| Value::String(request_id.clone())),
+            request_id,
             session_id: optional_string_field(params, &["sessionId", "session_id"]),
             title: permission_title(params),
             options: permission_options(params),
@@ -489,7 +501,7 @@ impl RoomState {
         if let Some(existing) = self
             .pending_permissions
             .iter_mut()
-            .find(|existing| existing.request_id == permission.request_id)
+            .find(|existing| existing.response_id == permission.response_id)
         {
             if permission.actionable || !existing.actionable {
                 *existing = permission;
@@ -558,6 +570,7 @@ pub struct QueueItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionRequest {
     pub request_id: String,
+    pub response_id: Value,
     pub session_id: Option<String>,
     pub title: Option<String>,
     pub options: Vec<String>,
