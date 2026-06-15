@@ -6,13 +6,14 @@ This crate is the Rust home for the earlier `vibe-textual` room-client experimen
 
 ## Current status
 
-Kickoff scaffold plus reusable client transport/state:
+Live TUI foundation plus reusable client transport/state:
 
 - CLI parser for a room-native terminal peer
 - reusable client core imported from `rooms-client`
 - `rooms-client` WebSocket transport for `initialize` → `session/attach` bootstrap and typed inbound/outbound channels
 - `rooms-client` UI-neutral `RoomState` reducer for roster, transcript, active turn, queue, permissions, replay/debug/errors
-- minimal ratatui shell with `q` / `Esc` exit
+- event-driven ratatui loop that connects through `rooms-client`, folds inbound frames into `RoomState`, and renders connection/bootstrap progress, reducer snapshot, and event summaries
+- `q` / `Esc` exit
 
 Shared non-UI logic lives in `../rooms-client` so a future Tauri app can reuse the same attach URL, protocol builders, event parser, websocket transport, and reducer.
 
@@ -36,7 +37,7 @@ cargo run -p rooms-tui -- \
   --print-url
 ```
 
-Open the scaffold TUI:
+Open the live TUI:
 
 ```sh
 cargo run -p rooms-tui -- \
@@ -47,9 +48,10 @@ cargo run -p rooms-tui -- \
 
 ## Next slice
 
-Wire the shared `rooms-client` transport and reducer into this TUI:
+Add daily-driver operator controls on top of the live reducer snapshot:
 
-1. connect to the attach URL from the TUI loop;
-2. feed `InboundMessage` values into `RoomState`;
-3. replace the scaffold status pane with connection/bootstrap progress and reducer snapshots;
-4. render transcript, roster, queue, and permission summaries.
+1. submit a prompt when idle;
+2. queue a prompt when busy;
+3. steer or cancel the active turn;
+4. unqueue selected pending prompts;
+5. surface and answer permission requests.

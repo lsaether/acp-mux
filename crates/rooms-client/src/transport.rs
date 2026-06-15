@@ -102,7 +102,13 @@ pub async fn connect(config: AttachConfig) -> Result<Transport, TransportError> 
                             }
                         }
                         Some(Ok(Message::Frame(_))) => {}
-                        Some(Err(err)) => return Err(err.into()),
+                        Some(Err(err)) => {
+                            let error = err.to_string();
+                            let _ = inbound_tx
+                                .send(InboundMessage::Error(format!("websocket error: {error}")))
+                                .await;
+                            return Err(err.into());
+                        }
                         None => {
                             let _ = inbound_tx.send(InboundMessage::Closed).await;
                             return Ok(());
