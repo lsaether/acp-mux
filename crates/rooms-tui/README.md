@@ -13,7 +13,8 @@ Live TUI foundation plus reusable client transport/state:
 - `rooms-client` WebSocket transport for `initialize` → `session/attach` bootstrap and typed inbound/outbound channels
 - `rooms-client` UI-neutral `RoomState` reducer for roster, transcript, active turn, queue, permissions, replay/debug/errors
 - event-driven ratatui loop that connects through `rooms-client`, folds inbound frames into `RoomState`, and renders connection/bootstrap progress, reducer snapshot, and event summaries
-- `q` / `Esc` exit
+- keyboard controls for draft entry, idle prompt submit, busy queue, active-turn steer/cancel, and selected prompt unqueue
+- `Ctrl-Q` / `Esc` exit
 
 Shared non-UI logic lives in `../rooms-client` so a future Tauri app can reuse the same attach URL, protocol builders, event parser, websocket transport, and reducer.
 
@@ -48,10 +49,9 @@ cargo run -p rooms-tui -- \
 
 ## Next slice
 
-Add daily-driver operator controls on top of the live reducer snapshot:
+Add first-class permission handling on top of the live reducer snapshot:
 
-1. submit a prompt when idle;
-2. queue a prompt when busy;
-3. steer or cancel the active turn;
-4. unqueue selected pending prompts;
-5. surface and answer permission requests.
+1. highlight actionable `session/request_permission` requests;
+2. support allow/deny/custom option selection;
+3. send exactly one JSON-RPC response for the selected request;
+4. mark or remove the request once answered/resolved.

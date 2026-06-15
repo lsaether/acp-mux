@@ -1,7 +1,7 @@
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event as CrosstermEvent, KeyCode};
+use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -11,8 +11,13 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{Frame, Stylize};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use rooms_client::protocol::{
+    build_cancel_active_turn, build_queue_prompt, build_session_prompt, build_steer_active_turn,
+    build_unqueue_prompt,
+};
 use rooms_client::{
-    AttachConfig, ClientCommand, ConnectionStatus, InboundMessage, RoomState, Transport, connect,
+    AttachConfig, ClientCommand, ConnectionStatus, InboundMessage, QueueItemStatus, RoomState,
+    Transport, connect,
 };
 use serde_json::Value;
 use tokio::runtime::Builder;
@@ -26,6 +31,9 @@ pub struct UiModel {
     attach_url: String,
     state: RoomState,
     event_log: Vec<String>,
+    draft: String,
+    selected_queue: usize,
+    request_counter: u64,
 }
 
 impl UiModel {
@@ -35,6 +43,9 @@ impl UiModel {
             attach_url,
             state: RoomState::default(),
             event_log: vec!["boot: rooms-tui ready".to_string()],
+            draft: String::new(),
+            selected_queue: 0,
+            request_counter: 0,
         }
     }
 
@@ -61,6 +72,128 @@ impl UiModel {
 
     pub fn event_log(&self) -> &[String] {
         &self.event_log
+    }
+
+    pub fn draft(&self) -> &str {
+        &self.draft
+    }
+
+    pub fn set_draft(&mut self, draft: impl Into<String>) {
+        self.draft = draft.into();
+    }
+
+    pub fn selected_queue_index(&self) -> Option<usize> {
+        if self.state.queue.is_empty() {
+            None
+        } else {
+            Some(self.selected_queue.min(self.state.queue.len() - 1))
+        }
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> Option<ClientCommand> {
+        match key.code {
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.steer_active_turn_command()
+            }
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cancel_active_turn_command()
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.unqueue_selected_command()
+            }
+            KeyCode::Enter => self.submit_or_queue_prompt_command(),
+            KeyCode::Backspace => {
+                self.draft.pop();
+                None
+            }
+            KeyCode::Up => {
+                self.select_previous_queue_item();
+                None
+            }
+            KeyCode::Down => {
+                self.select_next_queue_item();
+                None
+            }
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                self.draft.push(ch);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub fn submit_or_queue_prompt_command(&mut self) -> Option<ClientCommand> {
+        let text = self.take_trimmed_draft("submit");
+        if text.is_empty() {
+            self.push_event("control: empty draft ignored");
+            return None;
+        }
+
+        if self.is_busy() {
+            let id = self.next_request_id("queue");
+            self.push_event("control: queued draft prompt");
+            Some(ClientCommand::SendFrame(build_queue_prompt(
+                id,
+                &text,
+                self.state.session_id.as_deref(),
+            )))
+        } else if let Some(session_id) = self.state.session_id.clone() {
+            let id = self.next_request_id("prompt");
+            self.push_event("control: submitted prompt");
+            Some(ClientCommand::SendFrame(build_session_prompt(
+                id,
+                &session_id,
+                &text,
+            )))
+        } else {
+            self.draft = text;
+            self.push_event("control: no attached session for prompt");
+            None
+        }
+    }
+
+    pub fn steer_active_turn_command(&mut self) -> Option<ClientCommand> {
+        let text = self.take_trimmed_draft("steer");
+        if text.is_empty() {
+            self.push_event("control: empty steer ignored");
+            return None;
+        }
+        if self.state.active_turn.is_none() {
+            self.draft = text;
+            self.push_event("control: no active turn to steer");
+            return None;
+        }
+
+        let id = self.next_request_id("steer");
+        self.push_event("control: steered active turn");
+        Some(ClientCommand::SendFrame(build_steer_active_turn(
+            id,
+            &text,
+            self.state.session_id.as_deref(),
+        )))
+    }
+
+    pub fn cancel_active_turn_command(&mut self) -> Option<ClientCommand> {
+        if self.state.active_turn.is_none() {
+            self.push_event("control: no active turn to cancel");
+            return None;
+        }
+
+        let id = self.next_request_id("cancel");
+        self.push_event("control: cancel active turn requested");
+        Some(ClientCommand::SendFrame(build_cancel_active_turn(
+            id,
+            Some("operator requested cancel"),
+        )))
+    }
+
+    pub fn unqueue_selected_command(&mut self) -> Option<ClientCommand> {
+        let item = self.selected_pending_queue_item_id()?;
+        let id = self.next_request_id("unqueue");
+        self.push_event(format!("control: unqueue requested for {item}"));
+        Some(ClientCommand::SendFrame(build_unqueue_prompt(id, &item)))
     }
 
     pub fn set_connection_status(&mut self, status: ConnectionStatus) {
@@ -139,6 +272,47 @@ impl UiModel {
             .join("\n")
     }
 
+    fn selected_pending_queue_item_id(&self) -> Option<String> {
+        let start = self.selected_queue_index().unwrap_or(0);
+        self.state
+            .queue
+            .iter()
+            .enumerate()
+            .skip(start)
+            .chain(self.state.queue.iter().enumerate().take(start))
+            .find(|(_, item)| item.status == QueueItemStatus::Queued)
+            .map(|(_, item)| item.queue_item_id.clone())
+    }
+
+    fn select_next_queue_item(&mut self) {
+        if self.state.queue.is_empty() {
+            self.selected_queue = 0;
+        } else {
+            self.selected_queue = (self.selected_queue + 1).min(self.state.queue.len() - 1);
+        }
+    }
+
+    fn select_previous_queue_item(&mut self) {
+        self.selected_queue = self.selected_queue.saturating_sub(1);
+    }
+
+    fn is_busy(&self) -> bool {
+        self.state.busy || self.state.active_turn.is_some()
+    }
+
+    fn take_trimmed_draft(&mut self, _reason: &str) -> String {
+        let text = self.draft.trim().to_string();
+        if !text.is_empty() {
+            self.draft.clear();
+        }
+        text
+    }
+
+    fn next_request_id(&mut self, kind: &str) -> String {
+        self.request_counter += 1;
+        format!("rooms-tui.{kind}.{}", self.request_counter)
+    }
+
     fn push_event(&mut self, event: impl Into<String>) {
         self.event_log.push(event.into());
         let overflow = self.event_log.len().saturating_sub(EVENT_LOG_LIMIT);
@@ -203,16 +377,40 @@ fn run_loop(
         terminal.draw(|frame| render_scaffold(frame, model))?;
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                CrosstermEvent::Key(key)
-                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) =>
-                {
+                CrosstermEvent::Key(key) if should_quit_key(key) => {
                     break;
+                }
+                CrosstermEvent::Key(key) => {
+                    if let Some(command) = model.handle_key(key) {
+                        send_command(transport, command, model);
+                    }
                 }
                 _ => {}
             }
         }
     }
     Ok(())
+}
+
+pub fn should_quit_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Esc)
+        || (matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn send_command(transport: &Option<Transport>, command: ClientCommand, model: &mut UiModel) {
+    let Some(transport) = transport else {
+        model.push_event("control: no live transport");
+        return;
+    };
+
+    if let Err(err) = transport.outbound.blocking_send(command) {
+        model
+            .state
+            .errors
+            .push(format!("failed to send command: {err}"));
+        model.state.set_connection_status(ConnectionStatus::Error);
+        model.push_event(format!("control send error: {err}"));
+    }
 }
 
 fn drain_transport(model: &mut UiModel, transport: &mut Option<Transport>) {
@@ -285,8 +483,15 @@ pub fn render_scaffold(frame: &mut Frame<'_>, model: &UiModel) {
     );
 
     frame.render_widget(
-        Paragraph::new("q/Esc quit · live rooms-client transport · controls land next")
-            .block(Block::default().borders(Borders::TOP)),
+        Paragraph::new(format!(
+            "draft: {}\nEnter submit/queue · Ctrl-S steer · Ctrl-X cancel · Ctrl-U unqueue · ↑/↓ select · Ctrl-Q/Esc quit",
+            if model.draft.is_empty() {
+                "<empty>"
+            } else {
+                model.draft.as_str()
+            }
+        ))
+        .block(Block::default().borders(Borders::TOP)),
         root[2],
     );
 }
